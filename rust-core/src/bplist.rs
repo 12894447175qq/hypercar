@@ -558,7 +558,7 @@ fn parse_object(
         },
 
         // 日期：CFAbsoluteTime（2001-01-01 起算秒数），按 f64 原样返回
-        0x3 => Ok(Value::Real(f64::from_bits(read_uint(bytes, offset + 1, 8)?)))),
+        0x3 => Ok(Value::Real(f64::from_bits(read_uint(bytes, offset + 1, 8)?))),
 
         0x4 => {
             let (count, start) = element_count(bytes, offset, info)?;
