@@ -96,6 +96,10 @@ pub struct ScreenSender {
     /** 最近一次随 VideoConfig 发出的 SPS/PPS（变化检测用）。 */
     last_sps: Option<Vec<u8>>,
     last_pps: Option<Vec<u8>>,
+    /** 首帧 NAL 类型只打印一次（诊断 H.264/H.265）。 */
+    logged_first_frame: bool,
+    /** HEVC 告警只打印一次。 */
+    logged_hevc: bool,
 }
 
 impl ScreenSender {
@@ -125,6 +129,8 @@ impl ScreenSender {
             config_sent: false,
             last_sps: None,
             last_pps: None,
+            logged_first_frame: false,
+            logged_hevc: false,
         }
     }
 
@@ -158,6 +164,25 @@ impl ScreenSender {
         let nals = annexb_nals(annexb);
         if nals.is_empty() {
             return Ok(());
+        }
+        // 诊断：首次出帧打印 NAL 类型（H.264 应为 7=SPS/8=PPS/5=IDR/1=P）；
+        // 同时守卫 HEVC——CarLife 新版（如 8.8.5）可能改用 H.265，而当前实现只做
+        // H.264（avcC+SPS/PPS）。不检测的话表现就是「握手全对、车机一直黑屏」。
+        if !self.logged_first_frame {
+            self.logged_first_frame = true;
+            let types: Vec<u8> = nals.iter().take(6).map(|n| nal_type(n)).collect();
+            crate::emit_log(&format!(
+                "VIDEO: 首帧 {} 个 NAL，类型={:?}（H.264 期望含 7/8/5）",
+                nals.len(),
+                types
+            ));
+        }
+        if !self.logged_hevc && nals.iter().any(|n| matches!(nal_type(n), 32 | 33 | 34 | 19 | 20 | 21)) {
+            self.logged_hevc = true;
+            crate::emit_log(
+                "VIDEO: ⚠ 检测到 H.265/HEVC NAL（32/33/34 或 19/20/21）——当前核心层只支持 H.264，\
+                 画面不会出。请换 CarLife 旧版（≤6.7.2）或 CarWith 的 CarLife 连接（H.264 通路）",
+            );
         }
         let mut sps: Option<&[u8]> = None;
         let mut pps: Option<&[u8]> = None;

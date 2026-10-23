@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::audio_out::AudioOut;
 use crate::bplist::{self, Value};
-use crate::pairing::{ControllerIdentity, PairVerifyClient, TlvTransport};
+use crate::pairing::{ControllerIdentity, PairSetupClient, PairVerifyClient, TlvTransport};
 use crate::rtsp::{ControlCipher, RtspChannel};
 use crate::screen::{ScreenCipher, ScreenSender};
 use crate::timing::TimingServer;
@@ -73,7 +73,7 @@ pub async fn negotiate(
     key_tx: mpsc::UnboundedSender<u32>,
     stop: Arc<Notify>,
 ) -> Result<AirplayOutcome, String> {
-    let (channel, _control_inbound) = RtspChannel::spawn(read, write, None);
+    let (mut channel, _control_inbound) = RtspChannel::spawn(read, write, None);
 
     // ---- 1. /info ----
     let info = fetch_info(&channel).await?;
@@ -100,29 +100,76 @@ pub async fn negotiate(
         display_uuid, disp_w, disp_h
     ));
 
-    // ---- 2. pair-verify（BMW ID8.5 / 现代车机主路径）----
+    // ---- 2. 配对：pair-setup → pair-verify（与 cardeck `runPairingLoop` 同策略）----
+    //
+    // 正确顺序是「先 pair-setup 交换长期公钥，再 pair-verify 派生会话密钥」。
+    // 但**已通过 iAP2/MFi 建立信任的接收端**（奥迪 MIB3 实测）会对匿名 pair-setup 回 403；
+    // 此时旧连接的状态机已被污染，必须**换一条新连接**走 pair-verify 快路径。
+    // 老车机（pre-HomeKit）对 /pair-setup 回 404/405/455/501 → 明文 et=NONE 会话。
+    // 此前实现跳过 pair-setup 直接 verify，对「需要真正 pair-setup 的接收端」会失败。
     let identity = ControllerIdentity::load_or_create(std::path::Path::new(&p.identity_path))
         .map_err(|e| format!("身份载入失败: {e}"))?;
     let receiver_pk = info
         .get("pk")
         .and_then(Value::as_bytes)
         .and_then(|b| <[u8; 32]>::try_from(b).ok());
-    let mut transport = RtspTransport { channel: &channel };
-    let verify_log = |s: &str| emit_log(&format!("PAIR: {s}"));
-    let shared_secret: Option<[u8; 32]> =
-        match PairVerifyClient::run(&identity, &mut transport, receiver_pk.as_ref(), &verify_log) {
+    let pair_log = |s: &str| emit_log(&format!("PAIR: {s}"));
+
+    let mut pairing_forbidden = false;
+    let mut pairing_unsupported = false;
+    {
+        let mut transport = RtspTransport { channel: &channel };
+        match PairSetupClient::run(&identity, &mut transport, &pair_log) {
+            Ok(_) => emit_log("PAIR: ✓ pair-setup 完成（长期公钥已交换）"),
+            Err(e) => {
+                let lower = e.to_ascii_lowercase();
+                if lower.contains("403") {
+                    pairing_forbidden = true;
+                    emit_log(
+                        "PAIR: pair-setup 403（接收端已通过 MFi 信任本机）→ 换新连接走 pair-verify 快路径",
+                    );
+                } else if ["404", "405", "455", "501"].iter().any(|s| lower.contains(s)) {
+                    pairing_unsupported = true;
+                    emit_log(&format!(
+                        "PAIR: pair-setup 不被支持（{e}）→ pre-HomeKit 老车机，走明文 et=NONE"
+                    ));
+                } else {
+                    emit_log(&format!("PAIR: pair-setup 失败（{e}）→ 仍尝试 pair-verify"));
+                }
+            }
+        }
+    }
+
+    // 403 后必须换新连接：旧连接的状态机不可再用
+    if pairing_forbidden {
+        match factory.open_tcp(&p.car_ip, p.airplay_port, 5_000) {
+            Some(stream) => {
+                let (r, w) = stream.into_split();
+                let (fresh, _rx) = RtspChannel::spawn(r, w, None);
+                channel = fresh;
+                emit_log("PAIR: 已换新控制连接");
+            }
+            None => emit_log("PAIR: ⚠ 新控制连接打开失败，沿用旧连接（可能仍被 403 污染）"),
+        }
+    }
+
+    let shared_secret: Option<[u8; 32]> = if pairing_unsupported {
+        None
+    } else {
+        let mut transport = RtspTransport { channel: &channel };
+        match PairVerifyClient::run(&identity, &mut transport, receiver_pk.as_ref(), &pair_log) {
             Ok(keys) => {
                 channel.set_cipher(ControlCipher::new(keys.read_key, keys.write_key));
                 emit_log("AIRPLAY: ✓ pair-verify 完成，控制通道已加密");
                 Some(keys.shared_secret)
             }
             Err(e) => {
-                // pre-HomeKit 老车机（无 HK_PAIRING_AND_ENCRYPT）：明文会话兜底。
-                // BMW iD8.5 不属于此类；命中 404/405/455/501 才走这条。
+                // 真车 403 的恢复路径：保持连接、退避重试由上层重连处理。
                 emit_log(&format!("AIRPLAY: pair-verify 未通过（{e}）——按 et=NONE 明文会话继续"));
                 None
             }
-        };
+        }
+    };
 
     // ---- 3. modesChanged ----
     let modes = build_modes_changed();
@@ -416,10 +463,13 @@ async fn negotiate_audio(
             ("spf", Value::int(352)), // AirPlay 标准 SPF（512 在真车无声）
         ])]),
     )]));
+    // 音频 SETUP 必须用**绝对 URI**（cardeck runAudioStream 同款：`rtsp://host:port/`）；
+    // 屏幕流与初始 SETUP 才用相对路径。URI 用反会 400/404。
+    let audio_uri = format!("rtsp://{}:{}/", p.car_ip, p.airplay_port);
     let resp = match channel
         .request(
             "SETUP",
-            "/",
+            &audio_uri,
             &body,
             "application/x-apple-binary-plist",
             &[],

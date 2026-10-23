@@ -173,7 +173,14 @@ pub async fn run_engine(
                         Some(CarLifeEvent::VideoFrame { pts_us, data }) => {
                             if let Some(s) = sender.as_mut() {
                                 let len = data.len() as u64;
-                                if s.send_video_annexb(&data, pts_us).await.is_err() {
+                                // CarLife 媒体头的时间戳偶有 0/非单调（不同发送端实现不一），
+                                // 直接当 PTS 会让车机按 0 排播 → 卡顿/丢帧。为 0 时用本机单调钟。
+                                let pts = if pts_us == 0 {
+                                    crate::timing::monotonic_nanos() / 1_000
+                                } else {
+                                    pts_us
+                                };
+                                if s.send_video_annexb(&data, pts).await.is_err() {
                                     emit_state("ended", "屏幕流写失败（车机侧断开）");
                                     return;
                                 }
