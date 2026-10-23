@@ -134,6 +134,26 @@ impl ScreenSender {
         }
     }
 
+    /// 更新画布尺寸（CarLife 手机回报其**实际**编码分辨率时调用）。
+    ///
+    /// 车机按 VideoConfig 里的宽高建立解码画布；若与真实码流不一致，画面会被
+    /// 拉伸/裁切，触摸坐标也会整体偏移。故以手机实际尺寸为准，而非设置里的值。
+    pub fn set_size(&mut self, width: u32, height: u32) {
+        let w = (width / 2) * 2;
+        let h = (height / 2) * 2;
+        if w < 2 || h < 2 {
+            return;
+        }
+        if w as f32 != self.width || h as f32 != self.height {
+            crate::emit_log(&format!(
+                "VIDEO: 画布 {}x{} → {w}x{h}（跟随手机实际编码分辨率）",
+                self.width as u32, self.height as u32
+            ));
+            self.width = w as f32;
+            self.height = h as f32;
+        }
+    }
+
     /// 发送 VideoConfig（明文 avcC body）。
     ///
     /// 头部必须与 catplay `ScreenFrame::config` 一致：`small_param[1] |= Encrypted(0x04)`

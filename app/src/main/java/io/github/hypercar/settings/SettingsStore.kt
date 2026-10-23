@@ -27,7 +27,6 @@ object SettingsStore {
     private const val KEY_TARGET_MAC = "target_car_mac"
     private const val KEY_TARGET_NAME = "target_car_name"
     private const val KEY_AUTO_CONNECT = "auto_connect_on_bt"
-    private const val KEY_SCREEN_OFF_ON_CONNECT = "screen_off_on_connect"
     private const val KEY_WIDTH = "carlife_width"
     private const val KEY_HEIGHT = "carlife_height"
     private const val KEY_FPS = "carlife_fps"
@@ -52,14 +51,13 @@ object SettingsStore {
         get() = p().getBoolean(KEY_AUTO_CONNECT, true)
         set(v) = p().edit().putBoolean(KEY_AUTO_CONNECT, v).apply()
 
-    /** 推流时手机面板降亮度（本项目无虚拟屏，只做省电提示，不做物理断电）。 */
-    var dimWhileConnected: Boolean
-        get() = p().getBoolean(KEY_SCREEN_OFF_ON_CONNECT, true)
-        set(v) = p().edit().putBoolean(KEY_SCREEN_OFF_ON_CONNECT, v).apply()
-
     /**
-     * CarLife 编码分辨率（下发 0x10007 video encoder init）。
-     * 宝马 iD8.5 曲面屏默认 1920×720（偶数、16:6 带鱼比；实车可视区域可在此微调）。
+     * CarLife 编码分辨率的**兜底值**（仅当车机 `/info` 没回报显示器尺寸、
+     * 且手机也没回报实际编码尺寸时才用）。
+     *
+     * 正常运行时不再读这里：连上车机后按 `/info` 的 displays 尺寸请求编码，
+     * 手机在 `VIDEO_ENCODER_INIT_DONE` 里回报实际值后再覆盖——所以设置里的
+     * 数值与车机原生分辨率不同也不会影响画质。
      */
     var carlifeWidth: Int
         get() = p().getInt(KEY_WIDTH, 1920)

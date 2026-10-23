@@ -15,11 +15,16 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
-    <!-- 蓝牙：iAP2 RFCOMM + 上车 ACL 广播唤醒（秒连链路的第一环） -->
+    <!-- 蓝牙：iAP2 RFCOMM + 上车 ACL 广播唤醒（秒连链路的第一环）。
+         BLUETOOTH_SCAN 标 neverForLocation：本项目只用 ACL 广播，不用扫描结果推断位置，
+         声明后 Android 12/12L 不再因蓝牙索要定位权限。 -->
     <uses-permission android:name="android.permission.BLUETOOTH" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="31" />
 
     <!-- 服务与唤醒 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -28,9 +33,9 @@
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <!-- 静默领投屏令牌（可选音频路径；本项目无 VirtualDisplay，音频直接来自 CarLife 通道，
-         此权限仅在需要 AudioPlaybackCapture 兜底时使用） -->
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- 注意：不声明 RECORD_AUDIO。本应用只播放下行音频（CarLife → AirPlay），
+         不采集麦克风；此前声明只是"给将来的 AudioPlaybackCapture 兜底"的占位，
+         却会在应用信息页显示"麦克风"权限，属误导，已移除。 -->
 
     <uses-feature
         android:name="android.hardware.bluetooth"

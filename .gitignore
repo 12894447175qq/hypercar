@@ -26,3 +26,6 @@ keystore.properties
 # 杂项
 .DS_Store
 *.log
+
+# 图标生成脚本的预览输出（tools/icon/out/，脚本本身入库）
+/tools/icon/out/

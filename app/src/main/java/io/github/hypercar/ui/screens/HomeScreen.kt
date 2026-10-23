@@ -26,8 +26,11 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import io.github.hypercar.core.SessionSnapshot
+import io.github.hypercar.perm.PermGroup
+import io.github.hypercar.perm.PermissionSummary
 import io.github.hypercar.ui.components.DegradedGuidanceCard
 import io.github.hypercar.ui.components.GlassPanel
+import io.github.hypercar.ui.components.PermissionChecklistCard
 import io.github.hypercar.ui.components.StatChips
 import io.github.hypercar.ui.components.StatusHeroCard
 import io.github.hypercar.ui.theme.MonoLogLine
@@ -45,8 +48,28 @@ fun HomeScreen(
     onStop: () -> Unit,
     onOpenDiagnostics: () -> Unit,
     onRequestDegradedPermission: () -> Unit,
+    permissions: PermissionSummary,
+    locationServiceOn: Boolean,
+    onRequestPermission: (PermGroup) -> Unit,
+    onRequestAllPermissions: () -> Unit,
+    onOpenOverlay: () -> Unit,
+    onBatteryOptimization: () -> Unit,
+    onAutostart: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    // 权限检查卡在两种布局里共用
+    @Composable
+    fun Checklist() {
+        PermissionChecklistCard(
+            summary = permissions,
+            locationServiceOn = locationServiceOn,
+            onRequest = onRequestPermission,
+            onRequestAll = onRequestAllPermissions,
+            onOpenOverlay = onOpenOverlay,
+            onBattery = onBatteryOptimization,
+            onAutostart = onAutostart,
+        )
+    }
     BoxWithConstraints(modifier = modifier.fillMaxSize()) {
         val landscape = maxWidth > maxHeight
         if (landscape) {
@@ -65,6 +88,7 @@ fun HomeScreen(
                         onStartClick = onStart,
                         onStopClick = onStop,
                     )
+                    Checklist()
                     DegradedGuidanceCard(
                         permissionGranted = snapshot.degradedPermissionGranted,
                         locationOn = snapshot.degradedLocationOn,
@@ -94,6 +118,7 @@ fun HomeScreen(
                     onStartClick = onStart,
                     onStopClick = onStop,
                 )
+                Checklist()
                 DegradedGuidanceCard(
                     permissionGranted = snapshot.degradedPermissionGranted,
                     locationOn = snapshot.degradedLocationOn,

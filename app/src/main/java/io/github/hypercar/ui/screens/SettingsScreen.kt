@@ -66,7 +66,10 @@ import io.github.hypercar.ui.theme.SurfaceInset
 import io.github.hypercar.ui.theme.TextPrimary
 import io.github.hypercar.ui.theme.TextSecondary
 
-/** 分辨率预设（宝马 iD8.5 曲面屏 16:6 带鱼比；宽度均为偶数）。 */
+/**
+ * 分辨率预设（**兜底用**）。实际分辨率以车机 `/info` 回报为准，手机回报实际
+ * 编码尺寸后还会再覆盖一次；只有两者都拿不到时才落到这里。宽度均为偶数。
+ */
 private data class ResolutionPreset(val label: String, val width: Int, val height: Int)
 
 private val ResolutionPresets = listOf(
@@ -306,12 +309,14 @@ private fun ResolutionSection() {
         )
     }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        SectionLabel(text = "CarLife 编码分辨率")
+        SectionLabel(text = "CarLife 编码分辨率（兜底值）")
         GlassPanel(
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 16.dp),
         ) {
             Text(
-                text = "下发 0x10007 视频编码初始化；偶数像素，越界值自动钳制",
+                text = "实际分辨率以车机 /info 回报为准——连上后会自动改成车机原生尺寸，" +
+                    "手机在编码器初始化完成后回报的实际值会再次覆盖它。" +
+                    "这里只在这两者都拿不到时使用；下发前按偶数对齐。",
                 style = MaterialTheme.typography.bodySmall,
                 color = TextSecondary,
             )
@@ -381,7 +386,6 @@ private fun FpsSegment() {
 private fun BehaviorSection() {
     var autoConnect by rememberSaveable { mutableStateOf(SettingsStore.autoConnect) }
     var enableAudio by rememberSaveable { mutableStateOf(SettingsStore.enableAudio) }
-    var dimWhileConnected by rememberSaveable { mutableStateOf(SettingsStore.dimWhileConnected) }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionLabel(text = "行为")
@@ -405,16 +409,6 @@ private fun BehaviorSection() {
                 onCheckedChange = {
                     enableAudio = it
                     SettingsStore.enableAudio = it
-                },
-            )
-            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-            SwitchRow(
-                title = "连接时降亮度",
-                subtitle = "推流期间压低面板亮度省电",
-                checked = dimWhileConnected,
-                onCheckedChange = {
-                    dimWhileConnected = it
-                    SettingsStore.dimWhileConnected = it
                 },
             )
         }

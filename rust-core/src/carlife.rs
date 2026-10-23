@@ -104,6 +104,8 @@ pub struct CarLifeHub {
     events: mpsc::UnboundedSender<CarLifeEvent>,
     touch_tx: mpsc::UnboundedSender<Vec<u8>>,
     cfg: CarLifeConfig,
+    /// 当前编码分辨率共享单元（与 AirPlay 协商/触摸换算共用）。
+    encoder_size: Arc<Mutex<(u32, u32)>>,
 }
 
 impl CarLifeHub {
@@ -113,15 +115,20 @@ impl CarLifeHub {
     ) -> Result<(Self, mpsc::UnboundedReceiver<CarLifeEvent>), String> {
         let (events, event_rx) = mpsc::unbounded_channel();
         let (touch_tx, touch_rx) = mpsc::unbounded_channel();
+        // 初始值取设置；AirPlay 的 /info 报到车机真实尺寸后会覆盖它，
+        // 手机在 INIT_DONE 里回报实际编码尺寸后再次覆盖。
+        let encoder_size: Arc<Mutex<(u32, u32)>> =
+            Arc::new(Mutex::new((cfg.width.max(2), cfg.height.max(2))));
 
         // ---- CMD 7240：14 步握手 ----
         let cmd_listener =
             bind_tcp(PORT_CMD).map_err(|e| format!("CarLife CMD 7240 绑定失败: {e}"))?;
         spawn_single_client_server(cmd_listener, stop.clone(), "CMD", {
             let events = events.clone();
-            let (w, h, f) = (cfg.width, cfg.height, cfg.fps);
+            let fps = cfg.fps;
+            let size = encoder_size.clone();
             let stop_c = stop.clone();
-            move |stream| handle_cmd_client(stream, events.clone(), w, h, f, stop_c.clone())
+            move |stream| handle_cmd_client(stream, events.clone(), size.clone(), fps, stop_c.clone())
         });
 
         // ---- VIDEO 8240 ----
@@ -147,9 +154,15 @@ impl CarLifeHub {
                 events,
                 touch_tx,
                 cfg,
+                encoder_size,
             },
             event_rx,
         ))
+    }
+
+    /// 编码分辨率共享单元的句柄（AirPlay 协商据此请求编码尺寸，触摸换算读它）。
+    pub fn encoder_size_handle(&self) -> Arc<Mutex<(u32, u32)>> {
+        self.encoder_size.clone()
     }
 
     /// 外部（AirPlay 事件通道）注入触摸 → CarLife CTRL 通道 TOUCH_ACTION。
@@ -314,8 +327,7 @@ async fn send_cmd(wr: &mut tokio::net::tcp::OwnedWriteHalf, ty: u32, payload: &[
 async fn handle_cmd_client(
     stream: TcpStream,
     events: mpsc::UnboundedSender<CarLifeEvent>,
-    width: u32,
-    height: u32,
+    encoder_size: Arc<Mutex<(u32, u32)>>,
     fps: u32,
     stop: Arc<Notify>,
 ) {
@@ -434,10 +446,13 @@ async fn handle_cmd_client(
                 CMD_MD_AUTHEN_RESULT => {
                     emit_log("CARLIFE: [Phase 5] ← MD_AUTHEN_RESULT —— 连接建立");
                     if !hs.encoder_init_sent {
+                        // 用**当前**编码分辨率（/info 已按车机真实尺寸写入）
+                        let (w, h) = *encoder_size.lock();
+                        let (w, h) = (even(w.max(2)), even(h.max(2)));
                         let ok = send_cmd(
                             &mut wr,
                             CMD_VIDEO_ENCODER_INIT,
-                            &proto_encoder_info_payload(width, height, fps),
+                            &proto_encoder_info_payload(w, h, fps),
                         )
                         .await;
                         if !ok {
@@ -445,15 +460,40 @@ async fn handle_cmd_client(
                         }
                         hs.encoder_init_sent = true;
                         emit_log(&format!(
-                            "CARLIFE: [Phase 6] → VIDEO_ENCODER_INIT {width}x{height}@{fps}"
+                            "CARLIFE: [Phase 6] → VIDEO_ENCODER_INIT {w}x{h}@{fps}"
                         ));
                     }
                 }
                 CMD_VIDEO_ENCODER_INIT_DONE => {
-                    emit_log(&format!(
-                        "CARLIFE: [Phase 6] ← VIDEO_ENCODER_INIT_DONE {}B",
-                        payload.len()
-                    ));
+                    // 手机在这里回报**实际**采用的分辨率（可能把我们请求的值压缩到
+                    // 其编码器上限）。以它为准，否则 VideoConfig 画布与真实码流不一致，
+                    // 车机端会缩放/错位，触摸坐标也会整体偏移。
+                    let (actual_w, actual_h) = parse_encoder_info(&payload);
+                    if actual_w >= 2 && actual_h >= 2 {
+                        let actual = (even(actual_w), even(actual_h));
+                        let requested = *encoder_size.lock();
+                        *encoder_size.lock() = actual;
+                        if actual != requested {
+                            emit_log(&format!(
+                                "CARLIFE: 手机实际编码 {}x{}（请求 {}x{}，已按其实际值同步画布）",
+                                actual.0, actual.1, requested.0, requested.1
+                            ));
+                        } else {
+                            emit_log(&format!(
+                                "CARLIFE: 手机确认编码 {}x{}",
+                                actual.0, actual.1
+                            ));
+                        }
+                        let _ = events.send(CarLifeEvent::EncoderResolution {
+                            width: actual.0,
+                            height: actual.1,
+                        });
+                    } else {
+                        emit_log(&format!(
+                            "CARLIFE: [Phase 6] ← VIDEO_ENCODER_INIT_DONE {}B（未含尺寸，沿用请求值）",
+                            payload.len()
+                        ));
+                    }
                     if !hs.encoder_start_sent {
                         let ok = send_cmd(&mut wr, CMD_VIDEO_ENCODER_START, &[]).await;
                         if !ok {
@@ -717,6 +757,51 @@ async fn handle_media_client(
             }
         }
     }
+}
+
+/// 偶数对齐：H.264 4:2:0 要求宽高为偶数。
+fn even(v: u32) -> u32 {
+    (v / 2) * 2
+}
+
+/// 解析 `CarlifeVideoEncoderInfo{1:width, 2:height, 3:frameRate}` 的宽高。
+/// 手机在 VIDEO_ENCODER_INIT_DONE 里用同一结构回报它**实际**采用的尺寸；缺失则返回 (0,0)。
+fn parse_encoder_info(bytes: &[u8]) -> (u32, u32) {
+    let mut width = 0u32;
+    let mut height = 0u32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let (tag, used) = read_varint(&bytes[i..]);
+        let Some(tag) = tag else { break };
+        i += used;
+        let field = (tag >> 3) as u32;
+        let wire = (tag & 0x07) as u8;
+        match wire {
+            0 => {
+                let (v, used) = read_varint(&bytes[i..]);
+                let Some(v) = v else { break };
+                i += used;
+                match field {
+                    1 => width = v as u32,
+                    2 => height = v as u32,
+                    _ => {}
+                }
+            }
+            2 => {
+                let (len, used) = read_varint(&bytes[i..]);
+                let Some(len) = len else { break };
+                i += used;
+                i += len as usize;
+            }
+            5 => i += 4,
+            1 => i += 8,
+            _ => break,
+        }
+        if i > bytes.len() {
+            break;
+        }
+    }
+    (width, height)
 }
 
 /// 解析音频初始化 protobuf：优先按 CarlifeAudioStart（3=sample_rate, 4=channels），

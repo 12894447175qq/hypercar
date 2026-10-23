@@ -17,6 +17,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use parking_lot::Mutex;
+
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Notify};
@@ -44,9 +46,13 @@ pub struct AirplayParams {
     pub identity_path: String,
     pub enable_audio: bool,
     pub keep_alive_stats: bool,
-    /// CarLife 编码分辨率（触摸坐标换算目标；也是 VideoConfig 画布）。
+    /// 设置里的 CarLife 编码分辨率（仅作 `/info` 无显示器信息时的兜底）。
     pub width: u32,
     pub height: u32,
+    /// 当前 CarLife 编码分辨率（共享单元）：
+    /// `/info` 报到车机真实显示尺寸后由协商写入，手机在 `VIDEO_ENCODER_INIT_DONE`
+    /// 里回报实际选择后由 CarLife 层覆盖。触摸坐标换算与 VideoConfig 都读它。
+    pub encoder_size: Arc<Mutex<(u32, u32)>>,
 }
 
 /// 车机触摸（已是 CarLife 编码空间坐标）。
@@ -101,6 +107,23 @@ pub async fn negotiate(
         "AIRPLAY: /info displays[0].uuid={:?} {}x{} features=0x{:x}",
         display_uuid, disp_w, disp_h, car_features
     ));
+
+    // 车机真实显示分辨率 → CarLife 编码请求。
+    // 设置里的分辨率只是"用户以为的"，实际以 `/info` 为准：两侧不一致时
+    // 车机要把小画面拉伸整屏（发虚），所以这里直接改成车机原生尺寸。
+    if disp_w >= 320 && disp_h >= 240 {
+        let target = (even(disp_w.max(2)), even(disp_h.max(2)));
+        *p.encoder_size.lock() = target;
+        emit_log(&format!(
+            "AIRPLAY: 车机实际 {}x{} → 请求 CarLife 按 {}x{} 编码（设置值 {}x{} 仅作兜底）",
+            disp_w, disp_h, target.0, target.1, p.width, p.height
+        ));
+    } else {
+        emit_log(&format!(
+            "AIRPLAY: /info 未提供有效显示器尺寸（{disp_w}x{disp_h}），沿用设置 {}x{}",
+            p.width, p.height
+        ));
+    }
 
     // ---- 2. 配对：pair-setup → pair-verify（与 cardeck `runPairingLoop` 同策略）----
     //
@@ -235,7 +258,7 @@ pub async fn negotiate(
         touch_tx,
         key_tx,
         (disp_w.max(1), disp_h.max(1)),
-        (p.width.max(1), p.height.max(1)),
+        p.encoder_size.clone(),
         stop.clone(),
     );
 
@@ -283,10 +306,11 @@ pub async fn negotiate(
         .ok_or_else(|| format!("屏幕流连接失败 {}:{data_port}", p.car_ip))?;
     // into_split 返回 (读半部, 写半部)；屏幕流只推不收，读半部直接丢弃
     let (_screen_r, screen_w) = screen_stream.into_split();
-    let screen = ScreenSender::new(screen_w, cipher, p.width, p.height, keep_alive_stats);
+    // 画布尺寸取当前编码分辨率（/info 已写入；手机回报实际值后 CarLife 层会再覆盖）
+    let (enc_w, enc_h) = *p.encoder_size.lock();
+    let screen = ScreenSender::new(screen_w, cipher, enc_w, enc_h, keep_alive_stats);
     emit_log(&format!(
-        "AIRPLAY: ✓ 主屏流就绪 dataPort={data_port} connId={conn_id_screen} {}x{}",
-        p.width, p.height
+        "AIRPLAY: ✓ 主屏流就绪 dataPort={data_port} connId={conn_id_screen} {enc_w}x{enc_h}"
     ));
 
     // ---- 7. 音频流 SETUP（可选）----
@@ -580,7 +604,7 @@ fn spawn_event_dispatcher(
     touch_tx: mpsc::UnboundedSender<TouchInput>,
     key_tx: mpsc::UnboundedSender<u32>,
     display_size: (u32, u32),
-    target_size: (u32, u32),
+    target_size: Arc<Mutex<(u32, u32)>>,
     stop: Arc<Notify>,
 ) {
     tokio::spawn(async move {
@@ -623,7 +647,7 @@ fn spawn_event_dispatcher(
                             &touch_tx,
                             &key_tx,
                             display_size,
-                            target_size,
+                            &target_size,
                             &mut tip_down,
                         );
                     }
@@ -652,7 +676,7 @@ fn handle_hid_report(
     touch_tx: &mpsc::UnboundedSender<TouchInput>,
     key_tx: &mpsc::UnboundedSender<u32>,
     display: (u32, u32),
-    target: (u32, u32),
+    target_size: &Arc<Mutex<(u32, u32)>>,
     tip_down: &mut bool,
 ) {
     if report.len() < 5 {
@@ -662,6 +686,10 @@ fn handle_hid_report(
         }
         return;
     }
+    // 每次触摸都读当前编码分辨率：手机可能把请求的分辨率压缩后回报，
+    // 用旧快照会让触摸整体偏移（越靠边越明显）。
+    let target = *target_size.lock();
+    let target = (target.0.max(2), target.1.max(2));
     let pressed = report[0] & 0x01 != 0;
     let x_raw = u16::from_le_bytes([report[1], report[2]]) as u32;
     let y_raw = u16::from_le_bytes([report[3], report[4]]) as u32;
@@ -693,6 +721,11 @@ fn consumer_key_of(report: &[u8]) -> Option<u32> {
 }
 
 // ---------------------------------------------------------------- 工具
+
+/// 偶数对齐：H.264 4:2:0 要求宽高为偶数（奇数会让编解码器首帧进错误态）。
+fn even(v: u32) -> u32 {
+    (v / 2) * 2
+}
 
 /// RtspTransport 适配：pairing 层是同步 trait，跑在多线程 runtime 的 worker 上，
 /// 用 block_in_place + block_on 桥接（配对只有 M1..M4 四次往返，代价可忽略）。

@@ -32,6 +32,9 @@ pub enum CarLifeEvent {
     AudioInit { tts: bool, rate: u32, channels: u8 },
     AudioStop { tts: bool },
     AudioData { tts: bool, rate: u32, channels: u8, data: Vec<u8> },
+    /// 手机在 VIDEO_ENCODER_INIT_DONE 里回报的**实际**编码分辨率
+    /// （可能与我们请求的不同：机型编码器会自行压缩到支持的上限）。
+    EncoderResolution { width: u32, height: u32 },
     ClientLeft { video: bool },
 }
 
@@ -124,7 +127,11 @@ pub async fn run_engine(
                                     | CarLifeEvent::AudioStop { .. }
                                     | CarLifeEvent::AudioData { .. }
                             );
-                            let to_video = matches!(ev, CarLifeEvent::VideoFrame { .. });
+                            let to_video = matches!(
+                                ev,
+                                CarLifeEvent::VideoFrame { .. }
+                                    | CarLifeEvent::EncoderResolution { .. }
+                            );
                             if to_audio {
                                 if audio_tx.send(ev).is_err() { return; }
                             } else if to_video {
@@ -153,6 +160,8 @@ pub async fn run_engine(
         let stats = video_stats.clone();
         tokio::spawn(async move {
             let mut sender: Option<ScreenSender> = None;
+            // 屏幕流就绪前收到的编码尺寸先存着，就绪时补上
+            let mut pending_size: Option<(u32, u32)> = None;
             let mut ready = Some(screen_ready_rx);
             let mut video_rx = video_rx;
             let mut tick = tokio::time::interval(Duration::from_millis(400));
@@ -166,10 +175,24 @@ pub async fn run_engine(
                             None => std::future::pending().await,
                         }
                     } => {
-                        if let Some(s) = r.flatten() { sender = Some(s); }
+                        if let Some(mut s) = r.flatten() {
+                            if let Some((w, h)) = pending_size.take() {
+                                s.set_size(w, h);
+                            }
+                            sender = Some(s);
+                        }
                         ready = None;
                     }
                     ev = video_rx.recv() => match ev {
+                        Some(CarLifeEvent::EncoderResolution { width, height }) => {
+                            // 手机回报实际编码尺寸 → 同步 AirPlay 画布（VideoConfig 宽高）。
+                            // 必须在首帧引出 VideoConfig 之前生效，否则车机按旧画布解码。
+                            if let Some(s) = sender.as_mut() {
+                                s.set_size(width, height);
+                            } else {
+                                pending_size = Some((width, height));
+                            }
+                        }
                         Some(CarLifeEvent::VideoFrame { pts_us, data }) => {
                             if let Some(s) = sender.as_mut() {
                                 let len = data.len() as u64;
@@ -312,6 +335,8 @@ pub async fn run_engine(
         keep_alive_stats: cfg.keep_alive_stats,
         width: cfg.width,
         height: cfg.height,
+        // 与 CarLife 层共用：/info 报到车机真实尺寸后写入，手机回报实际值后再覆盖
+        encoder_size: hub.encoder_size_handle(),
     };
     let outcome = airplay::negotiate(
         ctrl_r,

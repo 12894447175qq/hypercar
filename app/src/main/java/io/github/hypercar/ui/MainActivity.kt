@@ -32,10 +32,17 @@ import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -50,6 +57,8 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.hypercar.core.LinkState
 import io.github.hypercar.core.SessionSnapshot
+import io.github.hypercar.perm.AppPermissions
+import io.github.hypercar.perm.PermGroup
 import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.ui.screens.DiagnosticsScreen
 import io.github.hypercar.ui.screens.HomeScreen
@@ -63,6 +72,7 @@ import io.github.hypercar.ui.theme.HyperCarTheme
 import io.github.hypercar.ui.theme.MintGreen
 import io.github.hypercar.ui.theme.SurfaceNavBar
 import io.github.hypercar.ui.theme.TextPrimary
+import kotlinx.coroutines.delay
 import io.github.hypercar.ui.theme.TextSecondary
 
 /** 单 Activity：底部三 Tab（主页 / 设置 / 诊断），state-based 切换，无需 navigation-compose。 */
@@ -101,12 +111,50 @@ private fun MainContent() {
     val tabs = AppTab.entries
     val current = tabs[tabIndex.coerceIn(tabs.indices)]
 
-    // 无 Shizuku 降级模式：申请连车机热点所需的运行时权限（12/12L=定位，13+=附近设备）。
-    // 结果回来后刷新 Repo 快照，引导卡随之消失/推进。
+    // 权限快照：permVersion 变更即重算（申请结果回来后、或从系统设置返回时）
+    var permVersion by remember { mutableIntStateOf(0) }
+    var resumedOnce by remember { mutableStateOf(false) }
+    val permissions = remember(permVersion) { AppPermissions.summary(context) }
+    val locationServiceOn = remember(permVersion) { AppPermissions.isLocationServiceOn(context) }
+
+    // 从系统设置页返回（用户手动开权限/自启动/电池）后刷新清单
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                permVersion++
+                resumedOnce = true
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
+        permVersion++
+        // 降级模式的连接预检也依赖这些权限，结果回来后刷新 Repo 快照
         HyperCarRepo.onDegradedPermissionResult()
+    }
+
+    // 首启自动申请一次必需权限（只一次）：HyperOS 对侧载应用默认拒绝通知等，
+    // 不主动申请用户根本不知道要授权。必须等 Activity 真正 RESUMED 再弹，
+    // 否则系统会直接丢弃请求。
+    LaunchedEffect(resumedOnce) {
+        if (!resumedOnce || AppPermissions.wasPrompted(context)) return@LaunchedEffect
+        AppPermissions.markPrompted(context)
+        val all = AppPermissions.missingRequired(context)
+            .flatMap { AppPermissions.perms(it).toList() }
+            .distinct()
+        if (all.isEmpty()) return@LaunchedEffect
+        delay(300)
+        permissionLauncher.launch(all.toTypedArray())
+    }
+
+    fun requestGroup(group: PermGroup) {
+        val perms = AppPermissions.perms(group)
+        if (perms.isNotEmpty()) permissionLauncher.launch(perms)
     }
 
     Scaffold(
@@ -166,6 +214,24 @@ private fun MainContent() {
                         onOpenDiagnostics = { tabIndex = AppTab.Diagnostics.ordinal },
                         onRequestDegradedPermission = {
                             permissionLauncher.launch(HyperCarRepo.degradedPermissionsToRequest())
+                        },
+                        permissions = permissions,
+                        locationServiceOn = locationServiceOn,
+                        onRequestPermission = { requestGroup(it) },
+                        onRequestAllPermissions = {
+                            val all = AppPermissions.missingRequired(context)
+                                .flatMap { AppPermissions.perms(it).toList() }
+                                .distinct()
+                            if (all.isNotEmpty()) permissionLauncher.launch(all.toTypedArray())
+                        },
+                        onOpenOverlay = { AppPermissions.openOverlaySettings(context) },
+                        onBatteryOptimization = {
+                            AppPermissions.requestIgnoreBatteryOptimizations(context)
+                        },
+                        onAutostart = {
+                            if (!AppPermissions.openAutostartSettings(context)) {
+                                AppPermissions.openAppDetails(context)
+                            }
                         },
                     )
 
