@@ -5,6 +5,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSpecifier
 import android.os.SystemClock
 import android.util.Log
@@ -77,6 +78,25 @@ class WifiJoiner(
     val currentNetwork: Network? get() = boundNetwork.get()
 
     /**
+     * 最近一次静默入网失败的原因（人话，供会话层写进导出日志）。
+     *
+     * 为什么要这个：specifier 路径的失败在界面上**完全没有痕迹**——系统连弹窗都不弹，
+     * 只有 `onUnavailable` 回调（或 requestNetwork 直接抛异常）。没有这行原因，
+     * 现场日志只有「静默入网失败，尝试直接绑定当前网络」，看不出到底是
+     * 前台/权限/Wi-Fi 开关/热点不在范围内里的哪一种。
+     */
+    @Volatile
+    var lastFailureReason: String? = null
+        private set
+
+    /** Wi-Fi 开关是否打开：specifier 请求在 Wi-Fi 关闭时会立刻 onUnavailable（无弹窗）。 */
+    fun isWifiEnabled(): Boolean =
+        runCatching {
+            (context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager)
+                ?.isWifiEnabled == true
+        }.getOrDefault(false)
+
+    /**
      * 加入车机热点并返回可用的 Network 句柄（尚未绑进程，调用 [bindProcess] 后才生效）。
      *
      * **按 Shizuku 可用性自动分流**：有 Shizuku 走 [joinViaShell]（0 弹窗）；
@@ -86,8 +106,12 @@ class WifiJoiner(
      * @param psk  热点密码；空=开放热点；WEP 形态返回 [JoinResult.Unsupported]。
      */
     suspend fun joinCarHotspotSilently(ssid: String, psk: String): JoinResult {
+        lastFailureReason = null
         // WEP 无法用 wpa2/开放表达——两条路径都不支持，交调用方兜底
-        if (isWepKey(psk)) return JoinResult.Unsupported
+        if (isWepKey(psk)) {
+            lastFailureReason = "热点是 WEP 加密，公开 API 无法静默入网"
+            return JoinResult.Unsupported
+        }
         // 清掉旧回调/旧绑定，干净起步
         release()
         return if (ShizukuTools.isReady) {
@@ -116,13 +140,17 @@ class WifiJoiner(
 
             // ③ 轮询 cmd wifi status 直到 SSID 匹配（500ms × 15s，可取消）
             if (!awaitSsid(ssid, JOIN_WAIT_MS)) {
+                lastFailureReason = "cmd wifi 在 ${JOIN_WAIT_MS / 1000}s 内未连上 \"$ssid\"（密码错/热点不在范围/热点未开）"
                 Log.i(TAG, "connect-network 后 ${JOIN_WAIT_MS}ms 内未连上 \"$ssid\"")
                 return@withContext JoinResult.Failed
             }
 
             // ④ 不带 specifier 的 requestNetwork 取 Network 句柄（不会弹任何确认框）
             val network = awaitNetworkHandle(HANDLE_WAIT_MS)
-                ?: return@withContext JoinResult.Failed
+            if (network == null) {
+                lastFailureReason = "已连上 \"$ssid\" 但拿不到 Network 句柄"
+                return@withContext JoinResult.Failed
+            }
 
             JoinResult.Joined(network)
         }
@@ -163,6 +191,8 @@ class WifiJoiner(
     private suspend fun awaitSpecifierHandle(request: NetworkRequest, timeoutMs: Long): Network? {
         val latch = CountDownLatch(1)
         val result = AtomicReference<Network?>(null)
+        // 立刻 onUnavailable 与「等到超时」是完全不同的病因，必须分开记
+        val unavailable = java.util.concurrent.atomic.AtomicBoolean(false)
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 result.set(network)
@@ -170,6 +200,7 @@ class WifiJoiner(
             }
 
             override fun onUnavailable() {
+                unavailable.set(true)
                 latch.countDown()
             }
 
@@ -187,6 +218,7 @@ class WifiJoiner(
             connectivityManager.requestNetwork(request, cb, timeoutMs.toInt())
         } catch (t: Throwable) {
             callback.compareAndSet(cb, null)
+            lastFailureReason = "requestNetwork 抛异常：${t.javaClass.simpleName}: ${t.message}"
             Log.i(TAG, "specifier requestNetwork 失败：${t.message}")
             return null
         }
@@ -199,6 +231,17 @@ class WifiJoiner(
         if (network == null) {
             // 未拿到句柄（含用户拒绝/超时）：注销回调，别泄漏
             release()
+            lastFailureReason =
+                when {
+                    unavailable.get() && !isWifiEnabled() ->
+                        "系统立刻拒绝：Wi-Fi 开关是关的（没有弹窗是正常的）"
+                    unavailable.get() ->
+                        "系统立刻拒绝（onUnavailable）：通常因为 App 当时不在前台" +
+                            "（Android 10+ 的 WifiNetworkSpecifier 只给前台 App 弹确认框），" +
+                            "或该热点已被系统保存但处于拒绝状态"
+                    else ->
+                        "等 ${timeoutMs / 1000}s 没等到网络句柄：确认框没弹出/没点，或热点不在范围内/密码不对"
+                }
             return null
         }
         return network

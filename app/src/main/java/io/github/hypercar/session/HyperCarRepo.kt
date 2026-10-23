@@ -4,6 +4,7 @@ import android.bluetooth.BluetoothDevice
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import io.github.hypercar.autowake.AutoStart
@@ -249,16 +250,10 @@ object HyperCarRepo {
 
             // ---- 连 AirPlay 控制端口并移交 FD ----
             push(link = LinkState.Negotiating("连接车机 AirPlay 端口"))
-            val controlFd = withContext(Dispatchers.IO) {
-                runCatching {
-                    val socket = Socket()
-                    socket.tcpNoDelay = true
-                    socket.connect(InetSocketAddress(host, endpoint.airPlayPort.takeIf { it > 0 } ?: 7000), 5_000)
-                    ParcelFileDescriptor.fromSocket(socket).detachFd()
-                }.getOrNull()
-            }
+            val port = endpoint.airPlayPort.takeIf { it > 0 } ?: 7000
+            val controlFd = openControlFd(context, host, port)
             if (controlFd == null || controlFd < 0) {
-                fail("AirPlay 控制端口连接失败 $host:${endpoint.airPlayPort}")
+                fail("AirPlay 控制端口连接失败 $host:$port（默认网络/Wi-Fi 网络都试过了）")
                 return
             }
 
@@ -343,6 +338,7 @@ object HyperCarRepo {
         val ssid = endpoint.ssid
         val psk = endpoint.passphrase
         val network: Network? = if (!ssid.isNullOrBlank() && !psk.isNullOrBlank()) {
+            log("WIFI: 尝试静默加入热点 $ssid（Wi-Fi 开关=${if (joiner.isWifiEnabled()) "开" else "关"}）")
             when (val result = joiner.joinCarHotspotSilently(ssid, psk)) {
                 is WifiJoiner.JoinResult.Joined -> {
                     // 降级模式成功连上 = 系统确认框已批准（或此前批准过），记首连完成
@@ -350,11 +346,12 @@ object HyperCarRepo {
                     result.network
                 }
                 WifiJoiner.JoinResult.Unsupported -> {
-                    log("WIFI: 静默入网不支持（WEP/ROM 限制），尝试直接绑定当前网络")
+                    log("WIFI: 静默入网不支持（${joiner.lastFailureReason ?: "WEP/ROM 限制"}），尝试复用当前网络")
                     null
                 }
                 WifiJoiner.JoinResult.Failed -> {
-                    log("WIFI: 静默入网失败，尝试直接绑定当前网络")
+                    log("WIFI: 静默入网失败（${joiner.lastFailureReason ?: "原因未知"}）")
+                    log("WIFI: → 若手机已手动连上该热点，会继续用下面挑出来的网络试连；否则请在手机上手动连接")
                     null
                 }
             }
@@ -366,7 +363,7 @@ object HyperCarRepo {
         if (effective != null) {
             joiner.bindProcess(effective)
             boundNetwork = effective
-            log("WIFI: ✓ 已绑定车机网络（进程级）")
+            log("WIFI: ✓ 已绑定网络（进程级）${if (network == null) "——注意：这是兜底网络，不一定是车机热点" else ""}")
         }
         return effective
     }
@@ -375,6 +372,61 @@ object HyperCarRepo {
     private fun currentDefaultNetwork(context: Context): Network? = runCatching {
         context.getSystemService(ConnectivityManager::class.java)?.activeNetwork
     }.getOrNull()
+
+    /**
+     * 连车机 AirPlay 控制端口（TCP），按候选网络逐个试，成功返回已 detach 的 FD。
+     *
+     * 为什么不能「绑定默认网络后连一次」：手机手动连上热点后，系统默认网络仍可能是
+     * 移动数据（热点无外网，HyperOS 会主动切走），这时连 192.168.137.1 必然超时
+     * （2026-10-23 20:06、20:08 两次现场都是 5s 超时）。这里把
+     * 「已绑定的网络 → 手机上所有 Wi-Fi 网络 → 进程默认网络」都试一遍，哪条通走哪条。
+     */
+    private suspend fun openControlFd(
+        context: Context,
+        host: String,
+        port: Int,
+    ): Int? = withContext(Dispatchers.IO) {
+        val cm = context.getSystemService(ConnectivityManager::class.java)
+        val candidates = buildList<Network?> {
+            boundNetwork?.let { add(it) }
+            addAll(wifiNetworks(context))
+            add(null)
+        }.distinct()
+        for (network in candidates) {
+            val label = if (network == null) "进程默认网络" else "Wi-Fi 网络 #$network"
+            if (network != null) runCatching { cm?.bindProcessToNetwork(network) }
+            val fd = runCatching {
+                val socket = Socket()
+                socket.tcpNoDelay = true
+                socket.connect(InetSocketAddress(host, port), CONTROL_CONNECT_TIMEOUT_MILLIS.toInt())
+                ParcelFileDescriptor.fromSocket(socket).detachFd()
+            }.getOrNull()
+            if (fd != null && fd >= 0) {
+                if (network != null) {
+                    boundNetwork = network
+                    // 同步给 joiner：它的 onLost 只认自己记录的网络，不同步就解不掉绑定
+                    wifiJoiner?.bindProcess(network)
+                }
+                log("NET: ✓ $host:$port 已连通（$label）")
+                return@withContext fd
+            }
+            log("NET: 经 $label 连 $host:$port 失败")
+        }
+        // 全败：恢复默认绑定，别让进程一直卡在一块无外网的网络上
+        runCatching { cm?.bindProcessToNetwork(null) }
+        boundNetwork = null
+        null
+    }
+
+    /** 手机当前挂着的 Wi-Fi 网络（很可能就是用户手动连上的车机热点）。 */
+    private fun wifiNetworks(context: Context): List<Network> {
+        val cm = context.getSystemService(ConnectivityManager::class.java) ?: return emptyList()
+        return runCatching {
+            cm.allNetworks.filter { network ->
+                cm.getNetworkCapabilities(network)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+            }
+        }.getOrDefault(emptyList())
+    }
 
     // ---------------------------------------------------------------- socket 供给（移交 Rust）
 
@@ -773,6 +825,9 @@ object HyperCarRepo {
 
     /** 停止时等在途连接协程退出的上限（超过就先拆，连接侧另有 sessionLive 兜底）。 */
     private const val JOIN_TIMEOUT_MILLIS = 5_000L
+
+    /** 单个候选网络上连 AirPlay 控制端口的超时（多网络轮试，单次不能给太久）。 */
+    private const val CONTROL_CONNECT_TIMEOUT_MILLIS = 2_500L
 
     /** 环形日志保留行数（诊断页展示 + 导出）。 */
     private const val LOG_KEEP_LINES = 300
