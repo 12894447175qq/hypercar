@@ -315,11 +315,12 @@ fn encode_string(value: &str) -> Vec<u8> {
         with_length(0x50, value.as_bytes(), value.len())
     } else {
         let units: Vec<u16> = value.encode_utf16().collect();
-        let mut be = Vec::with_capacity(units.len() * 2);
+        let unit_count = units.len();
+        let mut be = Vec::with_capacity(unit_count * 2);
         for unit in units {
             be.extend_from_slice(&unit.to_be_bytes());
         }
-        with_length(0x60, &be, units.len())
+        with_length(0x60, &be, unit_count)
     }
 }
 

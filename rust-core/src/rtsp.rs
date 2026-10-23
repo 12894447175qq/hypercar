@@ -176,7 +176,9 @@ fn find_head_separator(buf: &[u8]) -> Option<usize> {
 /// - 入向请求（车机发来的 POST /command 等）：一律立即回 200 OK，
 ///   `/command` 的 body 经 [RtspChannel::inbound] 交给上层分发。
 pub struct RtspChannel {
-    write: Arc<Mutex<OwnedWriteHalf>>,
+    /// 写半部：必须用 tokio Mutex——写+flush 是 await 点，parking_lot 的 guard
+    /// 跨 await 会让 future 非 Send，tokio::spawn 拒收（CI 首编实证）。
+    write: Arc<tokio::sync::Mutex<OwnedWriteHalf>>,
     cipher: Arc<Mutex<Option<ControlCipher>>>,
     cseq: Arc<Mutex<i32>>,
     pending: Arc<Mutex<HashMap<i32, oneshot::Sender<RtspMessage>>>>,
@@ -191,7 +193,7 @@ impl RtspChannel {
         write: OwnedWriteHalf,
         cipher: Option<ControlCipher>,
     ) -> (Arc<Self>, mpsc::UnboundedReceiver<RtspMessage>) {
-        let write = Arc::new(Mutex::new(write));
+        let write = Arc::new(tokio::sync::Mutex::new(write));
         let cipher = Arc::new(Mutex::new(cipher));
         let cseq = Arc::new(Mutex::new(0));
         let pending: Arc<Mutex<HashMap<i32, oneshot::Sender<RtspMessage>>>> =
@@ -270,7 +272,7 @@ impl RtspChannel {
             }
         };
         {
-            let mut w = self.write.lock();
+            let mut w = self.write.lock().await;
             w.write_all(&wire)
                 .await
                 .map_err(|e| format!("控制通道写失败: {e}"))?;
@@ -315,7 +317,7 @@ impl RtspChannel {
                 None => plaintext,
             }
         };
-        let mut w = self.write.lock();
+        let mut w = self.write.lock().await;
         w.write_all(&wire)
             .await
             .map_err(|e| format!("事件通道写失败: {e}"))?;
@@ -335,7 +337,7 @@ impl Drop for RtspChannel {
     }
 }
 
-type SharedWrite = Arc<Mutex<OwnedWriteHalf>>;
+type SharedWrite = Arc<tokio::sync::Mutex<OwnedWriteHalf>>;
 type SharedCipher = Arc<Mutex<Option<ControlCipher>>>;
 type PendingMap = Arc<Mutex<HashMap<i32, oneshot::Sender<RtspMessage>>>>;
 
@@ -413,7 +415,7 @@ async fn respond_ok(write: &SharedWrite, cipher: &SharedCipher, cseq: Option<i32
             None => head.into_bytes(),
         }
     };
-    let mut w = write.lock();
+    let mut w = write.lock().await;
     let _ = w.write_all(&wire).await;
     let _ = w.flush().await;
 }

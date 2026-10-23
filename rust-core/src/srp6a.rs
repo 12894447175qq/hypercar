@@ -77,12 +77,12 @@ impl Srp6aClient {
         let mut secret = [0u8; 32];
         OsRng.fill_bytes(&mut secret);
         let a = BigUint::from_bytes_be(&secret);
-        let public_key_a = pad(&g.mod_pow(&a, n));
+        let public_key_a = pad(&g.modpow(&a, n));
 
         let u = BigUint::from_bytes_be(&crypto::sha512(&[&public_key_a, &pad(&big_b)]));
         let inner = crypto::sha512(&[USERNAME.as_bytes(), b":", SETUP_CODE.as_bytes()]);
         let x = BigUint::from_bytes_be(&crypto::sha512(&[salt, &inner]));
-        let verifier = g.mod_pow(&x, n);
+        let verifier = g.modpow(&x, n);
         // S = (B - k·v) mod N；BigUint 减法下溢会 panic，需先判断大小再补 N
         let kv = (&*K * &verifier) % n;
         let base = if big_b >= kv {
@@ -95,7 +95,7 @@ impl Srp6aClient {
         }
 
         let exponent = &a + &u * &x;
-        let shared = base.mod_pow(&exponent, n);
+        let shared = base.modpow(&exponent, n);
         // K 取**未 pad** 的最小大端字节再 SHA512（接收端同款，pad 会导致密钥不一致）
         let session_key = crypto::sha512(&[&to_bytes(&shared)]);
 

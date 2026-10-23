@@ -172,9 +172,8 @@ pub fn ed25519_verify(public: &[u8; 32], data: &[u8], signature: &[u8; 64]) -> b
     let Ok(verifying) = VerifyingKey::from_bytes(public) else {
         return false;
     };
-    let Ok(signature) = Signature::from_bytes(signature) else {
-        return false;
-    };
+    // ed25519-dalek 2.2：Signature::from_bytes 直接返回 Signature（长度固定，编译期保证）
+    let signature = Signature::from_bytes(signature);
     verifying.verify(data, &signature).is_ok()
 }
 

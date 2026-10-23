@@ -116,10 +116,11 @@ fn with_env<T>(
     match vm.get_env() {
         // 已 attach 的线程（JNI 调用栈内 / 已挂载 worker）
         Ok(mut env) => f(&mut env).ok(),
-        // tokio worker 线程：daemon 挂载（进程退出不阻塞）
+        // tokio worker 线程：daemon 挂载（进程退出不阻塞）。
+        // jni 0.21：attach_current_thread_as_daemon 返回 JNIEnv（非 AttachGuard），无需 unsafe。
         Err(_) => {
-            let mut guard = unsafe { vm.attach_current_thread_as_daemon() }.ok()?;
-            f(&mut *guard).ok()
+            let mut env = vm.attach_current_thread_as_daemon().ok()?;
+            f(&mut env).ok()
         }
     }
 }
@@ -127,7 +128,8 @@ fn with_env<T>(
 fn call_listener(method: &str, f: impl FnOnce(&mut JNIEnv, JObject) -> jni::errors::Result<()>) {
     let guard = LISTENER.read();
     let Some(global) = guard.as_ref() else { return };
-    let obj = global.as_obj();
+    // as_obj() 返回 &JObject，f 需按值接收，clone（仅新建一个 JNI 局部引用）
+    let obj = global.as_obj().clone();
     let _ = with_env(|env| f(env, obj));
     let _ = method;
 }
@@ -142,7 +144,7 @@ struct JniSocketProvider {
 
 impl JniSocketProvider {
     fn call_fd(&self, method: &str, host: &str, port: u16, timeout_ms: u32) -> Option<RawFd> {
-        let mut env = unsafe { self.vm.attach_current_thread_as_daemon() }.ok()?;
+        let mut env = self.vm.attach_current_thread_as_daemon().ok()?;
         let jhost = env.new_string(host).ok()?;
         let fd: jint = env
             .call_method(
@@ -179,7 +181,7 @@ impl SocketProvider for JniSocketProvider {
 
     fn open_udp(&self, host: &str, port: u16) -> Option<UdpSocket> {
         // 注意 Kotlin 侧 openUdpFd(host, port) 只有两个参数，签名为 (Ljava/lang/String;I)I
-        let mut env = unsafe { self.vm.attach_current_thread_as_daemon() }.ok()?;
+        let mut env = self.vm.attach_current_thread_as_daemon().ok()?;
         let jhost = env.new_string(host).ok()?;
         let fd: jint = env
             .call_method(
@@ -235,7 +237,7 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSetList
 /// 启动全链路网关：controlFd（已连车机 AirPlay 端口）+ socket 供给器 + 引擎配置 JSON。
 #[no_mangle]
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStart(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     config_json: JString,
     control_fd: jint,

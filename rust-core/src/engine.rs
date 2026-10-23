@@ -75,7 +75,8 @@ pub async fn run_engine(
     emit_state("negotiating", "CarLife 网关启动");
 
     // ---- CarLife 网关先行：协商期间 CarLife app 即可接入回环 ----
-    let (hub, mut life_events, _touch_frames) = CarLifeHub::start(
+    // （触摸接收端已内化给通道任务，hub 只保留注入 Sender）
+    let (hub, mut life_events) = CarLifeHub::start(
         CarLifeConfig {
             width: cfg.width,
             height: cfg.height,

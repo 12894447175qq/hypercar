@@ -78,7 +78,7 @@ impl CarLifeHub {
     pub fn start(
         cfg: CarLifeConfig,
         stop: Arc<Notify>,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<CarLifeEvent>, mpsc::UnboundedReceiver<Vec<u8>>), String> {
+    ) -> Result<(Self, mpsc::UnboundedReceiver<CarLifeEvent>), String> {
         let (events, event_rx) = mpsc::unbounded_channel();
         let (touch_tx, touch_rx) = mpsc::unbounded_channel();
 
@@ -134,8 +134,8 @@ impl CarLifeHub {
             },
         );
 
-        // ---- TOUCH 9340（回退 7244）：触摸/硬按键出向 ----
-        spawn_touch_channel(PORT_TOUCH, PORT_TOUCH_LEGACY, touch_tx.clone(), stop.clone());
+        // ---- TOUCH 9340（回退 7244）：触摸/硬按键出向（接收端交给通道任务消费）----
+        spawn_touch_channel(PORT_TOUCH, PORT_TOUCH_LEGACY, touch_rx, stop.clone());
 
         // ---- VR 9242 / CTRL 9440：接受并保活（语音识别/媒体信息通道，暂不消费）----
         spawn_drain(PORT_VR, "VR", stop.clone());
@@ -154,7 +154,6 @@ impl CarLifeHub {
                 cfg,
             },
             event_rx,
-            touch_rx,
         ))
     }
 
@@ -432,26 +431,24 @@ async fn handle_media_client(mut stream: TcpStream, events: mpsc::UnboundedSende
     }
 }
 
-/// 触摸通道：消费注入的触摸/硬按键帧并写出。
+/// 触摸通道：消费注入的触摸/硬按键帧并写出（持有 Receiver，与 hub 的 Sender 配对）。
 fn spawn_touch_channel(
     port: u16,
     legacy: u16,
-    touch_rx_sink: mpsc::UnboundedSender<Vec<u8>>,
+    mut touch_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     stop: Arc<Notify>,
 ) {
     // 触摸通道的接收端是「写者」：CarLife app 连上来后我们才有写目标。
     // 这里用一个共享队列承接注入帧，客户端在线时实时刷出。
     let queue: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
-    // 桥接：外部 touch_tx 发来的帧先进 queue（CarLifeHub 构造时拿到的 touch_tx
-    // 实际由这里消费）。为保持 hub 侧接口不变，用转发任务。
+    // 桥接：hub.touch_tx 发来的帧先进 queue（接收端在此消费）。
     {
         let queue = queue.clone();
-        let mut sink = touch_rx_sink;
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = stop.notified() => return,
-                    frame = sink.recv() => {
+                    frame = touch_rx.recv() => {
                         match frame {
                             Some(f) => {
                                 let mut q = queue.lock();

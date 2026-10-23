@@ -86,7 +86,7 @@ pub async fn negotiate(
         .get("displays")
         .and_then(Value::as_array)
         .and_then(|a| a.first());
-    let display_uuid = display.and_then(|d| d.get("uuid")).and_then(uuid_text);
+    let display_uuid = display.and_then(|d| uuid_text(d.get("uuid")));
     let (disp_w, disp_h) = display
         .map(|d| {
             (
@@ -232,7 +232,8 @@ pub async fn negotiate(
     let screen_stream = factory
         .open_tcp(&p.car_ip, data_port, 5_000)
         .ok_or_else(|| format!("屏幕流连接失败 {}:{data_port}", p.car_ip))?;
-    let (screen_w, _screen_r) = screen_stream.into_split();
+    // into_split 返回 (读半部, 写半部)；屏幕流只推不收，读半部直接丢弃
+    let (_screen_r, screen_w) = screen_stream.into_split();
     let screen = ScreenSender::new(screen_w, cipher, p.width, p.height, keep_alive_stats);
     emit_log(&format!(
         "AIRPLAY: ✓ 主屏流就绪 dataPort={data_port} connId={conn_id_screen} {}x{}",

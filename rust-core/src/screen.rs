@@ -205,7 +205,7 @@ impl ScreenSender {
         // 头只能构造一次：ChaCha 的 AAD 必须是最终写出的那 128 字节
         let (header, body) = match &mut self.cipher {
             ScreenCipher::ChaCha(key) => {
-                let mut header = build_header(OP_FRAME, plain.len() + TAG_SIZE, &ntp);
+                let header = build_header(OP_FRAME, plain.len() + TAG_SIZE, &ntp);
                 let sealed = chacha_seal(&*key, &nonce64(self.frame_counter), &plain, &header);
                 (header, sealed)
             }
