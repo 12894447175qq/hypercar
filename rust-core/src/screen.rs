@@ -1,0 +1,372 @@
+//! CarPlay 主屏视频发送端（屏幕流 TCP 推流，对照 cardeck `video/VideoSender.kt`）。
+//!
+//! 线格式：每条消息 = 128 字节明文头 + body。头部布局（Little-Endian）：
+//!  - `[0..4)`  u32LE body 长度（VideoFrame 含 16B Poly1305 tag）
+//!  - `[4]`     u8 opcode：0=VideoFrame，1=VideoConfig，2=KeepAlive，5=KeepAliveWithBody
+//!  - `[6]`     u8 small_param[1]：VideoConfig 置 ScreenFlag::Encrypted(0x04)
+//!  - `[8..16)` params[0]：NTP 32.32 LE 时间戳（VideoFrame 用 pts 换算；config/keepAlive 归零）
+//!  - `[16..24)` params[1] = width f32 LE；`[24..32)` params[2] = height f32 LE（仅 VideoConfig）
+//!  - `[120..124)` 0.0f32；`[124..128)` body 长度 f32 LE（仅 KeepAliveWithBody）
+//!  - 其余全零
+//!
+//! 加密（对照 cardeck `airplay/StreamFrameCipher.kt` 与 catplay ScreenFrameCodec）：
+//!  - VideoConfig / KeepAlive 恒为**明文**（两种加密形态下都不密封），不消耗帧计数；
+//!  - VideoFrame：ChaCha 形态 = ChaCha20-Poly1305 密封「4 字节 BE 长度前缀的 NAL 序列」，
+//!    AAD = 最终写出的那 128 字节头（头只能构造一次——AAD 若与线上字节不一致，
+//!    对端解密必然失败）、nonce = nonce64(帧计数)，每帧自增；
+//!  - VideoFrame：AES-CTR 形态（未配对会话）= 无 tag、长度不变，密钥流跨帧连续
+//!    （每帧新建流实例会导致对端解出乱码）。
+//!
+//! 真车实测依据（cardeck 文档事实，改头部字段前必读）：
+//!  - VideoConfig 缺 Encrypted flag（0x04）或缺 (width,height) 两个 f32 时，
+//!    部分真车（Audi 4851）**会话不断、触摸正常、屏全黑**——车机把后续密封帧按
+//!    明文 NAL 解析，日志里看不出任何错误（DiPlay/WinPlay 只读 body 不校验头，
+//!    所以测试台一直正常，真车才暴露）；
+//!  - 屏幕流 keepAlive 必须每 1 秒发一帧（明文）——它不是视频流量的备份，而是接收端
+//!    独立的存活信号；缺失时 RECORD 后约 10s 整轮会话被 reset（2026-10-19 奥迪 3315
+//!    两轮实测，视频/feedback/事件通道当时全都健康）。
+
+use crate::crypto::{chacha_seal, nonce64, Aes128CtrStream};
+use crate::timing::ntp_be;
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio::net::tcp::OwnedWriteHalf;
+
+/** 消息头定长。 */
+const HEADER_LEN: usize = 128;
+/** opcode：密封视频帧。 */
+const OP_FRAME: u8 = 0;
+/** opcode：明文 avcC 配置。 */
+const OP_CONFIG: u8 = 1;
+/** opcode：keepAlive（空 body）。 */
+const OP_KEEP_ALIVE: u8 = 2;
+/** opcode：keepAlive + 统计体 body（车机 /info 声明 keepAliveSendStatsAsBody 时用）。 */
+const OP_KEEP_ALIVE_WITH_BODY: u8 = 5;
+/** ChaCha20-Poly1305 tag 长度。 */
+const TAG_SIZE: usize = 16;
+
+/**
+ * 头部位标志（catplay `ScreenFlag`）：写进 `small_param[1]`（头部偏移 6）。
+ * `Encrypted = 1<<2`：视频帧是密封的；VideoConfig 里**必须**声明，否则真车黑屏
+ * （见模块文档）。
+ */
+const SCREEN_FLAG_ENCRYPTED: u8 = 0x04;
+
+/** 屏幕流 keepAlive 间隔（catplay `DEFAULT_KEEP_ALIVE` = 1s）。 */
+const KEEPALIVE_INTERVAL_MS: u64 = 1_000;
+
+/** VideoConfig / keepAlive 的 params[0] 恒为零（只有 VideoFrame 才写 PTS）。 */
+const ZERO_TS: [u8; 8] = [0u8; 8];
+
+/** 屏幕流帧加密方式（AirPlay `et` 的两形态；未配对会话走 AesCtr）。 */
+pub enum ScreenCipher {
+    /** 已配对会话：ChaCha20-Poly1305 密封（16B tag）。 */
+    ChaCha([u8; 32]),
+    /** 未配对会话（et=NONE 时全零会话密钥）：AES-128-CTR 流式加密，密钥流跨帧连续。 */
+    AesCtr(Aes128CtrStream),
+}
+
+/// 屏幕流发送器：持有 TCP 写半部（由调用方 `split_owned` 后传入）与加密形态。
+pub struct ScreenSender {
+    w: OwnedWriteHalf,
+    cipher: ScreenCipher,
+    /** ChaCha 帧计数（每帧自增；AES-CTR 形态不使用但照常计数，对齐参考实现）。 */
+    frame_counter: u64,
+    /** 解码器画布宽/高（VideoConfig 头部 params[1..3]，f32 LE）。 */
+    width: f32,
+    height: f32,
+    /** 车机 /info 声明 keepAliveSendStatsAsBody 时为 true → opcode=5 + 统计体。 */
+    keep_alive_with_stats: bool,
+    /** 上一次屏幕流 keepAlive 的时刻（1s 节流）。 */
+    last_keep_alive: tokio::time::Instant,
+    /** 累计发送帧数（对外统计）。 */
+    frames: u64,
+    /** 累计发送明文字节数（bytes_per_second 简化口径）。 */
+    bytes: u64,
+    /** 两次 keepAlive 之间的帧数/字节数（统计体用，参考实现 ScreenSenderStats 同义）。 */
+    frames_since_keep_alive: u64,
+    bytes_since_keep_alive: u64,
+    /** 已发 keepAlive 计数（诊断用；统计体接入 bplist 后供日志输出）。 */
+    #[allow(dead_code)]
+    keep_alive_count: u64,
+    /** 是否已发过 VideoConfig（未发前丢弃视频帧，对齐参考实现）。 */
+    config_sent: bool,
+    /** 最近一次随 VideoConfig 发出的 SPS/PPS（变化检测用）。 */
+    last_sps: Option<Vec<u8>>,
+    last_pps: Option<Vec<u8>>,
+}
+
+impl ScreenSender {
+    /// 构造。宽高强制对齐到偶数（H.264 4:2:0 要求；奇数高度会让编码器首帧进错误态）。
+    pub fn new(
+        w: OwnedWriteHalf,
+        cipher: ScreenCipher,
+        width: u32,
+        height: u32,
+        keep_alive_with_stats: bool,
+    ) -> Self {
+        let even_width = (width / 2) * 2;
+        let even_height = (height / 2) * 2;
+        Self {
+            w,
+            cipher,
+            frame_counter: 0,
+            width: even_width as f32,
+            height: even_height as f32,
+            keep_alive_with_stats,
+            last_keep_alive: tokio::time::Instant::now(),
+            frames: 0,
+            bytes: 0,
+            frames_since_keep_alive: 0,
+            bytes_since_keep_alive: 0,
+            keep_alive_count: 0,
+            config_sent: false,
+            last_sps: None,
+            last_pps: None,
+        }
+    }
+
+    /// 发送 VideoConfig（明文 avcC body）。
+    ///
+    /// 头部必须与 catplay `ScreenFrame::config` 一致：`small_param[1] |= Encrypted(0x04)`
+    /// 声明「后续视频帧是密封的」、params[1] = (width, height) 两个 f32 LE（车机据此
+    /// 建立解码器画布）、params[0] 归零（config 不带 PTS）。缺任何一项 → 真车黑屏。
+    pub async fn send_config(&mut self, avcc: &[u8]) -> std::io::Result<()> {
+        let mut header = build_header(OP_CONFIG, avcc.len(), &ZERO_TS);
+        header[6] = SCREEN_FLAG_ENCRYPTED;
+        header[16..20].copy_from_slice(&self.width.to_le_bytes());
+        header[24..28].copy_from_slice(&self.height.to_le_bytes());
+        let mut wire = Vec::with_capacity(HEADER_LEN + avcc.len());
+        wire.extend_from_slice(&header);
+        wire.extend_from_slice(avcc);
+        self.w.write_all(&wire).await?;
+        self.config_sent = true;
+        Ok(())
+    }
+
+    /// 发送一帧视频。输入 AnnexB（可能粘连 SPS/PPS/IDR/P 多 NAL）：
+    ///  - 检测到 SPS/PPS 且与上次不同时，先发 VideoConfig(avcC)；
+    ///  - 其余 NAL（SPS/PPS 除外）打成一帧（4 字节 BE 长度前缀序列）按加密形态密封后
+    ///    作 VideoFrame；`pts_us` 为毫秒时间戳 * 1000，换算 NTP 32.32 写进 params[0]。
+    ///
+    /// config 尚未发出时丢帧（对齐参考实现：车机没有 avcC 就无从解码）。
+    pub async fn send_video_annexb(&mut self, annexb: &[u8], pts_us: u64) -> std::io::Result<()> {
+        let nals = annexb_nals(annexb);
+        if nals.is_empty() {
+            return Ok(());
+        }
+        let mut sps: Option<&[u8]> = None;
+        let mut pps: Option<&[u8]> = None;
+        for &nal in &nals {
+            match nal_type(nal) {
+                7 => {
+                    if sps.is_none() {
+                        sps = Some(nal);
+                    }
+                }
+                8 => {
+                    if pps.is_none() {
+                        pps = Some(nal);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let (Some(s), Some(p)) = (sps, pps) {
+            let changed = self.last_sps.as_deref() != Some(s) || self.last_pps.as_deref() != Some(p);
+            if changed {
+                let avcc = build_avcc(s, p);
+                if !avcc.is_empty() {
+                    self.last_sps = Some(s.to_vec());
+                    self.last_pps = Some(p.to_vec());
+                    self.send_config(&avcc).await?;
+                }
+            }
+        }
+        if !self.config_sent {
+            return Ok(()); // config 未发（本帧也没带 SPS/PPS）：丢弃
+        }
+
+        // 打包「4 字节 BE 长度前缀 NAL 序列」（SPS/PPS 已经走 VideoConfig，不进帧体）
+        let mut plain = Vec::with_capacity(annexb.len());
+        for &nal in &nals {
+            let kind = nal_type(nal);
+            if kind == 7 || kind == 8 {
+                continue;
+            }
+            plain.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            plain.extend_from_slice(nal);
+        }
+        if plain.is_empty() {
+            return Ok(());
+        }
+
+        let ntp = ntp_le_from_us(pts_us);
+        // 头只能构造一次：ChaCha 的 AAD 必须是最终写出的那 128 字节
+        let (header, body) = match &mut self.cipher {
+            ScreenCipher::ChaCha(key) => {
+                let mut header = build_header(OP_FRAME, plain.len() + TAG_SIZE, &ntp);
+                let sealed = chacha_seal(&*key, &nonce64(self.frame_counter), &plain, &header);
+                (header, sealed)
+            }
+            ScreenCipher::AesCtr(stream) => {
+                // 无 tag、长度不变；密钥流状态跨帧连续（apply_keystream 推进内部计数器）
+                let header = build_header(OP_FRAME, plain.len(), &ntp);
+                let mut encrypted = plain.clone();
+                stream.apply_keystream(&mut encrypted);
+                (header, encrypted)
+            }
+        };
+        self.frame_counter = self.frame_counter.wrapping_add(1);
+
+        let mut wire = Vec::with_capacity(HEADER_LEN + body.len());
+        wire.extend_from_slice(&header);
+        wire.extend_from_slice(&body);
+        self.w.write_all(&wire).await?;
+
+        self.frames = self.frames.wrapping_add(1);
+        self.bytes = self.bytes.wrapping_add(plain.len() as u64);
+        self.frames_since_keep_alive = self.frames_since_keep_alive.wrapping_add(1);
+        self.bytes_since_keep_alive = self.bytes_since_keep_alive.wrapping_add(plain.len() as u64);
+        Ok(())
+    }
+
+    /// 屏幕流 keepAlive（内部按 1s 节流，调用方在推流循环里逐帧调用即可）。
+    ///
+    /// 明文帧、不消耗 ChaCha 帧计数。与 UDP keepAlive / RTSP feedback 是三条相互独立的
+    /// 存活信号；缺失时车机会话 ~10s 被拆（见模块文档）。stats 模式（车机 /info 声明
+    /// keepAliveSendStatsAsBody）发 opcode=5，body 长度同时写进头部 params[14] 的后 4 字节
+    /// （偏移 124，f32 LE），与 catplay 逐字节一致。
+    pub async fn maybe_send_keep_alive(&mut self) -> std::io::Result<()> {
+        if self.last_keep_alive.elapsed() < Duration::from_millis(KEEPALIVE_INTERVAL_MS) {
+            return Ok(());
+        }
+        self.last_keep_alive = tokio::time::Instant::now();
+        // 统计游标复位（fps/字节率计算待统计体接入 bplist 时再启用）
+        self.frames_since_keep_alive = 0;
+        self.bytes_since_keep_alive = 0;
+        self.keep_alive_count = self.keep_alive_count.wrapping_add(1);
+
+        let (opcode, body): (u8, Vec<u8>) = if self.keep_alive_with_stats {
+            // TODO(bplist)：统计体等 crate::bplist（Value/encode）就绪后替换为真实字典
+            // （txUsageAvg / encoderCurrentFPS / sentFramesAvg / queuedFramesAvg / lossAvg，
+            //  字段名对照 cardeck VideoSender.buildKeepAliveFrame），当前按契约发 32B 全零占位。
+            (OP_KEEP_ALIVE_WITH_BODY, vec![0u8; 32])
+        } else {
+            (OP_KEEP_ALIVE, Vec::new())
+        };
+
+        let mut header = build_header(opcode, body.len(), &ZERO_TS);
+        if !body.is_empty() {
+            // params[14]（偏移 8+14*8=120）：前 4 字节 0.0f，后 4 字节 body 长度 f32 LE
+            header[120..124].copy_from_slice(&0.0f32.to_le_bytes());
+            header[124..128].copy_from_slice(&(body.len() as f32).to_le_bytes());
+        }
+        let mut wire = Vec::with_capacity(HEADER_LEN + body.len());
+        wire.extend_from_slice(&header);
+        wire.extend_from_slice(&body);
+        self.w.write_all(&wire).await
+    }
+
+    /// 已发送帧总数（对外统计，如英雄卡实时帧率取差值）。
+    pub fn frames_sent(&self) -> u64 {
+        self.frames
+    }
+
+    /// 累计发送字节数（契约约定的简化口径；真实速率统计后续再按 keepAlive 窗口换算）。
+    pub fn bytes_per_second(&self) -> u64 {
+        self.bytes
+    }
+}
+
+/** 128 字节消息头：u32LE body 长度、opcode、NTP 32.32 LE 时间戳（params[0]），其余为零。 */
+fn build_header(opcode: u8, body_len: usize, ntp_le: &[u8; 8]) -> [u8; HEADER_LEN] {
+    let mut header = [0u8; HEADER_LEN];
+    header[0..4].copy_from_slice(&(body_len as u32).to_le_bytes());
+    header[4] = opcode;
+    header[8..16].copy_from_slice(ntp_le);
+    header
+}
+
+/// pts（微秒）→ NTP 32.32，按 LE 存进头部 params[0]。
+///
+/// 参考实现 VideoSender.buildHeader 把 NTP 64 位按小端逐字节写进 [8..16)；
+/// `ntp_be` 出的是大端序，反转即得 LE 编码。
+fn ntp_le_from_us(pts_us: u64) -> [u8; 8] {
+    let mut be = ntp_be(pts_us.saturating_mul(1_000));
+    be.reverse();
+    be
+}
+
+/// 按 00 00 00 01 / 00 00 01 起始码切分 AnnexB 码流为 NAL 载荷列表（不含起始码）。
+/// 无起始码时：非空输入整体视为一个 NAL（对齐参考实现 splitAnnexB）。
+pub fn annexb_nals(data: &[u8]) -> Vec<&[u8]> {
+    let mut starts: Vec<usize> = Vec::new();
+    let mut index = 0;
+    while index + 3 < data.len() {
+        if data[index] == 0 && data[index + 1] == 0 {
+            if data[index + 2] == 1 {
+                starts.push(index);
+                index += 3;
+                continue;
+            }
+            if index + 3 < data.len() && data[index + 2] == 0 && data[index + 3] == 1 {
+                starts.push(index);
+                index += 4;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    if starts.is_empty() {
+        if !data.is_empty() {
+            return vec![data];
+        }
+        return Vec::new();
+    }
+    let mut units = Vec::with_capacity(starts.len());
+    for (unit, &start) in starts.iter().enumerate() {
+        let prefix = if data[start + 2] == 1 { 3 } else { 4 };
+        let body_start = start + prefix;
+        let body_end = if unit + 1 < starts.len() {
+            starts[unit + 1]
+        } else {
+            data.len()
+        };
+        if body_end > body_start {
+            units.push(&data[body_start..body_end]);
+        }
+    }
+    units
+}
+
+/// H.264 NAL 类型（首字节低 5 位）；空切片返回 0。
+pub fn nal_type(nal: &[u8]) -> u8 {
+    if nal.is_empty() {
+        0
+    } else {
+        nal[0] & 0x1F
+    }
+}
+
+/// 组 avcC 记录（语义同 VideoSender 的 avcC 组装）：
+/// `1, profile, compat, level, 0xFF, 0xE1, spsLenBE, sps, 1, ppsLenBE, pps`。
+/// SPS 不足 4 字节或 PPS 为空时返回空 Vec（调用方跳过 config）。
+pub fn build_avcc(sps: &[u8], pps: &[u8]) -> Vec<u8> {
+    if sps.len() < 4 || pps.is_empty() {
+        return Vec::new();
+    }
+    let mut avcc = Vec::with_capacity(11 + sps.len() + pps.len());
+    avcc.push(1);
+    avcc.push(sps[1]); // profile
+    avcc.push(sps[2]); // compat
+    avcc.push(sps[3]); // level
+    avcc.push(0xFF); // 6 位保留 + 2 位长度尺寸-1（4 字节）
+    avcc.push(0xE1); // 3 位保留 + 5 位 SPS 数
+    avcc.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+    avcc.extend_from_slice(sps);
+    avcc.push(1);
+    avcc.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+    avcc.extend_from_slice(pps);
+    avcc
+}

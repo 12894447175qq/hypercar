@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">HyperCar</string>
+    <string name="notification_channel_link">车联会话</string>
+    <string name="notification_link_title">HyperCar 运行中</string>
+</resources>

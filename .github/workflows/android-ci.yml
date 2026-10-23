@@ -1,0 +1,340 @@
+# HyperCar —— 每次 push 自动构建**正式签名**的 Release APK；
+# **提交信息带 `[release]`（或 `[publish]`）时才发布 GitHub Release**，其余 push 只进 Artifacts。
+#
+# 与 CarDeck CI 的差异：构建前多一步 **Rust 核心层交叉编译**（cargo-ndk →
+# app/src/main/jniLibs/arm64-v8a/libhypercar_core.so），其余发布判定/签名闸门/
+# 版本累计机制同款。
+#
+# 版本号自动累计：`appVersionName` + 本次 run_number
+#   例：0.1.0 → APK 0.1.0.42（versionCode = 1_0042），每次推送 +1，可直接覆盖安装。
+#   基础版本仍只手改 app/build.gradle.kts 的 appVersionName。
+#
+# 发布规则（两种触发）：
+#   1. push 且**头提交**信息含 `[release]` / `[publish]`（必须在标题**末尾**）→ 构建后发布 Release（tag = v<版本>）
+#   2. Actions 页手动 Run workflow 并勾选 publish → 同上（可用于补发历史构建）
+#
+# 必需 Secrets（Settings → Secrets and variables → Actions）：
+#   KEYSTORE_BASE64    keystore 的 base64（单行无换行）
+#                      Linux/macOS: base64 -w0 keystore.jks
+#                      Windows:     [Convert]::ToBase64String([IO.File]::ReadAllBytes("keystore.jks"))
+#   KEYSTORE_PASSWORD  storePassword
+#   KEY_ALIAS          keyAlias
+#   KEY_PASSWORD       keyPassword
+# 可选：
+#   EXPECTED_CERT_SHA256  期望的签名证书 SHA-256（带不带冒号都行）——配了就会逐字比对，
+#                         防止误用别的 keystore 签出「正式版」。
+#
+# **没有 KEYSTORE_BASE64 会直接失败**，绝不退回 debug 签名：
+# debug 证书签出去的包，日后换正式证书时所有用户必须卸载重装（签名是不可逆决定）。
+# Gradle 侧还有第二道闸：传了 -Phypercar.buildNumber 却没有 keystore.properties 就构建失败。
+name: Build Release APK
+
+on:
+  push:
+    branches: ['**'] # 任何分支的推送都出包；是否发布 Release 由提交信息里的 [release] 决定
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: '构建后发布 GitHub Release（补发历史构建时勾选）'
+        type: boolean
+        default: false
+
+# 发布 Release 需要写权限（创建 tag / Release）
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: 构建正式签名 APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 55 # 比 CarDeck 多一步 Rust 交叉编译
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 发布判定放在最前：后面的步骤都按 publish 分流
+      - name: 判定是否发布 Release
+        id: meta
+        env:
+          HEAD_MESSAGE: ${{ github.event.head_commit.message }}
+          EVENT: ${{ github.event_name }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -eu
+          publish=false
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            [ "${INPUT_PUBLISH:-false}" = "true" ] && publish=true
+          else
+            # 只看提交标题行，且标记必须在**末尾**（`feat: xxx [release]`）。
+            # 不能在任何位置匹配：标题里顺带提到这个词的普通提交会被误发 Release。
+            subject=$(printf '%s\n' "${HEAD_MESSAGE:-}" | head -n1)
+            if printf '%s' "$subject" | grep -Eiq '\[(release|publish)\][[:space:]]*$'; then
+              publish=true
+            fi
+            echo "头提交：$subject"
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "本次是否发布 Release：$publish"
+
+      # AGP 8.5 要求 JDK 17，且与 app/build.gradle.kts 的 jvmTarget 一致
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # ---- Rust 核心层（CarDeck CI 没有这一段）----
+      - name: 安装 Rust（aarch64-linux-android 目标）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: 安装 NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+          link-to-sdk: true # 挂进 ANDROID_HOME/ANDROID_SDK_ROOT，cargo-ndk 自动发现
+
+      - name: 缓存 cargo-ndk
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-ndk
+          key: cargo-ndk-${{ runner.os }}
+
+      - name: 安装 cargo-ndk
+        run: command -v cargo-ndk >/dev/null 2>&1 || cargo install cargo-ndk --locked
+
+      - name: 缓存 rust-core 编译产物
+        uses: actions/cache@v4
+        with:
+          path: |
+            rust-core/target
+          key: rust-core-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.toml') }}
+          restore-keys: rust-core-${{ runner.os }}-
+
+      - name: 编译 Rust 核心层 → jniLibs
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -eu
+          cd rust-core
+          cargo ndk -t arm64-v8a -o ../app/src/main/jniLibs build --release
+          ls -la ../app/src/main/jniLibs/arm64-v8a/
+          test -f ../app/src/main/jniLibs/arm64-v8a/libhypercar_core.so
+
+      - name: 配置 Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # build.gradle.kts 用 rootProject.file(storeFile) 解析，所以 .jks 与
+      # keystore.properties 都放仓库根（两者都已 gitignore，不会被提交）
+      - name: 写入签名配置
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -eu
+          # 四个值缺一不可；缺了直接失败（绝不退回 debug 签名）
+          MISSING=""
+          for v in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!v:-}" ]; then MISSING="$MISSING $v"; fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::缺少仓库 Secrets:$MISSING。到 ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/settings/secrets/actions 添加（KEYSTORE_BASE64 生成：PowerShell [Convert]::ToBase64String([IO.File]::ReadAllBytes('keystore.jks'))）。本流水线只出正式签名包，不会退回 debug 签名。"
+            exit 1
+          fi
+          # 允许粘贴多行 base64（Windows 复制常见），解码前先去掉换行
+          printf '%s' "$KEYSTORE_BASE64" | tr -d '\r\n' | base64 -d > release.jks
+          {
+            echo "storeFile=release.jks"
+            echo "storePassword=$KEYSTORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > keystore.properties
+          echo "签名材料已就绪（release.jks + keystore.properties）"
+
+      - name: 计算版本号
+        id: version
+        run: |
+          set -eu
+          BASE=$(sed -n 's/^val appVersionName = "\(.*\)"/\1/p' app/build.gradle.kts)
+          test -n "$BASE" || { echo "::error::无法从 app/build.gradle.kts 读取 appVersionName"; exit 1; }
+          VERSION="${BASE}.${GITHUB_RUN_NUMBER}"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "name=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "本次版本：$VERSION（versionCode = base*10000 + ${GITHUB_RUN_NUMBER}）"
+
+      # 版本号由 build.gradle.kts 按同一规则计算（见文件里的 hypercar.buildNumber），这里只传 run_number
+      # Windows 上生成的 gradlew 在 git 里可能没有执行位（core.fileMode=false），
+      # checkout 到 Linux runner 后补一次 chmod
+      - name: 构建 Release APK
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          set -eu
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease "-Phypercar.buildNumber=$BUILD_NUMBER" --stacktrace
+
+      - name: 校验签名并打包
+        id: package
+        env:
+          VERSION: ${{ steps.version.outputs.name }}
+          EXPECTED_CERT: ${{ secrets.EXPECTED_CERT_SHA256 }}
+        run: |
+          set -eu
+          APK=app/build/outputs/apk/release/app-release.apk
+          test -f "$APK" || { echo "::error::未找到 $APK"; exit 1; }
+
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          APKSIGNER=$(ls "$SDK"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n1)
+          test -n "$APKSIGNER" || { echo "::error::找不到 apksigner"; exit 1; }
+          "$APKSIGNER" verify --print-certs "$APK" | tee certs.txt
+
+          # 配了 keystore 却仍是 debug 证书 = keystore.properties 没被读到，绝不能放出去
+          if grep -q "CN=Android Debug" certs.txt; then
+            echo "::error::产物是 debug 签名——正式签名配置没有生效（检查 keystore.properties 与 storeFile 路径）"
+            exit 1
+          fi
+          CERT=$(grep "certificate SHA-256 digest" certs.txt | head -n1 | sed 's/.*digest: //')
+          test -n "$CERT" || { echo "::error::读不到签名证书指纹"; exit 1; }
+
+          if [ -n "${EXPECTED_CERT:-}" ]; then
+            EXPECTED=$(printf '%s' "$EXPECTED_CERT" | tr -d ': ' | tr 'A-F' 'a-f')
+            ACTUAL=$(printf '%s' "$CERT" | tr -d ': ' | tr 'A-F' 'a-f')
+            if [ "$EXPECTED" != "$ACTUAL" ]; then
+              echo "::error::签名证书与 EXPECTED_CERT_SHA256 不一致：期望 $EXPECTED，实际 $ACTUAL"
+              exit 1
+            fi
+            echo "签名证书与 EXPECTED_CERT_SHA256 一致"
+          fi
+
+          # 附带核对 APK 内确有 Rust 核心层（防止 cargo-ndk 产物没被打包的静默失败）
+          if command -v unzip >/dev/null 2>&1; then
+            unzip -l "$APK" | grep -q "lib/arm64-v8a/libhypercar_core.so" \
+              || { echo "::error::APK 内缺少 libhypercar_core.so——cargo-ndk 产物未进入打包目录"; exit 1; }
+            echo "APK 内 libhypercar_core.so 已确认"
+          fi
+
+          NAME="HyperCar-${VERSION}-release.apk"
+          cp "$APK" "$NAME"
+          SHA=$(sha256sum "$NAME" | cut -d' ' -f1)
+          SIZE=$(du -h "$NAME" | cut -f1)
+          {
+            echo "name=$NAME"
+            echo "sha=$SHA"
+            echo "cert=$CERT"
+            echo "size=$SIZE"
+          } >> "$GITHUB_OUTPUT"
+          echo "已生成 $NAME（$SIZE）"
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.name }}
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: 'true' # 重跑同一 run 时版本号不变，覆盖旧产物而不是失败
+
+      - name: 写入运行摘要
+        env:
+          VERSION: ${{ steps.version.outputs.name }}
+          NAME: ${{ steps.package.outputs.name }}
+          SHA: ${{ steps.package.outputs.sha }}
+          CERT: ${{ steps.package.outputs.cert }}
+          SIZE: ${{ steps.package.outputs.size }}
+          PUBLISH: ${{ steps.meta.outputs.publish }}
+        run: |
+          set -eu
+          {
+            echo "### HyperCar ${VERSION}（正式签名）"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| APK | ${NAME} |"
+            echo "| APK 大小 | ${SIZE} |"
+            echo "| SHA-256 | ${SHA} |"
+            echo "| 签名证书 SHA-256 | ${CERT} |"
+            echo "| 发布 Release | ${PUBLISH} |"
+            echo
+            echo "安装：adb install -r ${NAME}"
+            echo
+            echo "> Artifacts 列表里显示的体积是**压缩包**大小（dex 在 APK 内不压缩，再打包会缩到约 45%）；"
+            echo "> 解压后的 APK 体积见上表。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 放在出包之后：单测挂了本次运行标红，但 APK 仍可下载
+      - name: 单元测试
+        run: |
+          set -eu
+          chmod +x gradlew
+          ./gradlew :app:testDebugUnitTest --stacktrace
+
+      # 发布放在单测**之后**：测试红了就不该产出「正式版」Release
+      # （补发历史构建时可用 workflow_dispatch + publish=true 跳过测试失败的影响）
+      - name: 发布 GitHub Release
+        if: steps.meta.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.name }}
+          TAG: ${{ steps.version.outputs.tag }}
+          NAME: ${{ steps.package.outputs.name }}
+          SHA: ${{ steps.package.outputs.sha }}
+          CERT: ${{ steps.package.outputs.cert }}
+          SIZE: ${{ steps.package.outputs.size }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          # 注意：这里是**未加引号**的 heredoc，会展开 $VAR；正文里不要出现反引号
+          # （未引号 heredoc 里反引号是命令替换，会执行 adb 并把错误写进 notes）
+          cat > notes.md <<EOF
+          HyperCar ${VERSION}（正式签名）
+
+          CarLife 本机回环 → 零转码 → 宝马 AirPlay 网关（核心层 Rust）。
+
+          | 项 | 值 |
+          |---|---|
+          | APK | ${NAME} |
+          | 大小 | ${SIZE} |
+          | SHA-256 | ${SHA} |
+          | 签名证书 SHA-256 | ${CERT} |
+
+          安装：adb install -r ${NAME}
+
+          > 用正式 keystore 签名，可直接覆盖安装上一版；换证书签名的包必须卸载重装。
+          > 前置：Shizuku 已启动并授权；本机装有 CarLife/CarWith 系 app。
+          EOF
+
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，覆盖附件"
+            gh release upload "$TAG" "$NAME" --repo "$REPO" --clobber
+            gh release edit "$TAG" --repo "$REPO" --title "HyperCar ${VERSION}" --notes-file notes.md --latest
+          else
+            # --target 必须指向本次运行的提交：默认会打到默认分支 HEAD，
+            # 从非默认分支发布时 tag 会指错提交
+            gh release create "$TAG" "$NAME" \
+              --repo "$REPO" \
+              --target "$GITHUB_SHA" \
+              --title "HyperCar ${VERSION}" \
+              --notes-file notes.md \
+              --latest
+          fi
+          gh release view "$TAG" --repo "$REPO" --json url --jq .url >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: 上传测试报告（失败时便于定位）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-${{ github.sha }}
+          path: |
+            app/build/reports/tests/**
+            app/build/test-results/**
+          if-no-files-found: ignore
+          retention-days: 7

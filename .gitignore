@@ -1,0 +1,27 @@
+# Android
+/local.properties
+/.idea/
+*.iml
+/app/build/
+/app/release/
+/captures/
+*.apk
+*.aab
+
+# Rust
+/rust-core/target/
+# 编译产物由 cargo-ndk 生成（可复现，不入库）
+/app/src/main/jniLibs/
+
+# 签名
+keystore.properties
+*.jks
+*.keystore
+*.p12
+*.pfx
+# 正式签名材料与 Secrets 清单（hypercar.p12 / keystore_base64.txt / HYPERCAR-SECRETS.txt）
+/release/
+
+# 杂项
+.DS_Store
+*.log
