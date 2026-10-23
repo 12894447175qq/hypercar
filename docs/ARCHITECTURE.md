@@ -1,8 +1,13 @@
 # HyperCar 架构说明
 
-> CarDeck + 本机 CarLife **零转码**网关：砍掉耗电的 VirtualDisplay 与 EGL 双屏合成，
-> 让本机的百度 CarLife / 荣耀车联 / 小米 CarWith（CarLife 兼容）连回 **127.0.0.1**，
-> H.264 裸流经 Rust 核心层零转码直推 **宝马 X6（2023）ID8.5** 的 AirPlay 接收端。
+> CarDeck + CarLife **零转码**网关：砍掉耗电的 VirtualDisplay 与 EGL 双屏合成，
+> 把本机 CarLife / 荣耀车联 / 小米 CarWith（CarLife 兼容）产出的 H.264 与 PCM
+> 经 Rust 核心层零转码直推 **宝马 X6（2023）ID8.5** 的 AirPlay 接收端。
+>
+> 两种部署形态（协议实现同一份，只是「谁监听」不同）：
+> - **本机 HU**：`hypercar_core` 跑在手机里，CarLife 连回 `127.0.0.1:7240…`；
+> - **盒子角色**：`rust-core/hub` 跑在车机侧（PC/WinPlay 联调），CarWith 的
+>   「车辆热点 → 开始连接」让 MD 先监听，HU 再逐个端口拨过去。
 >
 > 硬件环境：手机 = Android 17 / HyperOS 4；车机 = BMW iD8.5（MGU-86）。
 
@@ -49,7 +54,7 @@ Kotlin（薄壳 + 系统集成）
 Rust（rust-core，全部协商 + 数据面）
 ├── lib.rs                      JNI 入口、运行时、引擎生命周期、回调（onState/onLog/onStats）
 ├── engine.rs                   编排：CarLife 事件分发 → 视频泵/音频泵 → 统计
-├── carlife.rs                  CarLife HU 服务端（标准端口 + 7241~7244 回退）
+├── carlife.rs                  CarLife 网关（6 标准端口；start=监听 / connect=拨 MD）
 ├── airplay.rs                  AirPlay 会话：/info→pair-verify→SETUP→RECORD→心跳→HID
 ├── rtsp.rs                     RTSP 通道：1422 MTU 密文帧、CSeq 异步派发、入向 200
 ├── screen.rs                   屏幕流：VideoConfig/VideoFrame/keepAlive（128B 头）
@@ -74,8 +79,10 @@ Rust（rust-core，全部协商 + 数据面）
   → Socket(车机IP:7000) connect → detachFd → RustCoreBridge.nativeStart
   → Rust：GET /info → pair-verify → modesChanged → SETUP(/setup) → 事件通道
     → 屏幕流 SETUP → 音频流 SETUP → RECORD → 三条心跳
-  → onState("connected") → 广播唤醒本机 CarLife（StartWireless）
-  → CarLife 连 127.0.0.1:7240… → 版本/鉴权握手 → 0x10007 下发 1920×720@60
+  → onState("connected") → 唤醒本机 CarLife（三级：应用内广播 → Shizuku shell 广播 →
+    monkey 拉起；包名自动纠错，HyperOS 上实际是 com.baidu.carlife.xiaomi）
+  → CarLife 连 127.0.0.1:7240… → 版本/鉴权握手 → 0x10007 下发编码尺寸
+    （默认 2560×744；手机回报实际尺寸后画布自动跟随）
   → H.264 裸流泵入 ScreenSender；PCM 泵入混音器；车机 HID 触摸回注 CarLife
 下车：ACL 断开 → ACTION_STOP → nativeStop + iap2.stop + 网络释放
 ```
@@ -101,8 +108,15 @@ Rust（rust-core，全部协商 + 数据面）
 - **音频**：媒体（44.1k/48k 立体声）与 TTS（16k 单声道）各自线性重采样到 48k 立体声，
   按 352 帧出包；TTS 活跃时媒体增益 0.25（400ms 尾音保持）；RTP 封包（PT=100、
   SSRC=0、AAD=头 4..12、独立 nonce 计数、尾部 8B nonce、PCM 大端）；每秒同步包。
-- **触摸**：车机 hidSendReport（事件通道）→ 显示空间→CarLife 编码空间缩放 →
-  0x68001；iDrive 旋钮/媒体键 → 0x68008 硬按键。
+- **触摸**：车机 hidSendReport（事件通道，**每指 6 字节** `[index][touch][X LE][Y LE]`，
+  最多 2 指）→ 接收端显示空间 → CarLife 编码空间缩放 → `CarlifeTouchAction`
+  **protobuf**（action/x/y/pointerx/pointery，0x68001）；iDrive 旋钮/媒体键 →
+  0x68008 硬按键（裸 u32 BE）。事件通道必须活到会话结束——`RtspChannel` 的
+  `Drop` 会关 socket（早期实现就是连上即被自己关掉，触摸全丢）。
+- **麦克风**：CarLife 语音助手要求「车机」供麦。本机 HU 用手机 `AudioRecord`
+  （16k mono）→ `nativeSendMic` → `carlife::inject_mic` → VR 通道
+  `VR_MIC_DATA 0x58001`（12 字节媒体头 + PCM）。盒子角色没有麦克风来源时，
+  在车机端设置把麦克风源切成「手机麦克风录音」。
 
 ## 5. 状态机（UI 视角）
 
@@ -131,4 +145,5 @@ Rust（rust-core，全部协商 + 数据面）
   「引擎任务异常退出」；`nativeInitLogger` 装的 panic hook 再把 `PANIC:` 行打到 logcat。
 - 启动时（有 Shizuku 即可）`captureCrashArtifacts()` 用 shell 读 `logcat -s HyperCar-Core`
   与 crash 缓冲区，把 `PANIC`/`Fatal signal` 行抓进日志，免 adb。
+
 

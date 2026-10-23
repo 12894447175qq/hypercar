@@ -16,7 +16,7 @@
 |---|---|---|---|
 | AirPlay 协商 | Kotlin 完成（pair-setup/verify、RTSP SETUP），Rust 只接「已连通 FD + 已派生密钥」 | 协商状态机极复杂：/info、pair-verify、modesChanged、两级 SETUP、RECORD、事件通道、三条心跳，跨语言传密钥要序列化 80B+ 且方向易错 | **协商下沉 Rust**（`airplay.rs`）；Kotlin 只提供「绑定车机网络的 socket 供给器」（`SocketProvider` 回调 openTcpFd/openUdpFd）。协商状态机只有一份实现，秒连路径少一次跨语言往返 |
 | 密钥派生 | Kotlin 派生好交给 Rust（video_key/video_iv/audio_key） | 流密钥 = HKDF(shared, "DataStream-Salt<connId>")，connId 每次 SETUP 随机；「先派生后移交」意味着 Kotlin 必须完整跑完 SETUP | Rust 内自派生（`airplay::stream_key`），Kotlin 完全不接触密钥 |
-| CarLife 端口 | 监听 7240~7244 连续端口 | 标准车机端口是 7240/8240/9240/9241/9242/9340/9440（发送端按此连接） | 监听标准端口 + 7241~7244 回退双布局（`carlife.rs`） |
+| CarLife 端口 | 监听 7240~7244 连续端口 | 标准车机端口是 7240/8240/9240/9241/9242/9340，**没有 9440，也没有 7241~7244**；且方向取决于入口：Android 同机由 HU 监听，盒子角色（CarWith 车辆热点）由 MD 监听、HU 拨号 | 只实现 6 个标准端口；`CarLifeHub::start`（监听）/ `connect`（主动拨 MD）两种方向，见 `docs/CARLIFE-PROTOCOL.md` |
 
 ## 2. 视频线格式：参考文档按此实现会「真车黑屏」
 
@@ -129,14 +129,19 @@ hypercar 的 Kotlin iAP2 层（`iap2/`）按 cardeck docs §3/§4/§5/§9h/§9j 
 
 ## 8. 仍未定谳 / 需实车校准
 
-1. **BMW iD8.5 的 HID 触摸报告格式**：cardeck 只实测了奥迪（5B `[tip][X u16LE]
-   [Y u16LE]`）；BMW 描述符未抓过。hypercar 默认按奥迪格式解析并做显示空间缩放，
-   首次实车若触摸漂移，在 `airplay::handle_hid_report` 按 /info hidDevices 描述符调整。
-2. **BMW 的 CarLife 唤醒广播**：`com.baidu.carlife.Action.StartWireless` 对 CarLife
-   官方 app 有效；CarWith/荣耀车联的 CarLife 兼容组件是否监听同一 action 需实测
-   （设置里可切换目标包名）。
+1. ~~**BMW iD8.5 的 HID 触摸报告格式**~~ → **已定谳（2026-10-24）**：不是奥迪的 5B
+   `[tip][X u16LE][Y u16LE]`，而是**每指 6 字节** `[index][touch][X u16LE][Y u16LE]`，
+   最多 2 指；载荷在事件报文的**顶层 `hidReport`** 字段（不是 `params.report`）。
+   CarLife 侧也不是 12B 裸结构，而是 `CarlifeTouchAction` **protobuf**。
+   实现见 `airplay::handle_hid_report` / `carlife::touch_proto`。
+2. ~~**CarLife 唤醒广播**~~ → **已实测（HyperOS + CarWith）**：
+   `com.baidu.carlife.Action.StartWireless` 对 `com.baidu.carlife` 有效，但小米上
+   **没有这个包**（只有 `com.baidu.carlife.xiaomi` 与 `com.miui.carlink`），不带包名
+   的广播被静默丢弃 → 表现为「一直 Waiting」。现行做法：包名自动探测 + 三级唤醒
+   （应用内广播 → Shizuku shell 广播 → monkey），设置里也可手选。
 3. **CarLife 握手已按 CarLifeWirelessBox 重构**（14 步 + 8 字节 CMD 头 + 正确 ID）。
    剩余不确定点收敛为：MEDIA/TTS 初始化载荷的 protobuf 字段号、MD 是否跳过
    MD_AUTHEN_RESPONSE（两者都已做兼容），详见 docs/CARLIFE-PROTOCOL.md §6。
 4. **0x5702 是否必须带参数**（BMW 空体接受性）——cardeck 同样未定谳，需要一次
    真 iPhone 同车抓包。
+

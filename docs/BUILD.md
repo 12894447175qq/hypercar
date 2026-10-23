@@ -24,6 +24,30 @@ cd rust-core && cargo check
 cargo test   # 纯函数（bplist/tlv8/srp/封帧）可在宿主跑单测
 ```
 
+### 1.1 一键构建（Windows，已装 JDK17 / SDK35 / NDK / rust）
+
+```powershell
+pwsh -File tools\build-local.ps1 -Release -BuildNumber <N>   # 全量：Rust + APK
+pwsh -File tools\build-local.ps1 -Release -SkipRust          # 只改 Kotlin 时
+```
+
+脚本自动处理：非 ASCII 路径（建 ASCII junction 后再构建）、`CARGO_TARGET_DIR`
+外置、NDK 环境变量，并把 `.so` 拷到 `app/src/main/jniLibs`。
+
+### 1.2 PC 侧 HU（盒子角色 / 联调）
+
+独立 crate `rust-core/hub`，用 `#[path]` 复用同一批协议源码（不含 JNI/android_logger），
+**不影响 Android 构建**：
+
+```powershell
+cd rust-core\hub
+cargo build --release      # 产物 target/release/hypercar-hub.exe
+
+# 典型联调：先让 WinPlay 点「开始接收」（它才会监听 17000）
+.\target\release\hypercar-hub.exe --device-id <手机蓝牙MAC> --airplay 127.0.0.1:17000 `
+    --md-host <手机IP> --touch-display 2732x794 --voice 0
+```
+
 ## 2. 编译 Android 应用
 
 ```bash
@@ -84,5 +108,14 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
   - `Shizuku 未就绪` → 启动 Shizuku 并重新授权。
   - `0x5702 后无 0x5703` → 车机未开无线 CarPlay 窗口；在车机上点一次手机图标。
   - `会话 SETUP 被拒 403` → 车机按 deviceID 过滤；确认设置里的目标车机与本机蓝牙 MAC 匹配。
-  - `CarLife 一直 Waiting` → 唤醒包名不对，或 CarLife app 版本过新（≥7.2 与第三方
-    车机端不兼容，需用 CarWith 的 CarLife 连接通道）。
+  - `CarLife 一直 Waiting` → 先确认唤醒包名：HyperOS 上是 `com.baidu.carlife.xiaomi`
+    （不是 `com.baidu.carlife`），App 会自动纠错并在日志里写明替换结果，仍不行就在设置里手选。
+    若用 PC 侧 hub（盒子角色），这不是"唤醒"问题，而是 **MD 在监听、需要 hub 主动拨过去**
+    （`--md-host`），且 CarWith 必须先走一次「车辆热点 → 选车机蓝牙 → 开始连接」。
+  - `CarLife CMD 7240 绑定失败: Address already in use` → 7240 被 CarLife（MD）占着。
+    这个端口只能有一个主人：要么 MD 监听（盒子角色，HU 拨号），要么 HU 监听（本机 HU，
+    需要 MD 有连回环的通道）。两边同时抢就会报这个错。
+  - 语音助手「麦克风有问题 / 不响应」 → 见 `docs/CARLIFE-PROTOCOL.md`：CarLife 期望
+    「车机」供麦（VR `VR_MIC_DATA 0x58001`），或把车机端设置切到「手机麦克风录音」；
+    MIUI 会把 CarWith 的后台录音静音（appops 锁在 foreground），此时只能靠本 App 供麦。
+
