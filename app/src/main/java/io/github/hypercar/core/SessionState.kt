@@ -56,6 +56,15 @@ data class SessionSnapshot(
     val audio: AudioStats = AudioStats(),
     val shizukuReady: Boolean = false,
     val targetCar: String? = null,
+
+    // ---- 无 Shizuku 降级模式的引导状态（shizukuReady=true 时全部忽略）----
+    /** 降级模式下连车机热点所需的运行时权限是否已授予（12/12L=定位，13+=附近设备）。 */
+    val degradedPermissionGranted: Boolean = true,
+    /** 降级模式下系统定位服务是否开启（仅 12/12L 相关；13+ 恒 true）。 */
+    val degradedLocationOn: Boolean = true,
+    /** 降级模式下是否已完成过一次前台首连（系统确认框已批准）。 */
+    val degradedFirstConnectDone: Boolean = false,
+
     /** 调试日志记录开关（关 = 暂停写入环形缓冲，不丢既有内容）。 */
     val logRecording: Boolean = true,
     /** 最近一次导出的绝对路径（null = 尚未导出）。 */

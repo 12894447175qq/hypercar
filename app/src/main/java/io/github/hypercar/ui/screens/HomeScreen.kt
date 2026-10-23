@@ -26,6 +26,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import io.github.hypercar.core.SessionSnapshot
+import io.github.hypercar.ui.components.DegradedGuidanceCard
 import io.github.hypercar.ui.components.GlassPanel
 import io.github.hypercar.ui.components.StatChips
 import io.github.hypercar.ui.components.StatusHeroCard
@@ -43,6 +44,7 @@ fun HomeScreen(
     onStart: () -> Unit,
     onStop: () -> Unit,
     onOpenDiagnostics: () -> Unit,
+    onRequestDegradedPermission: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     BoxWithConstraints(modifier = modifier.fillMaxSize()) {
@@ -62,6 +64,13 @@ fun HomeScreen(
                         link = snapshot.link,
                         onStartClick = onStart,
                         onStopClick = onStop,
+                    )
+                    DegradedGuidanceCard(
+                        permissionGranted = snapshot.degradedPermissionGranted,
+                        locationOn = snapshot.degradedLocationOn,
+                        firstConnectDone = snapshot.degradedFirstConnectDone,
+                        onRequestPermission = onRequestDegradedPermission,
+                        onTestConnect = onStart,
                     )
                     StatChips(snapshot = snapshot)
                 }
@@ -84,6 +93,13 @@ fun HomeScreen(
                     link = snapshot.link,
                     onStartClick = onStart,
                     onStopClick = onStop,
+                )
+                DegradedGuidanceCard(
+                    permissionGranted = snapshot.degradedPermissionGranted,
+                    locationOn = snapshot.degradedLocationOn,
+                    firstConnectDone = snapshot.degradedFirstConnectDone,
+                    onRequestPermission = onRequestDegradedPermission,
+                    onTestConnect = onStart,
                 )
                 StatChips(snapshot = snapshot)
                 LogPreviewCard(

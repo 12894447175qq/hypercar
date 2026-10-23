@@ -13,6 +13,7 @@ import io.github.hypercar.core.SessionSnapshot
 import io.github.hypercar.iap2.CarPlayEndpoint
 import io.github.hypercar.iap2.Iap2Coordinator
 import io.github.hypercar.net.BluetoothMac
+import io.github.hypercar.net.SpecifierPermissions
 import io.github.hypercar.net.WifiJoiner
 import io.github.hypercar.settings.SettingsStore
 import io.github.hypercar.shizuku.ShizukuTools
@@ -130,7 +131,15 @@ object HyperCarRepo {
             // Shizuku 从「必须」降级为「可选增强」：没有它照样能连，只是两条路径降级——
             //  WiFi 走 WifiNetworkSpecifier（热点首连弹一次系统确认框）+ deviceID 用稳定伪 MAC。
             if (!ShizukuTools.isReady) {
-                log("SHIZUKU: 未就绪——降级模式（热点首连需确认一次，deviceID 用稳定伪 MAC）")
+                // 降级模式预检：权限缺失/定位服务关闭时提前失败并给出可操作原因，
+                // 不要等 requestNetwork 静默 onUnavailable 才让用户一头雾水。
+                if (!precheckDegradedMode(context)) return
+                val first = !SettingsStore.degradedFirstConnectDone
+                log(
+                    "SHIZUKU: 未就绪——降级模式" +
+                        if (first) "（热点首连需在系统确认框点「连接」，deviceID 用稳定伪 MAC）"
+                        else "（热点已批准过，应静默；deviceID 用稳定伪 MAC）"
+                )
             }
             push(link = LinkState.Negotiating("解析本机蓝牙身份"))
             val deviceMac = BluetoothMac.resolveOrStable()
@@ -232,7 +241,11 @@ object HyperCarRepo {
         val psk = endpoint.passphrase
         val network: Network? = if (!ssid.isNullOrBlank() && !psk.isNullOrBlank()) {
             when (val result = joiner.joinCarHotspotSilently(ssid, psk)) {
-                is WifiJoiner.JoinResult.Joined -> result.network
+                is WifiJoiner.JoinResult.Joined -> {
+                    // 降级模式成功连上 = 系统确认框已批准（或此前批准过），记首连完成
+                    markDegradedFirstConnectIfNeeded()
+                    result.network
+                }
                 WifiJoiner.JoinResult.Unsupported -> {
                     log("WIFI: 静默入网不支持（WEP/ROM 限制），尝试直接绑定当前网络")
                     null
@@ -361,7 +374,62 @@ object HyperCarRepo {
             link = link ?: s.link,
             carLife = carLife ?: s.carLife,
             shizukuReady = ShizukuTools.isReady,
+            degradedPermissionGranted = degradedPermissionGranted(),
+            degradedLocationOn = degradedLocationOn(),
+            degradedFirstConnectDone = SettingsStore.degradedFirstConnectDone,
         )
+    }
+
+    // ---------------------------------------------------------------- 降级模式引导
+
+    /** 降级模式下连热点的运行时权限是否已授予（有 Shizuku 时不需要，恒 true）。 */
+    private fun degradedPermissionGranted(): Boolean {
+        if (ShizukuTools.isReady) return true
+        val ctx = appCtx ?: return true
+        return runCatching { SpecifierPermissions.isGranted(ctx) }.getOrDefault(false)
+    }
+
+    /** 系统定位服务是否开启（仅 12/12L 相关；13+ 用 NEARBY_WIFI_DEVICES，恒 true）。 */
+    private fun degradedLocationOn(): Boolean {
+        if (ShizukuTools.isReady) return true
+        val ctx = appCtx ?: return true
+        return runCatching { SpecifierPermissions.isLocationEnabled(ctx) }.getOrDefault(true)
+    }
+
+    /**
+     * 由 UI 调：发起降级模式所需的运行时权限申请。
+     * 走标准 ActivityResult 由 Activity 侧发起（这里只决定申请哪些权限）。
+     */
+    fun degradedPermissionsToRequest(): Array<String> = SpecifierPermissions.requiredPermissions()
+
+    /** 权限申请结果回调（UI 侧 ActivityResult 后调用），刷新快照让引导卡消失。 */
+    fun onDegradedPermissionResult() {
+        log("PERM: 权限申请结果 refreshed（granted=${degradedPermissionGranted()}）")
+        push()
+    }
+
+    /**
+     * 降级模式连接前预检：权限缺失/定位服务关闭时**提前失败**并给出可操作原因，
+     * 而不是等 WifiNetworkSpecifier 的 requestNetwork 静默 onUnavailable 才懵。
+     */
+    private fun precheckDegradedMode(context: Context): Boolean {
+        if (ShizukuTools.isReady) return true
+        val reason = SpecifierPermissions.degradeBlockReason(context)
+        if (reason != null) {
+            fail(reason)
+            return false
+        }
+        return true
+    }
+
+    /** 降级模式成功连上车机热点后：标记首连已完成（系统确认框已批准，后续静默）。 */
+    private fun markDegradedFirstConnectIfNeeded() {
+        if (ShizukuTools.isReady) return
+        if (!SettingsStore.degradedFirstConnectDone) {
+            SettingsStore.degradedFirstConnectDone = true
+            log("PERM: ✓ 降级模式首连完成——此后上车自动连接将静默（不再弹确认框）")
+            push()
+        }
     }
 
     /** 环形日志（200 行）+ 快照更新。任意线程可调。行前缀带 HH:mm:ss.SSS 时间戳（上车对表用）。 */

@@ -2,7 +2,9 @@ package io.github.hypercar.ui
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
@@ -99,6 +101,14 @@ private fun MainContent() {
     val tabs = AppTab.entries
     val current = tabs[tabIndex.coerceIn(tabs.indices)]
 
+    // 无 Shizuku 降级模式：申请连车机热点所需的运行时权限（12/12L=定位，13+=附近设备）。
+    // 结果回来后刷新 Repo 快照，引导卡随之消失/推进。
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        HyperCarRepo.onDegradedPermissionResult()
+    }
+
     Scaffold(
         containerColor = DeepSpace,
         topBar = { StatusStrip(link = snapshot.link) },
@@ -154,6 +164,9 @@ private fun MainContent() {
                         onStart = { HyperCarRepo.connect(context) },
                         onStop = { HyperCarRepo.disconnect() },
                         onOpenDiagnostics = { tabIndex = AppTab.Diagnostics.ordinal },
+                        onRequestDegradedPermission = {
+                            permissionLauncher.launch(HyperCarRepo.degradedPermissionsToRequest())
+                        },
                     )
 
                     AppTab.Settings -> SettingsScreen()

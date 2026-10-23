@@ -36,6 +36,7 @@ object SettingsStore {
     private const val KEY_KEEP_ALIVE_STATS = "keep_alive_stats"
     private const val KEY_DEBUG_LOG = "debug_log_enabled"
     private const val KEY_STABLE_DEVICE_ID = "stable_device_id"
+    private const val KEY_DEGRADED_FIRST_CONNECT = "degraded_first_connect_done"
 
     /** 目标车机（多车场景）：null = 自动（来者不拒）。 */
     var targetCarMac: String?
@@ -110,6 +111,17 @@ object SettingsStore {
             p().edit().putString(KEY_STABLE_DEVICE_ID, mac).apply()
             return mac
         }
+
+    /**
+     * 无 Shizuku 降级模式下，是否已完成过一次「前台首连」（系统确认框已批准）。
+     *
+     * WifiNetworkSpecifier 每个热点**首次**连接弹一次系统确认框，且后台 FGS 拉起时
+     * 不保证弹得出。所以推荐装好后在前台手动连一次完成批准；本标记用于 UI 判断是否
+     * 还需要提示用户「去前台完成首连」。只在降级模式有意义，装了 Shizuku 就不再看它。
+     */
+    var degradedFirstConnectDone: Boolean
+        get() = p().getBoolean(KEY_DEGRADED_FIRST_CONNECT, false)
+        set(v) = p().edit().putBoolean(KEY_DEGRADED_FIRST_CONNECT, v).apply()
 
     /** 引擎配置 JSON（Rust EngineConfig::from_json 消费）。 */
     fun engineConfigJson(carIp: String, airplayPort: Int, deviceBluetoothMac: String, identityPath: String): String {
