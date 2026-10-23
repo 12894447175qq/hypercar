@@ -26,10 +26,13 @@ object RustCoreBridge {
     const val CL_KEY_KNOB_RIGHT = 0x1D
     const val CL_KEY_KNOB_SELECT = 0x1E
 
-    /** 触摸动作（与 CarLife 0x68001 字段 1 对齐）。 */
-    const val TOUCH_DOWN = 1
-    const val TOUCH_UP = 2
-    const val TOUCH_MOVE = 3
+    /**
+     * 触摸动作（**CarLife 语义**：0=DOWN/1=UP/2=MOVE，不是 Android MotionEvent 的 1/2/3）。
+     * CTRL 通道载荷为裸 BE 结构 `[u32 action][u32 x][u32 y]`。
+     */
+    const val TOUCH_DOWN = 0
+    const val TOUCH_UP = 1
+    const val TOUCH_MOVE = 2
 
     /**
      * socket 供给器：Rust 协商过程中需要新开「绑定车机网络」的套接字

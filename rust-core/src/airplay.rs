@@ -615,10 +615,13 @@ fn handle_hid_report(
     let y_raw = u16::from_le_bytes([report[3], report[4]]) as u32;
     let x = (x_raw * target.0 / display.0).min(target.0 - 1);
     let y = (y_raw * target.1 / display.1).min(target.1 - 1);
+    // 动作边沿：按下沿 → DOWN，保持 → MOVE，抬起沿 → UP。
+    // 用 **CarLife 语义**（0=DOWN/1=UP/2=MOVE），不是 Android MotionEvent 的 1/2/3——
+    // 下游 carlife::inject_touch 直接按 CarLife 裸结构封包。
     let action = match (*tip_down, pressed) {
-        (false, true) => 1, // DOWN
-        (true, true) => 3,  // MOVE
-        (true, false) => 2, // UP
+        (false, true) => crate::carlife::TOUCH_DOWN,
+        (true, true) => crate::carlife::TOUCH_MOVE,
+        (true, false) => crate::carlife::TOUCH_UP,
         (false, false) => return, // 无状态变化
     };
     *tip_down = pressed;

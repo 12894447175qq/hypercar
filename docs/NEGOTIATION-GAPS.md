@@ -80,14 +80,22 @@ hypercar 实现：`rtsp.rs`（1422 MTU、CSeq 异步派发、入向请求自动 
 `airplay.rs`（上列 1-8 全部内化；三条心跳分别在 `spawn_keepalive_loops` 与
 视频泵的 keepAlive 节流里）。
 
-## 5. CarLife 消息层：参考文档的缺失与不符
+## 5. CarLife 消息层：参考文档与实测协议的差异
 
-| 项 | 参考文档 | hypercar（实测口径） |
+> 详见 **[docs/CARLIFE-PROTOCOL.md](CARLIFE-PROTOCOL.md)**（14 步握手 / 两种帧头 / 载荷格式）。
+> 本节只列与参考文档冲突、且已按 CarLifeWirelessBox 实测实现纠正的项。
+
+| 项 | 参考文档 | hypercar（按 CarLifeWirelessBox/apollo-DuerOS 纠正） |
 |---|---|---|
-| 握手 | 无（直接发 encoder init） | 版本协商 0x18001→0x10002、鉴权 0x18004→0x1000B（放行）、心跳 0x20002；握手完成后才下发 0x10007/0x10008（否则老 app 可能不接受编码参数） |
-| 触摸消息 ID | 0x00040001 | **0x68001**（425985 实测）；硬按键 **0x68008**（425992） |
-| 音频初始化 | 解析 0x00020001 的 protobuf rate/ch | 一致；补充 TTS 域 0x00030001 与停止消息 0x00020002/0x00020004 的缓冲清理 |
-| 通道健壮性 | 单次 accept、单客户端 | 每通道单客户端但新连接顶替旧连接（CarLife app 重连场景）；缓冲上限防 OOM |
+| 帧头 | 全通道 12 字节 `[len][ts][type]` | **CMD(7240)/CTRL(9340) 是 8 字节** `[u16 len][u16 rsv][u32 type]`；仅 VIDEO/MEDIA/TTS/VR 是 12 字节。写成 12 字节 → MD 侧把握手消息当垃圾 |
+| 端口 | 7240~7244 + 9440 | 标准 6 口：7240/8240/9240/9241/9242/9340。**无 9440，无 7241~7244** |
+| 握手 | 无（直接发 encoder init） | **14 步事件驱动**：版本→统计→设备信息→特性配置→鉴权(4 段)→编码器 init/done/start |
+| 鉴权 ID | 0x00018004 / 0x0001000B | **0x00018048 / 0x00010049 / 0x0001804A / 0x0001004B**（请求/响应/结果/结果） |
+| 编码器 ID | 0x00010007 + 0x00010008 | init **0x00018007**(HU→MD)、init_done **0x00010008**(MD→HU)、start **0x00018009**(HU→MD)；**必须等 done 再发 start** |
+| 触摸消息 ID | 0x00040001 | **0x68001**；硬按键 **0x68008** |
+| 触摸载荷 | protobuf varint | **裸 BE 结构** `[u32 action][u32 x][u32 y]`，action 0=DOWN/1=UP/2=MOVE |
+| 音频/TTS 域 | 0x00020001 / 0x00030001 | MEDIA 域 **0x0003xxxx**、TTS 域 **0x0004xxxx**（0x0002xxxx 是 VIDEO） |
+| 通道健壮性 | 单次 accept、单客户端 | 每通道单客户端但新连接顶替旧连接；缓冲上限防 OOM |
 | 触摸坐标 | 直接透传车机坐标 | 车机显示空间 → CarLife 编码空间缩放（HID 报告按 /info displays 宽高归一） |
 
 ## 6. iAP2（蓝牙协商）侧：cardeck 实测教训全部继承
@@ -123,8 +131,8 @@ hypercar 的 Kotlin iAP2 层（`iap2/`）按 cardeck docs §3/§4/§5/§9h/§9j 
 2. **BMW 的 CarLife 唤醒广播**：`com.baidu.carlife.Action.StartWireless` 对 CarLife
    官方 app 有效；CarWith/荣耀车联的 CarLife 兼容组件是否监听同一 action 需实测
    （设置里可切换目标包名）。
-3. **CarLife 握手的 protobuf 细节**（版本字段布局）：按 apollo-DuerOS 最小集实现
-   并全程容忍应答缺失；若实车 CarLife app 不推流，用 `carlife_pc_tool` 抓一次
-   真机对照补字段。
+3. **CarLife 握手已按 CarLifeWirelessBox 重构**（14 步 + 8 字节 CMD 头 + 正确 ID）。
+   剩余不确定点收敛为：MEDIA/TTS 初始化载荷的 protobuf 字段号、MD 是否跳过
+   MD_AUTHEN_RESPONSE（两者都已做兼容），详见 docs/CARLIFE-PROTOCOL.md §6。
 4. **0x5702 是否必须带参数**（BMW 空体接受性）——cardeck 同样未定谳，需要一次
    真 iPhone 同车抓包。

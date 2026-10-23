@@ -309,6 +309,8 @@ object HyperCarRepo {
                     wakeLocalCarLife()
                 }
                 "carlife_waiting" -> push(carLife = CarLifeState.Waiting())
+                // Rust 侧 CarLife 14 步握手完成（VIDEO_ENCODER_START 已发）
+                "carlife_active" -> push(carLife = CarLifeState.Active())
                 "failed" -> fail(detail)
                 "ended" -> {
                     scope.launch { runDisconnect(detail) }
