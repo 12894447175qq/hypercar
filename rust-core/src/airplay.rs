@@ -95,9 +95,11 @@ pub async fn negotiate(
             )
         })
         .unwrap_or((0, 0));
+    // 车机能力位图：判断是否支持 HEVC 等能力，只能靠它（我们无法向 CarLife 指定 codec）
+    let car_features = info.get("features").and_then(Value::as_int).unwrap_or(0);
     emit_log(&format!(
-        "AIRPLAY: /info displays[0].uuid={:?} {}x{}",
-        display_uuid, disp_w, disp_h
+        "AIRPLAY: /info displays[0].uuid={:?} {}x{} features=0x{:x}",
+        display_uuid, disp_w, disp_h, car_features
     ));
 
     // ---- 2. 配对：pair-setup → pair-verify（与 cardeck `runPairingLoop` 同策略）----
