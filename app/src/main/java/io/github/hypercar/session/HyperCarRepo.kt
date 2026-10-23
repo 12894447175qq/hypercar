@@ -411,7 +411,7 @@ object HyperCarRepo {
                 val socket = Socket()
                 socket.tcpNoDelay = true
                 socket.connect(InetSocketAddress(host, port), CONTROL_CONNECT_TIMEOUT_MILLIS.toInt())
-                ParcelFileDescriptor.fromSocket(socket).detachFd()
+                dupForRust(ParcelFileDescriptor.fromSocket(socket).detachFd())
             }.getOrNull()
             if (fd != null && fd >= 0) {
                 if (network != null) {
@@ -442,18 +442,29 @@ object HyperCarRepo {
 
     // ---------------------------------------------------------------- socket 供给（移交 Rust）
 
+    /**
+     * 把要交给 Rust 的 fd 先 `dup` 一份。
+     *
+     * `detachFd()` 只是把 fd 从 PFD 里摘出来；Java 的 Socket/DatagramSocket 对象仍然持有
+     * 同一个 fd，并在 GC 时 close 它——那一刻 Rust 正在用的 fd 就没了（推流中途断、引擎
+     * 报 EBADF）。dup 之后两边各持一份、各关各的（dup 共享同一 open file description，
+     * 非阻塞标志和连接状态都保持一致）。
+     */
+    private fun dupForRust(rawFd: Int): Int =
+        runCatching { android.system.Os.dup(rawFd) }.getOrDefault(rawFd)
+
     private val socketProvider = object : RustCoreBridge.SocketProvider {
         override fun openTcpFd(host: String, port: Int, timeoutMs: Int): Int = runCatching {
             val socket = Socket()
             socket.tcpNoDelay = true
             socket.connect(InetSocketAddress(host, port), timeoutMs.coerceAtLeast(1_000))
-            ParcelFileDescriptor.fromSocket(socket).detachFd()
+            dupForRust(ParcelFileDescriptor.fromSocket(socket).detachFd())
         }.getOrElse { -1 }
 
         override fun openUdpFd(host: String, port: Int): Int = runCatching {
             val udp = DatagramSocket()
             udp.connect(InetSocketAddress(host, port))
-            ParcelFileDescriptor.fromDatagramSocket(udp).detachFd()
+            dupForRust(ParcelFileDescriptor.fromDatagramSocket(udp).detachFd())
         }.getOrElse { -1 }
     }
 
@@ -806,21 +817,37 @@ object HyperCarRepo {
      * 抓上一次运行的崩溃线索（只有 Shizuku 就绪时能读 logcat）。
      *
      * Rust 侧 panic 会经 `nativeInitLogger` 装的 panic hook 打到 logcat（tag HyperCar-Core），
-     * 系统崩溃记录在 crash 缓冲区。抓回来写进日志后，不用 adb 也能看到「谁崩的、崩在哪」。
-     * 用指纹文件去重，避免每次启动重复抄同一段。
+     * 系统崩溃记录在 crash 缓冲区，原生 abort 的证据（`Fatal signal`/`Abort message`）在
+     * DEBUG/libc 里。抓回来写进日志后，不用 adb 也能看到「谁崩的、崩在哪」。
+     *
+     * 注意别用 `logcat -d -t 600` 这种「全量尾巴」：这台机器 logcat 每秒上千行，
+     * 600 行只覆盖半秒，崩溃那一瞬很容易被冲掉（2026-10-23 20:44 就是这样漏掉的）。
+     * 改成按 tag 精确抓、窗口放大，并只留真正像崩溃的行。指纹文件去重。
      */
     private suspend fun captureCrashArtifacts() {
         if (!ShizukuTools.isReady) return
-        val core = runCatching { ShizukuTools.exec("logcat -d -s HyperCar-Core -t 300", 4_000) }.getOrNull()
-        val recent = runCatching { ShizukuTools.exec("logcat -d -t 600", 4_000) }.getOrNull()
-        val lines = ((core?.out ?: "") + "\n" + (recent?.out ?: ""))
+        val dump = runCatching {
+            ShizukuTools.exec(
+                "logcat -d -s HyperCar-Core:V -t 600; " +
+                    "logcat -b crash -d -t 150; " +
+                    "logcat -d -t 5000 -s DEBUG:V libc:V",
+                8_000,
+            )
+        }.getOrNull() ?: return
+        val interesting = listOf(
+            "PANIC",
+            "panicked at",
+            "Fatal signal",
+            "Abort message",
+            "libhypercar_core",
+            "tombstone",
+            "Process: io.github.hypercar",
+            "ANR in io.github.hypercar",
+        )
+        val lines = (dump.out + "\n" + dump.err)
             .lineSequence()
             .map { it.trim() }
-            .filter { it.isNotEmpty() }
-            .filter {
-                it.contains("PANIC") || it.contains("Fatal signal") || it.contains("Abort message") ||
-                    it.contains("hypercar_core") || it.contains("io.github.hypercar")
-            }
+            .filter { it.isNotEmpty() && interesting.any { key -> it.contains(key) } }
             .distinct()
             .toList()
             .takeLast(40)

@@ -256,8 +256,34 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSetList
 /// 启动全链路网关：controlFd（已连车机 AirPlay 端口）+ socket 供给器 + 引擎配置 JSON。
 #[no_mangle]
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStart(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
+    config_json: JString,
+    control_fd: jint,
+    socket_provider: JObject,
+) -> jboolean {
+    // 任何 panic 都不得越过 JNI 边界：一旦越过（哪怕 panic=unwind）Rust 会 abort 整个进程，
+    // 现场只剩「进程消失 + 内存日志全丢」。这里兜住，翻译成 JNI_FALSE + 一条日志。
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        native_start_impl(env, config_json, control_fd, socket_provider)
+    }));
+    match outcome {
+        Ok(value) => value,
+        Err(payload) => {
+            let detail = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "未知 panic".to_string());
+            emit_log(&format!("nativeStart 内部 panic（已兜住，进程未退出）：{detail}"));
+            emit_state("failed", "核心层启动时 panic（详见日志）");
+            JNI_FALSE
+        }
+    }
+}
+
+fn native_start_impl(
+    mut env: JNIEnv,
     config_json: JString,
     control_fd: jint,
     socket_provider: JObject,
@@ -280,12 +306,23 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStart(
         emit_log("controlFd 非法");
         return JNI_FALSE;
     }
+    emit_log("nativeStart: 配置已解析，开始接管控制 FD");
 
     // 控制 FD → 非阻塞 tokio TcpStream（所有权移交 Rust）
-    let control_stream = unsafe {
-        let std_stream = std::net::TcpStream::from_raw_fd(control_fd as RawFd);
-        let _ = std_stream.set_nonblocking(true);
-        let _ = std_stream.set_nodelay(true);
+    //
+    // **必须在 tokio runtime 上下文里做 `from_std`**：tokio 的文档明确写着
+    // 「This function panics if thread-local runtime is not set」——而本函数是被 Kotlin
+    // 的 IO 线程（Dispatchers.IO）直接调进来的，不是 tokio worker，没有线程局部 runtime。
+    // 2026-10-23 20:44 的秒崩就死在这一行：日志停在「CORE: 调用 nativeStart」，之后
+    // 一条 CORE 都没有（'there is no reactor running' panic → abort）。这里显式 enter()。
+    let control_stream = {
+        let std_stream = unsafe {
+            let std_stream = std::net::TcpStream::from_raw_fd(control_fd as RawFd);
+            let _ = std_stream.set_nonblocking(true);
+            let _ = std_stream.set_nodelay(true);
+            std_stream
+        };
+        let _enter = TOKIO_RT.enter();
         match TcpStream::from_std(std_stream) {
             Ok(s) => s,
             Err(e) => {
@@ -294,6 +331,7 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStart(
             }
         }
     };
+    emit_log("nativeStart: 控制 FD 已注册到 tokio");
 
     let vm = match env.get_java_vm() {
         Ok(vm) => vm,
@@ -349,6 +387,7 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStart(
         key_tx,
     });
 
+    emit_log("nativeStart: 引擎任务已派生");
     emit_state("starting", "核心层引擎已启动");
     JNI_TRUE
 }
