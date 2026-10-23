@@ -6,6 +6,16 @@
 //!  Kotlin 只提供「绑定车机网络的 socket FD 供给器」——协商状态机只有一份实现。
 //!
 //! JNI 命名对应 io.github.hypercar.core.RustCoreBridge（下划线式导出名）。
+//!
+//! # dead-code lint 说明
+//!
+//! 本 crate 是 `crate-type = ["cdylib"]`，dead-code lint 只把「从 8 个 JNI 导出
+//! 可达」的代码算作活跃。但协议实现刻意保留了完整覆盖面（如 pair-setup M1..M6
+//! 完整链路，主路径只走 pair-verify）与一批诊断/统计访问器（`frames_sent`、
+//! `packets_sent`、`resolution` 等，供后续 UI 或日志接线）。这些不是遗留垃圾，
+//! 而是库的 API 面——故 crate 级 allow，避免用 `#[allow(dead_code)]` 逐个标注
+//! 淹没真正的意图注释。新增代码若确属误删引用，仍应靠 code review 拦截。
+#![allow(dead_code)]
 
 mod airplay;
 mod audio_out;
