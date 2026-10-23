@@ -98,6 +98,14 @@ object HyperCarRepo {
             // 恢复日志记录开关（诊断页切换过则沿用）
             logRecording = SettingsStore.debugLogEnabled
             _snapshots.value = _snapshots.value.copy(logRecording = logRecording)
+            // 落盘日志 + 崩溃兜底：环形缓冲只在内存里，进程一死（原生崩溃 / 被 OOM 杀）
+            // 现场就全没了——2026-10-23 20:30 那次崩溃就是这么丢的。这里把日志逐行
+            // 追加到 filesDir/hypercar-session.log（每行 flush），重启后先把上一轮的尾部
+            // 带回环形缓冲（放在启动标记之前，顺序才读得懂），崩溃前现场仍可导出。
+            restoreDiskLogTail()
+            installCrashHandler()
+            appendDiskLog("===== HyperCar 启动 =====")
+            scope.launch { captureCrashArtifacts() }
             // ACL 广播唤醒入口（receiver → handler）：优先经 FGS 拿前台豁免与持锁，
             // 服务起来后再触发真正会话（handler 幂等，service 二次进入走直连分支）
             AutoStart.handler = { ctx, device, connected ->
@@ -261,7 +269,11 @@ object HyperCarRepo {
             push(link = LinkState.Negotiating("Rust 核心层协商 AirPlay 会话"))
             val identityPath = context.filesDir.resolve("controller_identity.txt").absolutePath
             val json = SettingsStore.engineConfigJson(host, endpoint.airPlayPort.takeIf { it > 0 } ?: 7000, deviceMac, identityPath)
+            // 前后各记一行：原生崩溃（Rust panic 越过 JNI → SIGABRT）会直接把进程带走，
+            // 这两行能区分「崩在 nativeStart 里」还是「崩在引擎跑起来之后」。
+            log("CORE: 调用 nativeStart（$host:$port fd=$controlFd）")
             val started = RustCoreBridge.nativeStart(json, controlFd, socketProvider)
+            log("CORE: nativeStart 返回 $started")
             if (!started) {
                 fail("核心层启动失败（查看日志）")
                 return
@@ -706,6 +718,7 @@ object HyperCarRepo {
         android.util.Log.i("HyperCar", line)
         if (!logRecording) return // 记录开关关闭：丢弃（logcat 仍写，adb 可查）
         val stamp = logTimeFormat.get().format(java.util.Date())
+        appendDiskLog("$stamp  $line")
         _snapshots.update { s ->
             val extra =
                 if (folded > 0) {
@@ -715,6 +728,110 @@ object HyperCarRepo {
                 }
             s.copy(recentLogs = (s.recentLogs + extra + "$stamp  $line").takeLast(LOG_KEEP_LINES))
         }
+    }
+
+    // ---------------------------------------------------------------- 落盘日志（崩溃后仍可查）
+
+    /**
+     * 磁盘日志写入器（懒打开）。只在 [diskLogLock] 内访问。
+     *
+     * 为什么要落盘：`recentLogs` 是纯内存环形缓冲，进程一死就清零；2026-10-23 20:30
+     * 的崩溃现场（连上 AirPlay 端口之后）就是这么丢的——用户「崩溃前快速点了导出」，
+     * 导出的也只是崩溃前的旧内容。落盘后重启会把上一轮的尾部带回环形缓冲。
+     */
+    private var diskLogWriter: java.io.BufferedWriter? = null
+    private val diskLogLock = Any()
+
+    /** 打开（必要时先把上一份转成 .1）内部日志文件；失败返回 null，不影响界面日志。 */
+    private fun diskLog(): java.io.BufferedWriter? {
+        synchronized(diskLogLock) {
+            diskLogWriter?.let { return it }
+            val dir = appCtx?.filesDir ?: return null
+            val writer = runCatching {
+                val file = java.io.File(dir, DISK_LOG_NAME)
+                if (file.length() > DISK_LOG_MAX_BYTES) {
+                    val old = java.io.File(dir, "$DISK_LOG_NAME.1")
+                    old.delete()
+                    file.renameTo(old)
+                }
+                java.io.FileOutputStream(file, true).bufferedWriter()
+            }.getOrNull() ?: return null
+            diskLogWriter = writer
+            return writer
+        }
+    }
+
+    /** 追加一行到磁盘日志并立即 flush：原生崩溃（SIGSEGV/SIGABRT）时最后几行也不会丢。 */
+    private fun appendDiskLog(line: String) {
+        val writer = diskLog() ?: return
+        synchronized(diskLogLock) {
+            runCatching {
+                writer.write(line)
+                writer.newLine()
+                writer.flush()
+            }
+        }
+    }
+
+    /** 把上一次运行（崩溃/被系统杀）的最后若干行带回环形缓冲，供崩溃后导出。 */
+    private fun restoreDiskLogTail() {
+        val dir = appCtx?.filesDir ?: return
+        val file = java.io.File(dir, DISK_LOG_NAME)
+        if (!file.exists() || file.length() == 0L) return
+        val tail = runCatching { file.readLines().takeLast(DISK_LOG_TAIL_LINES) }.getOrDefault(emptyList())
+        if (tail.isEmpty()) return
+        _snapshots.update { s ->
+            val header = "===== 上次运行（进程重启/崩溃前）最后 ${tail.size} 行 ====="
+            s.copy(recentLogs = (s.recentLogs + header + tail).takeLast(LOG_KEEP_LINES))
+        }
+    }
+
+    /** Java 层未捕获异常写盘（原生崩溃靠 [appendDiskLog] 的逐行 flush 保命）。 */
+    private fun installCrashHandler() {
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, error ->
+            runCatching {
+                appendDiskLog("!!! CRASH（线程 ${thread.name}）：${error.javaClass.name}: ${error.message}")
+                error.stackTraceToString().lineSequence().take(80).forEach { appendDiskLog("    $it") }
+            }
+            if (previous != null) {
+                previous.uncaughtException(thread, error)
+            } else {
+                android.os.Process.killProcess(android.os.Process.myPid())
+            }
+        }
+    }
+
+    /**
+     * 抓上一次运行的崩溃线索（只有 Shizuku 就绪时能读 logcat）。
+     *
+     * Rust 侧 panic 会经 `nativeInitLogger` 装的 panic hook 打到 logcat（tag HyperCar-Core），
+     * 系统崩溃记录在 crash 缓冲区。抓回来写进日志后，不用 adb 也能看到「谁崩的、崩在哪」。
+     * 用指纹文件去重，避免每次启动重复抄同一段。
+     */
+    private suspend fun captureCrashArtifacts() {
+        if (!ShizukuTools.isReady) return
+        val core = runCatching { ShizukuTools.exec("logcat -d -s HyperCar-Core -t 300", 4_000) }.getOrNull()
+        val recent = runCatching { ShizukuTools.exec("logcat -d -t 600", 4_000) }.getOrNull()
+        val lines = ((core?.out ?: "") + "\n" + (recent?.out ?: ""))
+            .lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .filter {
+                it.contains("PANIC") || it.contains("Fatal signal") || it.contains("Abort message") ||
+                    it.contains("hypercar_core") || it.contains("io.github.hypercar")
+            }
+            .distinct()
+            .toList()
+            .takeLast(40)
+        if (lines.isEmpty()) return
+        val dir = appCtx?.filesDir ?: return
+        val marker = java.io.File(dir, "crash-capture.txt")
+        val fingerprint = lines.joinToString("\n").hashCode().toString()
+        if (runCatching { marker.readText() }.getOrNull() == fingerprint) return
+        runCatching { marker.writeText(fingerprint) }
+        log("CRASH: 上一次运行的崩溃线索（${lines.size} 行）")
+        lines.forEach { log("CRASH| $it") }
     }
 
     /** 单行日志的限流状态（仅 [logRateLock] 内访问）。 */
@@ -838,4 +955,13 @@ object HyperCarRepo {
 
     /** 限流表容量上限（超过就清空重建，避免长跑后无限增长）。 */
     private const val LOG_RATE_MAX_KEYS = 256
+
+    /** 落盘日志文件名（filesDir 下，不需要任何存储权限）。 */
+    private const val DISK_LOG_NAME = "hypercar-session.log"
+
+    /** 落盘日志超过这个大小就转存成 `.1`（只留一份上一代）。 */
+    private const val DISK_LOG_MAX_BYTES = 1_500_000L
+
+    /** 重启时从落盘日志带回环形缓冲的行数（够覆盖崩溃前的一段现场）。 */
+    private const val DISK_LOG_TAIL_LINES = 120
 }

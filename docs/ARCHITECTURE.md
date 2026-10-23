@@ -117,3 +117,18 @@ Rust（rust-core，全部协商 + 数据面）
 - 删除：VirtualDisplay/虚拟屏、EGL 合成器、MediaCodec 编码、触摸三坐标路由、
   隐形启动器、暗幕/真息屏（无屏可暗）、iAP2 隧道（MIB3 专属，BMW 不需要）。
 - 新增：CarLife HU 回环服务端、Rust 协商层、TTS 闪避混音、HUD 导航报文。
+
+## 7. 崩溃取证（为什么日志必须落盘）
+
+内存环形缓冲的日志在进程一死就清零——2026-10-23 20:30 连上 AirPlay 端口后 App 秒崩，
+用户「崩溃前快速点了导出」导出的也只是崩溃前的旧内容，现场全丢。现在的取证链：
+
+- `HyperCarRepo.log()` 每行同时追加到 `filesDir/hypercar-session.log` 并 flush（>1.5MB 转存 `.1`）；
+  重启时把上一轮最后 120 行带回环形缓冲，标一条「上次运行（进程重启/崩溃前）」。
+- Java 未捕获异常走 `installCrashHandler()` 写盘完整栈。
+- Rust 侧 `[profile.release]` **不用 `panic = "abort"`**：否则任何一个 `unwrap` 踩空都会让
+  进程直接消失且无痕。现在 panic 由 tokio 任务边界捕获，`lib.rs` 的看门狗把它报成
+  「引擎任务异常退出」；`nativeInitLogger` 装的 panic hook 再把 `PANIC:` 行打到 logcat。
+- 启动时（有 Shizuku 即可）`captureCrashArtifacts()` 用 shell 读 `logcat -s HyperCar-Core`
+  与 crash 缓冲区，把 `PANIC`/`Fatal signal` 行抓进日志，免 adb。
+

@@ -229,6 +229,13 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeInitLog
             .with_max_level(log::LevelFilter::Info)
             .with_tag("HyperCar-Core"),
     );
+    // 崩溃取证：默认 panic hook 写 stderr，Android 应用进程的 stderr 基本看不到。
+    // 换成打到 logcat（tag HyperCar-Core）后，App 侧用 Shizuku 跑 `logcat -s HyperCar-Core`
+    // 就能把「哪一行 panic 的」抓进导出日志（现场 2026-10-23 20:30 崩得无声无息）。
+    // 这里只用 `log`（liblog），不碰 JNI——panic 钩子里调 JNI 有死锁风险。
+    std::panic::set_hook(Box::new(|info| {
+        log::error!("PANIC: {info}");
+    }));
     log::info!("HyperCar Rust 核心层已初始化（协商下沉版）");
 }
 
@@ -308,7 +315,7 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStart(
     let stop_run = stop.clone();
     let touch_tx_engine = touch_tx.clone();
     let key_tx_engine = key_tx.clone();
-    TOKIO_RT.spawn(async move {
+    let engine_task = TOKIO_RT.spawn(async move {
         let result = engine::run_engine(
             cfg,
             control_stream,
@@ -323,6 +330,14 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStart(
         if let Err(e) = &result {
             emit_log(&format!("引擎退出: {e}"));
             emit_state("failed", e);
+        }
+    });
+    // panic 隔离看门狗：Cargo 已去掉 panic = "abort"，任务内 panic 由 tokio 捕获在
+    // JoinHandle 里。这里把它报成「会话失败」并留日志，而不是让进程无声消失。
+    TOKIO_RT.spawn(async move {
+        if let Err(join_error) = engine_task.await {
+            emit_log(&format!("引擎任务异常退出: {join_error}"));
+            emit_state("failed", "核心层内部异常（panic），请导出日志");
         }
     });
 
