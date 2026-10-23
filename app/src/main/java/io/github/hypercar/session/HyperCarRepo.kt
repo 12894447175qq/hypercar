@@ -384,9 +384,16 @@ object HyperCarRepo {
 
     // ---------------------------------------------------------------- 降级模式引导
 
+    /**
+     * 系统侧状态变化后刷新快照（Shizuku 授权成功、从系统设置返回等）。
+     * 与连接流程无关，只重算 shizukuReady / 降级预检等派生字段。
+     */
+    fun refreshSystemState() {
+        push()
+    }
+
     /** 降级模式下连热点的运行时权限是否已授予（有 Shizuku 时不需要，恒 true）。 */
-    private fun degradedPermissionGranted(): Boolean {
-        if (ShizukuTools.isReady) return true
+    private fun degradedPermissionGranted(): Boolean {        if (ShizukuTools.isReady) return true
         val ctx = appCtx ?: return true
         return runCatching { SpecifierPermissions.isGranted(ctx) }.getOrDefault(false)
     }

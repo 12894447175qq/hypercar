@@ -55,6 +55,7 @@ fun HomeScreen(
     onOpenOverlay: () -> Unit,
     onBatteryOptimization: () -> Unit,
     onAutostart: () -> Unit,
+    onOpenShizukuSettings: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     // 权限检查卡在两种布局里共用
@@ -96,7 +97,10 @@ fun HomeScreen(
                         onRequestPermission = onRequestDegradedPermission,
                         onTestConnect = onStart,
                     )
-                    StatChips(snapshot = snapshot)
+                    StatChips(
+                        snapshot = snapshot,
+                        onOpenShizuku = onOpenShizukuSettings,
+                    )
                 }
                 LogPreviewCard(
                     logs = snapshot.recentLogs,
@@ -126,7 +130,10 @@ fun HomeScreen(
                     onRequestPermission = onRequestDegradedPermission,
                     onTestConnect = onStart,
                 )
-                StatChips(snapshot = snapshot)
+                StatChips(
+                    snapshot = snapshot,
+                    onOpenShizuku = onOpenShizukuSettings,
+                )
                 LogPreviewCard(
                     logs = snapshot.recentLogs,
                     onOpenDiagnostics = onOpenDiagnostics,

@@ -1,5 +1,7 @@
 package io.github.hypercar.shizuku
 
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Looper
 import android.util.Log
@@ -9,6 +11,21 @@ import moe.shizuku.server.IShizukuService
 import java.io.FileInputStream
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+
+/** Shizuku 在本机的四种状态（UI 据此给不同的下一步动作）。 */
+enum class ShizukuState {
+    /** 没装 Shizuku app。 */
+    NotInstalled,
+
+    /** 装了但服务没跑（需要在 Shizuku 里启动：无线调试配对 / root）。 */
+    NotRunning,
+
+    /** 服务在跑，但本应用还没被授权（可以弹授权框）。 */
+    NotGranted,
+
+    /** 已授权，`cmd wifi` 等 shell 能力可用。 */
+    Ready,
+}
 
 /** 一次 shell 命令的执行结果。 */
 data class ExecResult(
@@ -59,6 +76,49 @@ object ShizukuTools {
         } catch (_: Throwable) {
             false
         }
+
+    private const val SHIZUKU_PKG = "moe.shizuku.privileged.api"
+
+    /** Shizuku app 是否已安装（manifest 里有 `<queries>`，Android 11+ 才能查到）。 */
+    @Suppress("DEPRECATION")
+    fun isInstalled(context: Context): Boolean = runCatching {
+        context.packageManager.getPackageInfo(SHIZUKU_PKG, 0)
+        true
+    }.getOrDefault(false)
+
+    /**
+     * 当前状态。UI 用它决定给"安装 / 打开 / 授权 / 已就绪"哪个动作。
+     *
+     * 判定顺序：先看 binder 是否活着（`pingBinder`），再看本应用是否被授权。
+     */
+    fun state(context: Context): ShizukuState {
+        val alive = runCatching { rikka.shizuku.Shizuku.pingBinder() }.getOrDefault(false)
+        if (!alive) {
+            return if (isInstalled(context)) ShizukuState.NotRunning else ShizukuState.NotInstalled
+        }
+        val granted = runCatching {
+            rikka.shizuku.Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+        }.getOrDefault(false)
+        return if (granted) ShizukuState.Ready else ShizukuState.NotGranted
+    }
+
+    /** 打开 Shizuku app 主界面（未运行/未安装时引导用户去处理）。 */
+    fun openShizukuApp(context: Context): Boolean = runCatching {
+        val intent = context.packageManager.getLaunchIntentForPackage(SHIZUKU_PKG)
+            ?: return false
+        context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        true
+    }.getOrDefault(false)
+
+    /** Shizuku 官方站点（未安装时的安装入口）——用浏览器打开，避免依赖应用商店。 */
+    fun openShizukuSite(context: Context) {
+        runCatching {
+            context.startActivity(
+                Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://shizuku.rikka.app/"))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
+        }
+    }
 
     /**
      * 需要时请求 Shizuku 授权，结果经 [onResult] 回调（true=已授权）。

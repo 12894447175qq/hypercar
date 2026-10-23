@@ -1,5 +1,9 @@
 package io.github.hypercar.ui.screens
 
+import android.content.Intent
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -16,6 +20,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -39,9 +44,12 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -49,22 +57,35 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import io.github.hypercar.perm.AppPermissions
+import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.settings.SettingsStore
+import io.github.hypercar.shizuku.ShizukuState
+import io.github.hypercar.shizuku.ShizukuTools
 import io.github.hypercar.ui.components.CapsuleButton
 import io.github.hypercar.ui.components.GlassPanel
 import io.github.hypercar.ui.components.SectionLabel
 import io.github.hypercar.ui.theme.AmberWarning
+import io.github.hypercar.ui.theme.CoralError
 import io.github.hypercar.ui.theme.ElectricCyan
 import io.github.hypercar.ui.theme.MintGreen
 import io.github.hypercar.ui.theme.StrokeGlass
 import io.github.hypercar.ui.theme.SurfaceInset
 import io.github.hypercar.ui.theme.TextPrimary
 import io.github.hypercar.ui.theme.TextSecondary
+import io.github.hypercar.update.UpdateCenter
+import io.github.hypercar.update.UpdateUiState
+import kotlinx.coroutines.launch
 
 /**
  * 分辨率预设（**兜底用**）。实际分辨率以车机 `/info` 回报为准，手机回报实际
@@ -102,7 +123,407 @@ fun SettingsScreen(modifier: Modifier = Modifier) {
         ResolutionSection()
         BehaviorSection()
         WakePackageSection()
+        PermissionSettingsSection()
+        ShizukuSection()
+        AboutSection()
         Spacer(modifier = Modifier.height(8.dp))
+    }
+}
+
+/* ---------- Shizuku ---------- */
+
+/**
+ * Shizuku 入口。
+ *
+ * 之前只有一个**只读**状态芯片（`StatChips.ShizukuChip`），而 `requestPermissionIfNeeded`
+ * 从未被调用——用户看到"未启用 Shizuku"却没有任何地方可以授权。这里按四种状态给出
+ * 对应的下一步动作：安装 → 打开 → 授权 → 已就绪。
+ */
+@Composable
+private fun ShizukuSection() {
+    val context = LocalContext.current
+    var version by remember { mutableIntStateOf(0) }
+    val state = remember(version) { ShizukuTools.state(context) }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) version++
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    val (statusText, statusColor) = when (state) {
+        ShizukuState.Ready -> "已就绪" to MintGreen
+        ShizukuState.NotGranted -> "已运行 · 待授权" to AmberWarning
+        ShizukuState.NotRunning -> "已安装 · 未启动" to AmberWarning
+        ShizukuState.NotInstalled -> "未安装" to TextSecondary
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        SectionLabel(text = "Shizuku（可选增强）")
+        GlassPanel(
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(statusColor),
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+                Text(
+                    text = state.label(),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = TextPrimary,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(
+                    text = statusText,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = statusColor,
+                )
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = state.hint(),
+                style = MaterialTheme.typography.bodySmall,
+                color = TextSecondary,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+
+            when (state) {
+                ShizukuState.NotInstalled -> CapsuleButton(
+                    text = "安装 Shizuku",
+                    onClick = { ShizukuTools.openShizukuSite(context) },
+                    modifier = Modifier.fillMaxWidth(),
+                    filled = true,
+                )
+
+                ShizukuState.NotRunning -> CapsuleButton(
+                    text = "打开 Shizuku 并启动服务",
+                    onClick = {
+                        if (!ShizukuTools.openShizukuApp(context)) {
+                            ShizukuTools.openShizukuSite(context)
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    filled = true,
+                )
+
+                ShizukuState.NotGranted -> CapsuleButton(
+                    text = "请求授权",
+                    onClick = {
+                        ShizukuTools.requestPermissionIfNeeded { _ ->
+                            // 无论允许/拒绝都刷新：授权框关闭后状态可能已变
+                            version++
+                            HyperCarRepo.refreshSystemState()
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    filled = true,
+                )
+
+                ShizukuState.Ready -> CapsuleButton(
+                    text = "重新检查",
+                    onClick = {
+                        version++
+                        HyperCarRepo.refreshSystemState()
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    filled = false,
+                )
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = "不启用也能用：降级模式用系统 WiFi 授权框连热点（每个热点首次弹一次），" +
+                    "且拿不到真实蓝牙 MAC。启用后连热点零弹窗、可读真实 MAC。",
+                style = MaterialTheme.typography.labelSmall,
+                color = TextSecondary.copy(alpha = 0.75f),
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+private fun ShizukuState.label(): String = when (this) {
+    ShizukuState.Ready -> "Shizuku 已授权"
+    ShizukuState.NotGranted -> "Shizuku 服务在运行"
+    ShizukuState.NotRunning -> "Shizuku 已安装但服务未启动"
+    ShizukuState.NotInstalled -> "未检测到 Shizuku"
+}
+
+private fun ShizukuState.hint(): String = when (this) {
+    ShizukuState.Ready -> "可以静默连接车机热点，并读取本机真实蓝牙 MAC。"
+    ShizukuState.NotGranted ->
+        "点下方按钮会弹出 Shizuku 的授权框；若没弹，请先在 Shizuku 里确认服务已启动。"
+    ShizukuState.NotRunning ->
+        "需要先打开 Shizuku 并启动服务（无线调试配对，或 root 启动）。"
+    ShizukuState.NotInstalled ->
+        "Shizuku 是可选的：装上后能免除每次连热点的系统确认框。不装也能正常使用。"
+}
+
+/* ---------- 权限与系统设置 ---------- */
+
+/**
+ * 设置页的权限入口（与首页的「权限检查」卡互补）：
+ * 首页卡片在必需项齐备后会隐藏/可收起，这里**常驻**，方便随时回来复查或改系统开关。
+ */
+@Composable
+private fun PermissionSettingsSection() {
+    val context = LocalContext.current
+    var version by remember { mutableIntStateOf(0) }
+    val summary = remember(version) { AppPermissions.summary(context) }
+    val missing = remember(version) { AppPermissions.missingRequired(context) }
+
+    // 从系统设置页返回后自动刷新状态
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) version++
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    val launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { version++ }
+
+    val essentialsOk = missing.isEmpty()
+    val missingNames = buildList {
+        if (!summary.nearby) add("附近设备")
+        if (summary.locationRequired && !summary.location) add("定位")
+        if (summary.notificationRequired && !summary.notification) add("通知")
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        SectionLabel(text = "权限与系统设置")
+        GlassPanel(
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = if (essentialsOk) "必需权限已就绪" else "缺 ${missingNames.size} 项必需权限",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (essentialsOk) MintGreen else AmberWarning,
+                    )
+                    Text(
+                        text = if (essentialsOk) {
+                            "附近设备与通知已授予"
+                        } else {
+                            missingNames.joinToString("、") + " 未授予——对应功能会静默失效"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = TextSecondary,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                Text(
+                    text = "重新检查",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = ElectricCyan,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable { version++ }
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                )
+            }
+
+            if (!essentialsOk) {
+                Spacer(modifier = Modifier.height(10.dp))
+                CapsuleButton(
+                    text = "补授缺失权限",
+                    onClick = {
+                        val all = missing.flatMap { AppPermissions.perms(it).toList() }.distinct()
+                        if (all.isNotEmpty()) launcher.launch(all.toTypedArray())
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    filled = true,
+                )
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+
+            InfoRow(
+                label = "自启动",
+                value = when (summary.autostart) {
+                    true -> "已允许"
+                    false -> "已禁止"
+                    null -> "去设置"
+                },
+                onClick = {
+                    if (!AppPermissions.openAutostartSettings(context)) {
+                        AppPermissions.openAppDetails(context)
+                    }
+                },
+            )
+            InfoRow(
+                label = "电池优化白名单",
+                value = if (summary.batteryWhitelisted) "已加入" else "去设置",
+                onClick = { AppPermissions.requestIgnoreBatteryOptimizations(context) },
+            )
+            InfoRow(
+                label = "悬浮窗（后台启动豁免）",
+                value = if (summary.overlay) "已允许" else "去设置",
+                onClick = { AppPermissions.openOverlaySettings(context) },
+            )
+            InfoRow(
+                label = "系统权限页",
+                value = "打开",
+                onClick = { AppPermissions.openAppDetails(context) },
+            )
+
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = "自启动、电池白名单属系统专有设置，部分系统不提供查询接口，" +
+                    "显示「去设置」不代表未开启。",
+                style = MaterialTheme.typography.labelSmall,
+                color = TextSecondary.copy(alpha = 0.75f),
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+/* ---------- 关于 / 更新 ---------- */
+
+@Composable
+private fun AboutSection() {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val state by UpdateCenter.state.collectAsStateWithLifecycle()
+    val checking = state is UpdateUiState.Checking
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        SectionLabel(text = "关于")
+        GlassPanel(
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+        ) {
+            InfoRow(label = "当前版本", value = UpdateCenter.currentVersion)
+            InfoRow(label = "版本号（versionCode）", value = UpdateCenter.currentBuild.toString())
+            InfoRow(label = "作者", value = "fw867")
+            InfoRow(
+                label = "开源仓库",
+                value = "github.com/fw867/hypercar",
+                onClick = {
+                    runCatching {
+                        context.startActivity(
+                            Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/fw867/hypercar"))
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                        )
+                    }
+                },
+            )
+
+            Spacer(modifier = Modifier.height(10.dp))
+            when (val s = state) {
+                is UpdateUiState.Available -> {
+                    Text(
+                        text = "发现新版本 ${s.info.version}（当前 ${UpdateCenter.currentVersion}）",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MintGreen,
+                    )
+                    if (s.info.notes.isNotBlank()) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = s.info.notes.take(400),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextSecondary,
+                            maxLines = 6,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    CapsuleButton(
+                        text = if (s.info.apkUrl != null) "下载新版本" else "打开 Release 页面",
+                        onClick = {
+                            val url = s.info.apkUrl ?: s.info.pageUrl
+                            runCatching {
+                                context.startActivity(
+                                    Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                                )
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        filled = true,
+                        containerColor = MintGreen,
+                    )
+                }
+
+                is UpdateUiState.UpToDate -> Text(
+                    text = "已是最新版本（${s.latest}）",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextSecondary,
+                )
+
+                is UpdateUiState.Failed -> Text(
+                    text = "检查失败：${s.message}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = CoralError,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                )
+
+                UpdateUiState.Checking -> Text(
+                    text = "正在检查…",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextSecondary,
+                )
+
+                UpdateUiState.Idle -> Text(
+                    text = "更新来自 GitHub Releases；每次推送由 CI 自动构建正式签名包",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextSecondary,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+            CapsuleButton(
+                text = if (checking) "检查中…" else "检查更新",
+                onClick = { scope.launch { UpdateCenter.check(context) } },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !checking,
+                filled = false,
+            )
+        }
+    }
+}
+
+@Composable
+private fun InfoRow(label: String, value: String, onClick: (() -> Unit)? = null) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
+            .heightIn(min = 36.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodySmall,
+            color = TextSecondary,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodySmall,
+            color = if (onClick != null) ElectricCyan else TextPrimary,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 

@@ -2,6 +2,7 @@ package io.github.hypercar.ui.components
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -52,6 +53,7 @@ import java.util.Locale
 fun StatChips(
     snapshot: SessionSnapshot,
     modifier: Modifier = Modifier,
+    onOpenShizuku: (() -> Unit)? = null,
 ) {
     Row(
         modifier = modifier
@@ -62,7 +64,7 @@ fun StatChips(
         VideoChip(snapshot.video)
         CarLifeChip(snapshot.carLife)
         AudioChip(snapshot.audio)
-        ShizukuChip(snapshot.shizukuReady)
+        ShizukuChip(snapshot.shizukuReady, onOpenShizuku)
     }
 }
 
@@ -75,6 +77,7 @@ private fun StatChip(
     accent: Color,
     modifier: Modifier = Modifier,
     leadingIcon: ImageVector? = null,
+    onClick: (() -> Unit)? = null,
 ) {
     Row(
         modifier = modifier
@@ -83,6 +86,7 @@ private fun StatChip(
             .clip(RoundedCornerShape(16.dp))
             .background(SurfaceInset.copy(alpha = 0.65f))
             .border(1.dp, StrokeGlass, RoundedCornerShape(16.dp))
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
             .padding(horizontal = 14.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -185,14 +189,16 @@ private fun AudioChip(audio: AudioStats) {
 }
 
 @Composable
-private fun ShizukuChip(ready: Boolean) {
+private fun ShizukuChip(ready: Boolean, onClick: (() -> Unit)? = null) {
     // Shizuku 已降级为「可选增强」：没有它也能连车（热点首连弹一次框 + 稳定伪 MAC），
     // 有则体验最优（0 弹窗 + 真实蓝牙 MAC）。故未就绪时用中性灰、文案标「可选」，不报警色。
+    // 未就绪时可点进设置页授权（此前只有只读文案，用户找不到入口）。
     StatChip(
         label = "Shizuku",
-        value = if (ready) "增强已启用" else "可选未启用",
+        value = if (ready) "增强已启用" else "未启用 · 点此设置",
         accent = if (ready) MintGreen else TextSecondary,
         leadingIcon = Icons.Rounded.Security,
+        onClick = if (ready) null else onClick,
     )
 }
 

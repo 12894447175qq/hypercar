@@ -1,5 +1,7 @@
 package io.github.hypercar.ui
 
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -24,6 +26,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
@@ -31,6 +34,7 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -70,7 +74,10 @@ import io.github.hypercar.ui.theme.ElectricCyan
 import io.github.hypercar.ui.theme.HyperCarBackground
 import io.github.hypercar.ui.theme.HyperCarTheme
 import io.github.hypercar.ui.theme.MintGreen
+import io.github.hypercar.ui.theme.SurfaceInset
 import io.github.hypercar.ui.theme.SurfaceNavBar
+import io.github.hypercar.update.UpdateCenter
+import io.github.hypercar.update.UpdateUiState
 import io.github.hypercar.ui.theme.TextPrimary
 import kotlinx.coroutines.delay
 import io.github.hypercar.ui.theme.TextSecondary
@@ -157,6 +164,59 @@ private fun MainContent() {
         if (perms.isNotEmpty()) permissionLauncher.launch(perms)
     }
 
+    // ---- 自动更新：启动时按 6 小时节流检查一次；有新版弹一次（可"稍后"）----
+    val updateState by UpdateCenter.state.collectAsStateWithLifecycle()
+    var updateDialogClosed by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        if (UpdateCenter.shouldAutoCheck(context)) UpdateCenter.check(context)
+    }
+    val newRelease = (updateState as? UpdateUiState.Available)?.info
+    if (newRelease != null && !updateDialogClosed &&
+        !UpdateCenter.isDismissed(context, newRelease.tag)
+    ) {
+        AlertDialog(
+            onDismissRequest = { updateDialogClosed = true },
+            containerColor = SurfaceInset,
+            title = {
+                Text(
+                    text = "发现新版本 ${newRelease.version}",
+                    color = TextPrimary,
+                )
+            },
+            text = {
+                Text(
+                    text = buildString {
+                        append("当前版本 ${UpdateCenter.currentVersion}。")
+                        if (newRelease.notes.isNotBlank()) {
+                            append("\n\n")
+                            append(newRelease.notes.take(600))
+                        }
+                    },
+                    color = TextSecondary,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    updateDialogClosed = true
+                    val url = newRelease.apkUrl ?: newRelease.pageUrl
+                    runCatching {
+                        context.startActivity(
+                            Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                        )
+                    }
+                }) { Text("去下载", color = ElectricCyan) }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    updateDialogClosed = true
+                    UpdateCenter.dismiss(context, newRelease.tag)
+                }) { Text("稍后", color = TextSecondary) }
+            },
+        )
+    }
+
     Scaffold(
         containerColor = DeepSpace,
         topBar = { StatusStrip(link = snapshot.link) },
@@ -233,6 +293,7 @@ private fun MainContent() {
                                 AppPermissions.openAppDetails(context)
                             }
                         },
+                        onOpenShizukuSettings = { tabIndex = AppTab.Settings.ordinal },
                     )
 
                     AppTab.Settings -> SettingsScreen()

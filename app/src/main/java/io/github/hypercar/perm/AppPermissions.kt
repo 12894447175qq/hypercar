@@ -1,6 +1,7 @@
 package io.github.hypercar.perm
 
 import android.Manifest
+import android.app.AppOpsManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -51,17 +52,11 @@ data class PermissionSummary(
     val notificationRequired: Boolean,
     val overlay: Boolean,
     val batteryWhitelisted: Boolean,
-) {
-    /** 所有"必需"项是否齐备（特殊权限不算必需，只提示）。 */
-    val requiredOk: Boolean
-        get() = nearby &&
-            (!locationRequired || location) &&
-            (!notificationRequired || notification)
-
-    /** 是否还有任何可优化项（用于决定卡片是否显示）。 */
-    val hasTodo: Boolean
-        get() = !requiredOk || !overlay || !batteryWhitelisted
-}
+    /** 用户已选择"不再提示可选优化"（自启动/电池等无法回读的项）。 */
+    val optionalDismissed: Boolean = false,
+    /** 自启动状态：true/false 为读到；**null = 系统没有公开接口，未知**。 */
+    val autostart: Boolean? = null,
+)
 
 object AppPermissions {
 
@@ -103,8 +98,25 @@ object AppPermissions {
             .edit().putBoolean(KEY_PROMPTED, true).apply()
     }
 
+    /**
+     * 可选优化是否已被用户收起。
+     *
+     * 为什么需要它：自启动在 HyperOS 没有公开查询接口、电池白名单在部分 ROM 上
+     * 也不回写 AOSP 标志——这两项**永远无法被应用确认为"已完成"**，
+     * 若不做收起，首页会永久挂着提示卡。
+     */
+    fun isOptionalDismissed(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_OPTIONAL_DISMISSED, false)
+
+    fun dismissOptional(context: Context) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_OPTIONAL_DISMISSED, true).apply()
+    }
+
     private const val PREFS = "hypercar_permissions"
     private const val KEY_PROMPTED = "onboarding_prompted"
+    private const val KEY_OPTIONAL_DISMISSED = "optional_dismissed"
 
     fun isGranted(context: Context, group: PermGroup): Boolean {
         val list = perms(group)
@@ -130,6 +142,30 @@ object AppPermissions {
             ?.isIgnoringBatteryOptimizations(context.packageName) == true
     }.getOrDefault(false)
 
+    /**
+     * 自启动状态探测。
+     *
+     * Android 没有公开 API；但 MIUI / HyperOS 把自启动实现为一个 AppOps 项
+     * `android:auto_start`，可以用 `unsafeCheckOpNoThrow` 读到（非标准接口，
+     * 不同版本可能返回 DEFAULT / 抛异常）。
+     *
+     * @return true=已允许、false=已禁止、**null=读不到（按未知处理，不画状态点）**
+     */
+    fun autostartState(context: Context): Boolean? = runCatching {
+        val appOps = context.getSystemService(AppOpsManager::class.java) ?: return null
+        @Suppress("DEPRECATION")
+        val mode = appOps.unsafeCheckOpNoThrow(
+            "android:auto_start",
+            context.applicationInfo.uid,
+            context.packageName,
+        )
+        when (mode) {
+            AppOpsManager.MODE_ALLOWED -> true
+            AppOpsManager.MODE_ERRORED, AppOpsManager.MODE_IGNORED -> false
+            else -> null
+        }
+    }.getOrNull()
+
     fun summary(context: Context): PermissionSummary = PermissionSummary(
         nearby = isGranted(context, PermGroup.Nearby),
         location = isGranted(context, PermGroup.Location),
@@ -138,6 +174,8 @@ object AppPermissions {
         notificationRequired = Build.VERSION.SDK_INT >= 33,
         overlay = hasOverlay(context),
         batteryWhitelisted = isBatteryWhitelisted(context),
+        optionalDismissed = isOptionalDismissed(context),
+        autostart = autostartState(context),
     )
 
     // ------------------------------------------------------------ 深链
