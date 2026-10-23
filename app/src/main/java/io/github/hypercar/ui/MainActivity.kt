@@ -25,6 +25,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.Home
+import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
@@ -64,6 +65,7 @@ import io.github.hypercar.core.SessionSnapshot
 import io.github.hypercar.perm.AppPermissions
 import io.github.hypercar.perm.PermGroup
 import io.github.hypercar.session.HyperCarRepo
+import io.github.hypercar.ui.screens.AboutScreen
 import io.github.hypercar.ui.screens.DiagnosticsScreen
 import io.github.hypercar.ui.screens.HomeScreen
 import io.github.hypercar.ui.screens.SettingsScreen
@@ -108,6 +110,7 @@ private enum class AppTab(val title: String, val icon: ImageVector) {
     Home("主页", Icons.Rounded.Home),
     Settings("设置", Icons.Rounded.Settings),
     Diagnostics("诊断", Icons.Rounded.BugReport),
+    About("关于", Icons.Rounded.Info),
 }
 
 @Composable
@@ -306,6 +309,8 @@ private fun MainContent() {
                         onClearLogs = { HyperCarRepo.clearLogs() },
                         onExport = { HyperCarRepo.exportLogs() },
                     )
+
+                    AppTab.About -> AboutScreen()
                 }
             }
         }

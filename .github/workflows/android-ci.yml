@@ -292,10 +292,19 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -eu
+          # 本次发布的"更新说明"取**提交标题**（subject，即第一行）。
+          # 用 git 读而不是 github.event.head_commit.message：后者是多行全文，
+          # 且格式随触发方式（push / 手工补发）变化。
+          # 注意：本块内不要出现 Actions 的表达式插值（双花括号），否则会先被
+          # 替换成提交内容——多行内容会把这里撑成可执行的 shell 代码。
+          SUBJECT=$(git log -1 --format=%s)
           # 注意：这里是**未加引号**的 heredoc，会展开 $VAR；正文里不要出现反引号
-          # （未引号 heredoc 里反引号是命令替换，会执行 adb 并把错误写进 notes）
+          # （未引号 heredoc 里反引号是命令替换，会执行 adb 并把错误写进 notes）。
+          # SUBJECT 里的反引号无此问题：变量展开的结果不会被再次求值。
           cat > notes.md <<EOF
           HyperCar ${VERSION}（正式签名）
+
+          **更新说明**：${SUBJECT}
 
           CarLife 本机回环 → 零转码 → 宝马 AirPlay 网关（核心层 Rust）。
 
@@ -309,7 +318,6 @@ jobs:
           安装：adb install -r ${NAME}
 
           > 用正式 keystore 签名，可直接覆盖安装上一版；换证书签名的包必须卸载重装。
-          > 前置：Shizuku 已启动并授权；本机装有 CarLife/CarWith 系 app。
           EOF
 
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then

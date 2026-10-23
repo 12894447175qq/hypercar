@@ -27,6 +27,7 @@ object SettingsStore {
     private const val KEY_TARGET_MAC = "target_car_mac"
     private const val KEY_TARGET_NAME = "target_car_name"
     private const val KEY_AUTO_CONNECT = "auto_connect_on_bt"
+    private const val KEY_MANUAL_BT_MAC = "manual_bt_mac"
     private const val KEY_WIDTH = "carlife_width"
     private const val KEY_HEIGHT = "carlife_height"
     private const val KEY_FPS = "carlife_fps"
@@ -36,6 +37,9 @@ object SettingsStore {
     private const val KEY_DEBUG_LOG = "debug_log_enabled"
     private const val KEY_STABLE_DEVICE_ID = "stable_device_id"
     private const val KEY_DEGRADED_FIRST_CONNECT = "degraded_first_connect_done"
+
+    /** MAC 格式（字段写入前先大写归一，再按此校验；不合法直接存 null）。 */
+    private val MAC_PATTERN = Regex("([0-9A-F]{2}:){5}[0-9A-F]{2}")
 
     /** 目标车机（多车场景）：null = 自动（来者不拒）。 */
     var targetCarMac: String?
@@ -109,6 +113,28 @@ object SettingsStore {
             p().edit().putString(KEY_STABLE_DEVICE_ID, mac).apply()
             return mac
         }
+
+    /**
+     * 手动指定的本机蓝牙 MAC（大小写归一，非法值写不进去）。
+     *
+     * 为什么需要它：Android 6.0+ 应用层拿不到本机蓝牙地址，读 `settings/secure` 又要
+     * Shizuku/root。WinPlay / 部分奥迪会校验协议里的 bluetoothTransportIdentifier，
+     * 伪 ID 会被 403；这类接收端下用户可以用 PC 跑一次
+     * `adb shell settings get secure bluetooth_address`，把真值填进来。
+     *
+     * 优先级：手动值 > 自动解析（Shizuku/getAddress）> 稳定伪 ID。
+     * 设为 null 即恢复自动。
+     */
+    var manualBtMac: String?
+        get() = p().getString(KEY_MANUAL_BT_MAC, null)
+        set(v) {
+            val normalized = v?.trim()?.uppercase()?.takeIf { MAC_PATTERN.matches(it) }
+            p().edit().putString(KEY_MANUAL_BT_MAC, normalized).apply()
+        }
+
+    /** 手动 MAC 是否已设置（UI 用来显示"手动/自动"）。 */
+    val hasManualBtMac: Boolean
+        get() = manualBtMac != null
 
     /**
      * 无 Shizuku 降级模式下，是否已完成过一次「前台首连」（系统确认框已批准）。

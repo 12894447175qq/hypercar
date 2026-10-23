@@ -1,7 +1,5 @@
 package io.github.hypercar.ui.screens
 
-import android.content.Intent
-import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -49,7 +47,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -58,6 +55,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.window.Dialog
@@ -66,7 +64,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import io.github.hypercar.net.BluetoothMac
 import io.github.hypercar.perm.AppPermissions
 import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.settings.SettingsStore
@@ -74,6 +72,7 @@ import io.github.hypercar.shizuku.ShizukuState
 import io.github.hypercar.shizuku.ShizukuTools
 import io.github.hypercar.ui.components.CapsuleButton
 import io.github.hypercar.ui.components.GlassPanel
+import io.github.hypercar.ui.components.InfoRow
 import io.github.hypercar.ui.components.SectionLabel
 import io.github.hypercar.ui.theme.AmberWarning
 import io.github.hypercar.ui.theme.CoralError
@@ -83,9 +82,6 @@ import io.github.hypercar.ui.theme.StrokeGlass
 import io.github.hypercar.ui.theme.SurfaceInset
 import io.github.hypercar.ui.theme.TextPrimary
 import io.github.hypercar.ui.theme.TextSecondary
-import io.github.hypercar.update.UpdateCenter
-import io.github.hypercar.update.UpdateUiState
-import kotlinx.coroutines.launch
 
 /**
  * 分辨率预设（**兜底用**）。实际分辨率以车机 `/info` 回报为准，手机回报实际
@@ -109,6 +105,11 @@ private val CarLifePackagePresets = listOf(
 
 /**
  * 设置页：全部直读直写 [SettingsStore]，改动即时生效（apply() 异步落盘，读路径内存可见）。
+ *
+ * 排布原则（按"改动频率 × 影响面"自上而下）：
+ *   1. **常用**：行为（自动连接/音频）、唤醒包名——装好就要调的；
+ *   2. **一次性配置**：目标车机、权限与系统设置；
+ *   3. **高级**（分隔线以下）：编码分辨率（现在是兜底值）、设备身份（蓝牙 MAC）、Shizuku。
  */
 @Composable
 fun SettingsScreen(modifier: Modifier = Modifier) {
@@ -119,14 +120,44 @@ fun SettingsScreen(modifier: Modifier = Modifier) {
             .padding(horizontal = 16.dp, vertical = 16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        TargetCarSection()
-        ResolutionSection()
+        // ---- 常用 ----
         BehaviorSection()
         WakePackageSection()
+        // ---- 一次性配置 ----
+        TargetCarSection()
         PermissionSettingsSection()
+        // ---- 高级 ----
+        AdvancedMarker()
+        ResolutionSection()
+        IdentitySection()
         ShizukuSection()
-        AboutSection()
         Spacer(modifier = Modifier.height(8.dp))
+    }
+}
+
+/** 分隔线 + "高级"：把低频/兜底设置与常用设置分开，避免首屏被淹没。 */
+@Composable
+private fun AdvancedMarker() {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        HorizontalDivider(
+            modifier = Modifier.weight(1f),
+            color = StrokeGlass.copy(alpha = 0.5f),
+        )
+        Text(
+            text = "高级",
+            style = MaterialTheme.typography.labelSmall,
+            color = TextSecondary.copy(alpha = 0.8f),
+            modifier = Modifier.padding(horizontal = 12.dp),
+        )
+        HorizontalDivider(
+            modifier = Modifier.weight(1f),
+            color = StrokeGlass.copy(alpha = 0.5f),
+        )
     }
 }
 
@@ -269,6 +300,192 @@ private fun ShizukuState.hint(): String = when (this) {
         "Shizuku 是可选的：装上后能免除每次连热点的系统确认框。不装也能正常使用。"
 }
 
+/* ---------- 设备身份（蓝牙 MAC） ---------- */
+
+/**
+ * 本机蓝牙 MAC：免 Shizuku 的手动入口。
+ *
+ * Android 6.0+ 应用层拿不到本机蓝牙地址，读 `settings/secure` 又要 Shizuku/root。
+ * 宝马 iD8.5 不校验这个值（稳定伪 ID 即可），但 WinPlay / 部分奥迪会按
+ * bluetoothTransportIdentifier 严格过滤并 403——那种接收端下可以用 PC 跑一次
+ * `adb shell settings get secure bluetooth_address`，把真值填在这里。
+ */
+@Composable
+private fun IdentitySection() {
+    var dialogVisible by remember { mutableStateOf(false) }
+    var version by remember { mutableIntStateOf(0) }
+    val manual = remember(version) { SettingsStore.manualBtMac }
+    val pseudo = remember(version) { SettingsStore.stableDeviceId }
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        SectionLabel(text = "设备身份（蓝牙 MAC）")
+        GlassPanel(
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = manual ?: "自动",
+                        style = MaterialTheme.typography.titleMedium.copy(
+                            fontFamily = FontFamily.Monospace,
+                        ),
+                        color = if (manual != null) ElectricCyan else TextPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        text = if (manual != null) {
+                            "手动指定 · 所有协议身份都用它"
+                        } else {
+                            "有 Shizuku 时用真实 MAC，否则用稳定伪 ID（$pseudo）"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextSecondary,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                Spacer(modifier = Modifier.width(12.dp))
+                CapsuleButton(
+                    text = "填写",
+                    onClick = { dialogVisible = true },
+                    modifier = Modifier.height(44.dp),
+                    filled = false,
+                    contentColor = ElectricCyan,
+                    borderColor = ElectricCyan.copy(alpha = 0.6f),
+                )
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = "车机用这个值标识本机。宝马/iD8.5 不校验，WinPlay 与部分奥迪会校验——" +
+                    "连不上且日志提示 403 时，填真值或装 Shizuku。改完下次连接生效。",
+                style = MaterialTheme.typography.labelSmall,
+                color = TextSecondary.copy(alpha = 0.75f),
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+
+    if (dialogVisible) {
+        ManualBtMacDialog(
+            initial = manual.orEmpty(),
+            onDismiss = { dialogVisible = false },
+            onCleared = {
+                SettingsStore.manualBtMac = null
+                BluetoothMac.invalidate()
+                HyperCarRepo.refreshSystemState()
+                version++
+                dialogVisible = false
+            },
+            onSaved = { value ->
+                SettingsStore.manualBtMac = value
+                BluetoothMac.invalidate()
+                HyperCarRepo.refreshSystemState()
+                version++
+                dialogVisible = false
+            },
+        )
+    }
+}
+
+/** 手动填写本机蓝牙 MAC（格式校验后才允许保存）。 */
+@Composable
+private fun ManualBtMacDialog(
+    initial: String,
+    onDismiss: () -> Unit,
+    onCleared: () -> Unit,
+    onSaved: (String) -> Unit,
+) {
+    var text by rememberSaveable { mutableStateOf(initial) }
+    val trimmed = text.trim()
+    val valid = Regex("([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}").matches(trimmed)
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+            decorFitsSystemWindows = false,
+        ),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color(0xB302040A))
+                .pointerInput(Unit) { detectTapGestures { onDismiss() } }
+                .padding(20.dp)
+                .navigationBarsPadding(),
+            contentAlignment = Alignment.Center,
+        ) {
+            GlassPanel(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .pointerInput(Unit) { detectTapGestures { } },
+                contentPadding = PaddingValues(20.dp),
+            ) {
+                Text(
+                    text = "本机蓝牙 MAC",
+                    style = MaterialTheme.typography.titleLarge,
+                    color = TextPrimary,
+                )
+                Text(
+                    text = "用 PC 执行一次即可获取：\n" +
+                        "adb shell settings get secure bluetooth_address\n" +
+                        "留空并清除则恢复自动（Shizuku / 稳定伪 ID）。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextSecondary,
+                    modifier = Modifier.padding(top = 6.dp, bottom = 16.dp),
+                )
+                DialogTextField(
+                    value = text,
+                    onValueChange = { text = it },
+                    label = "蓝牙 MAC（AA:BB:CC:DD:EE:FF）",
+                    keyboardType = KeyboardType.Ascii,
+                )
+                if (trimmed.isNotEmpty() && !valid) {
+                    Text(
+                        text = "格式不对：需要 6 组两位十六进制，用冒号分隔",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = CoralError,
+                        modifier = Modifier.padding(top = 6.dp),
+                    )
+                }
+                Spacer(modifier = Modifier.height(18.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    CapsuleButton(
+                        text = "清除",
+                        onClick = onCleared,
+                        modifier = Modifier.height(44.dp),
+                        filled = false,
+                        contentColor = AmberWarning,
+                        borderColor = AmberWarning.copy(alpha = 0.5f),
+                    )
+                    Spacer(modifier = Modifier.weight(1f))
+                    CapsuleButton(
+                        text = "取消",
+                        onClick = onDismiss,
+                        modifier = Modifier.height(44.dp),
+                        filled = false,
+                        contentColor = TextSecondary,
+                        borderColor = StrokeGlass,
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    CapsuleButton(
+                        text = "保存",
+                        onClick = { onSaved(trimmed) },
+                        modifier = Modifier.height(44.dp),
+                        enabled = valid,
+                        filled = true,
+                    )
+                }
+            }
+        }
+    }
+}
+
 /* ---------- 权限与系统设置 ---------- */
 
 /**
@@ -392,138 +609,6 @@ private fun PermissionSettingsSection() {
                 overflow = TextOverflow.Ellipsis,
             )
         }
-    }
-}
-
-/* ---------- 关于 / 更新 ---------- */
-
-@Composable
-private fun AboutSection() {
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    val state by UpdateCenter.state.collectAsStateWithLifecycle()
-    val checking = state is UpdateUiState.Checking
-
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        SectionLabel(text = "关于")
-        GlassPanel(
-            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
-        ) {
-            InfoRow(label = "当前版本", value = UpdateCenter.currentVersion)
-            InfoRow(label = "版本号（versionCode）", value = UpdateCenter.currentBuild.toString())
-            InfoRow(label = "作者", value = "fw867")
-            InfoRow(
-                label = "开源仓库",
-                value = "github.com/fw867/hypercar",
-                onClick = {
-                    runCatching {
-                        context.startActivity(
-                            Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/fw867/hypercar"))
-                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                        )
-                    }
-                },
-            )
-
-            Spacer(modifier = Modifier.height(10.dp))
-            when (val s = state) {
-                is UpdateUiState.Available -> {
-                    Text(
-                        text = "发现新版本 ${s.info.version}（当前 ${UpdateCenter.currentVersion}）",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MintGreen,
-                    )
-                    if (s.info.notes.isNotBlank()) {
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            text = s.info.notes.take(400),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextSecondary,
-                            maxLines = 6,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(8.dp))
-                    CapsuleButton(
-                        text = if (s.info.apkUrl != null) "下载新版本" else "打开 Release 页面",
-                        onClick = {
-                            val url = s.info.apkUrl ?: s.info.pageUrl
-                            runCatching {
-                                context.startActivity(
-                                    Intent(Intent.ACTION_VIEW, Uri.parse(url))
-                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                                )
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        filled = true,
-                        containerColor = MintGreen,
-                    )
-                }
-
-                is UpdateUiState.UpToDate -> Text(
-                    text = "已是最新版本（${s.latest}）",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = TextSecondary,
-                )
-
-                is UpdateUiState.Failed -> Text(
-                    text = "检查失败：${s.message}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = CoralError,
-                    maxLines = 3,
-                    overflow = TextOverflow.Ellipsis,
-                )
-
-                UpdateUiState.Checking -> Text(
-                    text = "正在检查…",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = TextSecondary,
-                )
-
-                UpdateUiState.Idle -> Text(
-                    text = "更新来自 GitHub Releases；每次推送由 CI 自动构建正式签名包",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = TextSecondary,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-
-            Spacer(modifier = Modifier.height(10.dp))
-            CapsuleButton(
-                text = if (checking) "检查中…" else "检查更新",
-                onClick = { scope.launch { UpdateCenter.check(context) } },
-                modifier = Modifier.fillMaxWidth(),
-                enabled = !checking,
-                filled = false,
-            )
-        }
-    }
-}
-
-@Composable
-private fun InfoRow(label: String, value: String, onClick: (() -> Unit)? = null) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
-            .heightIn(min = 36.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.bodySmall,
-            color = TextSecondary,
-            modifier = Modifier.weight(1f),
-        )
-        Text(
-            text = value,
-            style = MaterialTheme.typography.bodySmall,
-            color = if (onClick != null) ElectricCyan else TextPrimary,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
     }
 }
 

@@ -132,6 +132,10 @@ fun SectionLabel(text: String, modifier: Modifier = Modifier) {
 /**
  * 胶囊按钮（主按钮全宽 52dp，最小触达 44dp）：
  * [filled] = true 电光青实心；false 描边（用于停止 / 断开等次要动作）。
+ *
+ * 文字颜色默认值随 [filled] 自动切换：实心用深空色（压在亮底上），
+ * 描边用 [containerColor]（压在深色背景上）。此前默认恒为 `DeepSpace`，
+ * 描边按钮没有底色时就是「深色字 + 深色背景」——字直接看不见。
  */
 @Composable
 fun CapsuleButton(
@@ -141,12 +145,17 @@ fun CapsuleButton(
     enabled: Boolean = true,
     filled: Boolean = true,
     containerColor: Color = ElectricCyan,
-    contentColor: Color = DeepSpace,
+    contentColor: Color = Color.Unspecified,
     borderColor: Color = ElectricCyan,
     leadingIcon: ImageVector? = null,
 ) {
     val shape = CircleShape
-    val tint = contentColor.copy(alpha = if (enabled) 1f else 0.4f)
+    val resolvedContent = if (contentColor == Color.Unspecified) {
+        if (filled) DeepSpace else containerColor
+    } else {
+        contentColor
+    }
+    val tint = resolvedContent.copy(alpha = if (enabled) 1f else 0.4f)
     val borderTint = borderColor.copy(alpha = if (enabled) borderColor.alpha else borderColor.alpha * 0.4f)
     Row(
         modifier = modifier
