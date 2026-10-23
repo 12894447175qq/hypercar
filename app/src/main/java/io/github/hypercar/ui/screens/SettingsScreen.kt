@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.ui.screens
+package io.github.hypercar.ui.screens
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -286,13 +286,14 @@ private fun ShizukuState.label(): String = when (this) {
 }
 
 private fun ShizukuState.hint(): String = when (this) {
-    ShizukuState.Ready -> "可以静默连接车机热点，并读取本机真实蓝牙 MAC。"
+    ShizukuState.Ready -> "可以静默加入车机热点（不弹系统确认框），也能用 shell 兜底拉起 CarLife。"
     ShizukuState.NotGranted ->
         "点下方按钮会弹出 Shizuku 的授权框；若没弹，请先在 Shizuku 里确认服务已启动。"
     ShizukuState.NotRunning ->
         "需要先打开 Shizuku 并启动服务（无线调试配对，或 root 启动）。"
     ShizukuState.NotInstalled ->
-        "Shizuku 是可选的：装上后能免除每次连热点的系统确认框。不装也能正常使用。"
+        "Shizuku 是可选的：装上后能免除每个热点首次的系统确认框，并在包名不对时兜底拉起 CarLife。" +
+            "不装也能用；真实蓝牙 MAC 可手动填写，不依赖 Shizuku。"
 }
 
 /* ---------- 设备身份（蓝牙 MAC） ---------- */
@@ -330,9 +331,9 @@ private fun IdentitySection() {
                     )
                     Text(
                         text = if (manual != null) {
-                            "手动指定 · 所有协议身份都用它"
+                            "手动指定 · 所有协议身份都用它（与 Shizuku 无关，关掉也生效）"
                         } else {
-                            "有 Shizuku 时用真实 MAC，否则用稳定伪 ID（$pseudo）"
+                            "自动：有 Shizuku 用真实 MAC，否则用稳定伪 ID（$pseudo）"
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = TextSecondary,
@@ -352,8 +353,9 @@ private fun IdentitySection() {
             }
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "车机用这个值标识本机。宝马/iD8.5 不校验，WinPlay 与部分奥迪会校验——" +
-                    "连不上且日志提示 403 时，填真值或装 Shizuku。改完下次连接生效。",
+                text = "车机用这个值标识本机（AirPlay 会话 SETUP 的 deviceID）。宝马/iD8.5 不校验，" +
+                    "WinPlay 与部分奥迪会校验——连不上且日志提示 403 就填真值。" +
+                    "填好后与 Shizuku 无关，关掉不影响；改完下次连接生效。",
                 style = MaterialTheme.typography.labelSmall,
                 color = TextSecondary.copy(alpha = 0.75f),
                 maxLines = 3,
@@ -1113,4 +1115,5 @@ private fun WakePackageSection() {
         }
     }
 }
+
 
