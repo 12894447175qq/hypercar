@@ -142,7 +142,9 @@ class WifiJoiner(
         withContext(Dispatchers.IO) {
             val specifier = WifiNetworkSpecifier.Builder().apply {
                 setSsid(ssid)
-                if (psk.isBlank()) setOpenNetwork() else setWpa2Passphrase(psk)
+                // 开放网络：Builder 没有 setOpenNetwork()，不设任何密码方法即为开放；
+                // WPA2 只有 setWpa2Passphrase 一条路径。
+                if (psk.isNotBlank()) setWpa2Passphrase(psk)
             }.build()
 
             // app 专属网络：只能加 TRANSPORT_WIFI + specifier，
@@ -181,7 +183,8 @@ class WifiJoiner(
         callback.set(cb)
         try {
             // 带超时的 requestNetwork：系统确认框期间不超时，用户长期不点才失败
-            connectivityManager.requestNetwork(request, cb, timeoutMs)
+            // （该重载的 timeout 参数是 Int，需从 Long 转换）
+            connectivityManager.requestNetwork(request, cb, timeoutMs.toInt())
         } catch (t: Throwable) {
             callback.compareAndSet(cb, null)
             Log.i(TAG, "specifier requestNetwork 失败：${t.message}")

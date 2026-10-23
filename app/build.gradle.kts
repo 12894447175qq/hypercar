@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -57,11 +59,13 @@ android {
                 )
             }
             if (ks.exists()) {
-                val props = java.util.Properties().apply { ks.inputStream().use { load(it) } }
-                storeFile = rootProject.file(props.getProperty("storeFile") ?: "hypercar.jks")
+                val props = Properties().apply { ks.inputStream().use { load(it) } }
+                // 接到局部 val：storeFile 是可变属性，直接读会触发 smart cast 拒绝
+                val sf = rootProject.file(props.getProperty("storeFile") ?: "hypercar.jks")
+                storeFile = sf
                 // 未配 keystore.properties 里显式声明时按扩展名推断（.p12/.pfx = PKCS12）
                 storeType = props.getProperty("storeType")
-                    ?: if (storeFile.name.endsWith(".p12", true) || storeFile.name.endsWith(".pfx", true)) "PKCS12" else "JKS"
+                    ?: if (sf.name.endsWith(".p12", true) || sf.name.endsWith(".pfx", true)) "PKCS12" else "JKS"
                 storePassword = props.getProperty("storePassword")
                 keyAlias = props.getProperty("keyAlias")
                 keyPassword = props.getProperty("keyPassword")
@@ -116,10 +120,10 @@ dependencies {
     implementation("androidx.datastore:datastore-preferences:1.1.1")
 
     // Shizuku：静默连车机热点 / 真实蓝牙 MAC / shell 能力（cardeck 同款依赖）
-    // provider 是 ShizukuProvider 的宿主（清单需声明，缺它 binder 收不到）
+    // provider 是 ShizukuProvider 的宿主（清单需声明，缺它 binder 收不到）。
+    // 注意：只有 api + provider 两个构件；不存在 dev.rikka.shizuku:support。
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
-    implementation("dev.rikka.shizuku:support:13.1.5")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")

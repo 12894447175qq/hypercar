@@ -2,6 +2,7 @@ package io.github.hypercar.ui.components
 
 import android.graphics.BlurMaskFilter
 import android.graphics.Paint
+import android.graphics.RectF
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -27,11 +28,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithCache
-import androidx.compose.ui.geometry.CornerRadius
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -74,15 +75,20 @@ fun Modifier.glassPanel(
             val radiusPx = cornerRadius.toPx()
             glowPaint.strokeWidth = strokeWidthPx
             glowPaint.maskFilter = BlurMaskFilter(radiusPx * 1.25f, BlurMaskFilter.Blur.NORMAL)
-            glowPaint.color = glowColor.copy(alpha = 0.28f)
+            // android.graphics.Paint.color 是 ARGB Int，需把 Compose Color 转过去
+            glowPaint.color = glowColor.copy(alpha = 0.28f).toArgb()
             onDrawBehind {
-                val inset = strokeWidthPx / 2f
-                drawRoundRect(
-                    paint = glowPaint,
-                    topLeft = Offset(inset, inset),
-                    size = Size(size.width - strokeWidthPx, size.height - strokeWidthPx),
-                    cornerRadius = CornerRadius(radiusPx, radiusPx),
-                )
+                // 带 BlurMaskFilter 的辉光必须走 nativeCanvas（Compose 的 drawRoundRect 不接 Paint）
+                drawIntoCanvas { canvas ->
+                    val inset = strokeWidthPx / 2f
+                    val rect = RectF(
+                        inset,
+                        inset,
+                        size.width - inset,
+                        size.height - inset,
+                    )
+                    canvas.nativeCanvas.drawRoundRect(rect, radiusPx, radiusPx, glowPaint)
+                }
             }
         }
     } else {

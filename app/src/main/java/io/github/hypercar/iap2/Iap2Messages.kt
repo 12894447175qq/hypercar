@@ -193,8 +193,8 @@ object Iap2Messages {
     /** 纯函数解析 0x1D01。 */
     fun parseIdentification(body: ByteArray): Identification {
         val params = Iap2Csm.parseParams(body).associateBy { it.id }
-        val sendIds = params[IDENT_SEND_IDS]?.asU16List()?.takeIf { it.isNotEmpty() }
-        val receiveIds = params[IDENT_RECEIVE_IDS]?.asU16List()?.takeIf { it.isNotEmpty() }
+        val sendIds = params[IDENT_SEND_IDS]?.asU16List()?.takeIf { it.isNotEmpty() }?.toSet()
+        val receiveIds = params[IDENT_RECEIVE_IDS]?.asU16List()?.takeIf { it.isNotEmpty() }?.toSet()
         val ea = ArrayList<EaProtocol>()
         for (groupId in IDENT_EA_GROUP_FIRST..IDENT_EA_GROUP_LAST) {
             val value = params[groupId]?.value ?: continue

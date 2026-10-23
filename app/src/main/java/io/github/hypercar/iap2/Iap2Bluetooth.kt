@@ -692,7 +692,6 @@ private class RfcommLinkChannel(
             terminated = true
             controls.offer(POISON) // 哨兵：唤醒阻塞的接收方（LBQ 不接受 null）
             readyLatch.countDown()
-            lock.notifyAll()
             runCatching { socket.close() }
             log(if (reason == null) "LINK closed" else "LINK closed: ${reason.message}")
         }

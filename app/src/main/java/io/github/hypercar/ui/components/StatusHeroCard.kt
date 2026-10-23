@@ -20,7 +20,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Bluetooth
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
-import androidx.compose.material.icons.rounded.DirectionCar
+import androidx.compose.material.icons.rounded.DirectionsCar
 import androidx.compose.material.icons.rounded.PowerSettingsNew
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Warning
@@ -278,7 +278,7 @@ private fun IdleGlyph() {
         )
     }
     Icon(
-        imageVector = Icons.Rounded.DirectionCar,
+        imageVector = Icons.Rounded.DirectionsCar,
         contentDescription = "待机",
         tint = ElectricCyan.copy(alpha = 0.9f),
         modifier = Modifier.size(38.dp),
