@@ -758,27 +758,29 @@ object HyperCarRepo {
         }
     }
 
-    private companion object {
-        /** 等车机 iAP2 端点的上限：超时失败而不是无限挂着（挂着会让后续自动连接全被挡）。 */
-        const val ENDPOINT_TIMEOUT_MILLIS = 180_000L
+    // ---------------------------------------------------------------- 常量
+    // 注意：本类是 standalone object，**不能**用 companion object（Kotlin 不允许
+    // 「companion 声明在 object 里」），常量直接作为 object 成员即可。
 
-        /** 同一次 ACL 事件会被 receiver 与 service 各转交一次：这段时间内只记一行。 */
-        const val ACL_EVENT_LOG_DEDUPE_MILLIS = 1_500L
+    /** 等车机 iAP2 端点的上限：超时失败而不是无限挂着（挂着会让后续自动连接全被挡）。 */
+    private const val ENDPOINT_TIMEOUT_MILLIS = 180_000L
 
-        /** 等端点期间的进度日志间隔（车机不开 iAP2 窗口时不至于静默 3 分钟）。 */
-        const val ENDPOINT_PROGRESS_MILLIS = 15_000L
+    /** 同一次 ACL 事件会被 receiver 与 service 各转交一次：这段时间内只记一行。 */
+    private const val ACL_EVENT_LOG_DEDUPE_MILLIS = 1_500L
 
-        /** 停止时等在途连接协程退出的上限（超过就先拆，连接侧另有 sessionLive 兜底）。 */
-        const val JOIN_TIMEOUT_MILLIS = 5_000L
+    /** 等端点期间的进度日志间隔（车机不开 iAP2 窗口时不至于静默 3 分钟）。 */
+    private const val ENDPOINT_PROGRESS_MILLIS = 15_000L
 
-        /** 环形日志保留行数（诊断页展示 + 导出）。 */
-        const val LOG_KEEP_LINES = 300
+    /** 停止时等在途连接协程退出的上限（超过就先拆，连接侧另有 sessionLive 兜底）。 */
+    private const val JOIN_TIMEOUT_MILLIS = 5_000L
 
-        /** 单行日志限流：窗口内最多落盘次数。 */
-        const val LOG_RATE_MAX = 4
-        const val LOG_RATE_WINDOW_MILLIS = 10_000L
+    /** 环形日志保留行数（诊断页展示 + 导出）。 */
+    private const val LOG_KEEP_LINES = 300
 
-        /** 限流表容量上限（超过就清空重建，避免长跑后无限增长）。 */
-        const val LOG_RATE_MAX_KEYS = 256
-    }
+    /** 单行日志限流：窗口内最多落盘次数。 */
+    private const val LOG_RATE_MAX = 4
+    private const val LOG_RATE_WINDOW_MILLIS = 10_000L
+
+    /** 限流表容量上限（超过就清空重建，避免长跑后无限增长）。 */
+    private const val LOG_RATE_MAX_KEYS = 256
 }
