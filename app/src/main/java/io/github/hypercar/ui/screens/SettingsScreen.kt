@@ -1,4 +1,4 @@
-package io.github.hypercar.ui.screens
+﻿package io.github.hypercar.ui.screens
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -34,6 +34,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
@@ -87,14 +88,6 @@ import io.github.hypercar.ui.theme.TextSecondary
  * 分辨率预设（**兜底用**）。实际分辨率以车机 `/info` 回报为准，手机回报实际
  * 编码尺寸后还会再覆盖一次；只有两者都拿不到时才落到这里。宽度均为偶数。
  */
-private data class ResolutionPreset(val label: String, val width: Int, val height: Int)
-
-private val ResolutionPresets = listOf(
-    ResolutionPreset("1920×720", 1920, 720),
-    ResolutionPreset("1440×480", 1440, 480),
-    ResolutionPreset("1280×480", 1280, 480),
-)
-
 private val FpsOptions = listOf(30, 60)
 
 private val CarLifePackagePresets = listOf(
@@ -809,13 +802,10 @@ private fun DialogTextField(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ResolutionSection() {
-    var selectedIndex by rememberSaveable {
-        mutableStateOf(
-            ResolutionPresets.indexOfFirst {
-                it.width == SettingsStore.carlifeWidth && it.height == SettingsStore.carlifeHeight
-            }.coerceAtLeast(0),
-        )
-    }
+    // 分辨率改为自由输入（原三个预设已删除）：编码尺寸随机型而异，
+    // 写死选项反而逼用户改代码。输入即生效，偶数对齐在配置下发前完成。
+    var widthText by rememberSaveable { mutableStateOf(SettingsStore.carlifeWidth.toString()) }
+    var heightText by rememberSaveable { mutableStateOf(SettingsStore.carlifeHeight.toString()) }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionLabel(text = "CarLife 编码分辨率（兜底值）")
         GlassPanel(
@@ -829,28 +819,44 @@ private fun ResolutionSection() {
                 color = TextSecondary,
             )
             Spacer(modifier = Modifier.height(12.dp))
-            SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-                ResolutionPresets.forEachIndexed { index, preset ->
-                    SegmentedButton(
-                        selected = selectedIndex == index,
-                        onClick = {
-                            selectedIndex = index
-                            SettingsStore.carlifeWidth = preset.width
-                            SettingsStore.carlifeHeight = preset.height
-                        },
-                        shape = SegmentedButtonDefaults.itemShape(
-                            index = index,
-                            count = ResolutionPresets.size,
-                        ),
-                        label = {
-                            Text(
-                                text = preset.label,
-                                style = MaterialTheme.typography.labelMedium,
-                                maxLines = 1,
-                            )
-                        },
-                    )
-                }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                OutlinedTextField(
+                    value = widthText,
+                    onValueChange = { s ->
+                        widthText = s.filter { it.isDigit() }.take(5)
+                        widthText.toIntOrNull()?.let { if (it >= 320) SettingsStore.carlifeWidth = it }
+                    },
+                    label = { Text("宽", style = MaterialTheme.typography.labelMedium) },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.weight(1f),
+                )
+                OutlinedTextField(
+                    value = heightText,
+                    onValueChange = { s ->
+                        heightText = s.filter { it.isDigit() }.take(5)
+                        heightText.toIntOrNull()?.let { if (it >= 240) SettingsStore.carlifeHeight = it }
+                    },
+                    label = { Text("高", style = MaterialTheme.typography.labelMedium) },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.weight(1f),
+                )
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            TextButton(
+                onClick = {
+                    SettingsStore.carlifeWidth = 2560
+                    SettingsStore.carlifeHeight = 744
+                    widthText = "2560"
+                    heightText = "744"
+                },
+            ) {
+                Text("恢复默认 2560×744", style = MaterialTheme.typography.labelMedium)
             }
             Spacer(modifier = Modifier.height(16.dp))
             FpsSegment()
@@ -1107,3 +1113,4 @@ private fun WakePackageSection() {
         }
     }
 }
+

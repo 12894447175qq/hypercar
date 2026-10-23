@@ -1,4 +1,4 @@
-//! 网关引擎编排：CarLife 回环 ⇄ AirPlay 推流 的粘合层。
+﻿//! 网关引擎编排：CarLife 回环 ⇄ AirPlay 推流 的粘合层。
 //!
 //! 数据面（全部零转码）：
 //!  - 视频：CarLife 8240 的 H.264 Annex B 裸流 → ScreenSender（128B 头 + ChaCha20-Poly1305）
@@ -66,6 +66,13 @@ pub struct EngineConfig {
     pub touch_display_w: u32,
     #[serde(default)]
     pub touch_display_h: u32,
+    /// 特性配置里的 `voice`：0 = 车机不提供语音（MD 回落到**手机自己的麦克风**），
+    /// 1 = HU 通过 VR 通道推麦克风数据。
+    ///
+    /// 默认 0：我们没有可靠的车机麦克风来源；声明 1 会让手机等我们喂麦克风，
+    /// 语音助手于是报「麦克风有问题」（现场 2026-10-24 定位）。
+    #[serde(default)]
+    pub voice: u32,
 }
 
 fn default_true() -> bool {
@@ -87,6 +94,8 @@ pub async fn run_engine(
     mut touch_rx: mpsc::UnboundedReceiver<TouchInput>,
     key_tx: mpsc::UnboundedSender<u32>,
     mut key_rx: mpsc::UnboundedReceiver<u32>,
+    // 麦克风 PCM 来源（PC 侧联调注入；Android 上为 None）
+    mut mic_rx: Option<mpsc::UnboundedReceiver<Vec<i16>>>,
     stop: Arc<Notify>,
 ) -> Result<(), String> {
     emit_state("negotiating", "CarLife 网关启动");
@@ -97,6 +106,7 @@ pub async fn run_engine(
         width: cfg.width,
         height: cfg.height,
         fps: cfg.fps,
+        voice: cfg.voice,
     };
     let (hub, mut life_events) = match cfg.md_host.clone() {
         Some(host) => CarLifeHub::connect(life_cfg, host, stop.clone())?,
@@ -125,6 +135,22 @@ pub async fn run_engine(
         });
     }
 
+    // 麦克风上行：外部 PCM（PC 侧采集）→ CarLife VR 通道
+    if let Some(mut mic_rx) = mic_rx.take() {
+        let hub = hub.clone();
+        let stop_m = stop.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = stop_m.notified() => return,
+                    pcm = mic_rx.recv() => match pcm {
+                        Some(pcm) => hub.inject_mic(&pcm),
+                        None => return,
+                    },
+                }
+            }
+        });
+    }
     // ---- 分发器：CarLife 事件 → 视频泵 / 音频泵 ----
     let (video_tx, video_rx) = mpsc::unbounded_channel::<CarLifeEvent>();
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<CarLifeEvent>();
@@ -529,3 +555,7 @@ struct AudioPumpStat {
     playing: bool,
     ducking: bool,
 }
+
+
+
+

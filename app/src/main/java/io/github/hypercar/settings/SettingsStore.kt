@@ -1,4 +1,4 @@
-package io.github.hypercar.settings
+﻿package io.github.hypercar.settings
 
 import android.content.Context
 import android.content.SharedPreferences
@@ -65,11 +65,11 @@ object SettingsStore {
      * 数值与车机原生分辨率不同也不会影响画质。
      */
     var carlifeWidth: Int
-        get() = p().getInt(KEY_WIDTH, 1920)
+        get() = p().getInt(KEY_WIDTH, 2560)
         set(v) = p().edit().putInt(KEY_WIDTH, v.coerceAtLeast(2)).apply()
 
     var carlifeHeight: Int
-        get() = p().getInt(KEY_HEIGHT, 720)
+        get() = p().getInt(KEY_HEIGHT, 744)
         set(v) = p().edit().putInt(KEY_HEIGHT, v.coerceAtLeast(2)).apply()
 
     var carlifeFps: Int

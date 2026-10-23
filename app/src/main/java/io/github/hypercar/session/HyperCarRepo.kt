@@ -1,4 +1,4 @@
-package io.github.hypercar.session
+﻿package io.github.hypercar.session
 
 import android.bluetooth.BluetoothDevice
 import android.content.Context
@@ -32,6 +32,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -362,12 +363,86 @@ object HyperCarRepo {
      */
     private fun releaseSessionResources() {
         streaming = false
+        stopVoiceMic()
         runCatching { RustCoreBridge.nativeStop() }
         runCatching { iap2?.stop() }
         iap2 = null
         runCatching { wifiJoiner?.release() }
         wifiJoiner = null
         boundNetwork = null
+    }
+
+    // ---------------------------------------------------------------- 语音助手麦克风
+    //
+    // CarLife 的语音识别要求「车机」侧提供麦克风数据（VR 通道 VR_MIC_DATA 0x00058001）。
+    // 本机 HU 就用手机自己的麦克风：AudioRecord(16k mono) → nativeSendMic → carlife::inject_mic。
+    // 现场 2026-10-24：不给麦克风时手机端报「麦克风有问题」。
+
+    @Volatile
+    private var micRecord: android.media.AudioRecord? = null
+    private var micJob: Job? = null
+
+    private fun startVoiceMic() {
+        if (micRecord != null) return
+        val ctx = appContext() ?: return
+        if (androidx.core.content.ContextCompat.checkSelfPermission(
+                ctx,
+                android.Manifest.permission.RECORD_AUDIO,
+            ) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            log("VOICE: 缺少录音权限（RECORD_AUDIO）——语音助手会报麦克风异常，去设置授权后重连")
+            return
+        }
+        val rate = 16_000
+        val minBuf = android.media.AudioRecord.getMinBufferSize(
+            rate,
+            android.media.AudioFormat.CHANNEL_IN_MONO,
+            android.media.AudioFormat.ENCODING_PCM_16BIT,
+        )
+        // 至少 80ms 缓冲：20ms 一帧读，留点余量防采集中断
+        val bufSize = maxOf(minBuf, rate / 50 * 2 * 4)
+        val rec = runCatching {
+            android.media.AudioRecord(
+                android.media.MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                rate,
+                android.media.AudioFormat.CHANNEL_IN_MONO,
+                android.media.AudioFormat.ENCODING_PCM_16BIT,
+                bufSize,
+            )
+        }.getOrNull()
+        if (rec == null || rec.state != android.media.AudioRecord.STATE_INITIALIZED) {
+            log("VOICE: AudioRecord 初始化失败（state=${rec?.state}）")
+            runCatching { rec?.release() }
+            return
+        }
+        val started = runCatching { rec.startRecording() }.isSuccess
+        if (!started) {
+            log("VOICE: startRecording 失败")
+            runCatching { rec.release() }
+            return
+        }
+        micRecord = rec
+        micJob = scope.launch(Dispatchers.IO) {
+            val chunk = ShortArray(320) // 20ms @16kHz
+            while (isActive) {
+                val n = runCatching { rec.read(chunk, 0, chunk.size) }.getOrDefault(0)
+                if (n > 0) {
+                    val pcm = if (n == chunk.size) chunk else chunk.copyOf(n)
+                    runCatching { RustCoreBridge.nativeSendMic(pcm) }
+                }
+            }
+        }
+        log("VOICE: 手机麦克风已接入 CarLife VR 通道（16kHz 单声道，20ms/帧）")
+    }
+
+    private fun stopVoiceMic() {
+        micJob?.cancel()
+        micJob = null
+        micRecord?.let { r ->
+            runCatching { r.stop() }
+            runCatching { r.release() }
+        }
+        micRecord = null
     }
 
     // ---------------------------------------------------------------- WiFi
@@ -528,6 +603,9 @@ object HyperCarRepo {
                         carLife = CarLifeState.Waiting(),
                     )
                     wakeLocalCarLife()
+                    // 语音助手要靠车机侧供麦克风；CarLife 连上后再开采集，
+                    // 避免没会话时空录（也会占着麦克风影响其他应用）
+                    startVoiceMic()
                 }
                 "carlife_waiting" -> push(carLife = CarLifeState.Waiting())
                 // Rust 侧 CarLife 14 步握手完成（VIDEO_ENCODER_START 已发）

@@ -1,4 +1,4 @@
-package io.github.hypercar.ui.screens
+﻿package io.github.hypercar.ui.screens
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -33,6 +33,7 @@ import io.github.hypercar.ui.components.GlassPanel
 import io.github.hypercar.ui.components.PermissionChecklistCard
 import io.github.hypercar.ui.components.StatChips
 import io.github.hypercar.ui.components.StatusHeroCard
+import io.github.hypercar.ui.theme.MintGreen
 import io.github.hypercar.ui.theme.MonoLogLine
 import io.github.hypercar.ui.theme.TextPrimary
 import io.github.hypercar.ui.theme.TextSecondary
@@ -97,6 +98,7 @@ fun HomeScreen(
                         onRequestPermission = onRequestDegradedPermission,
                         onTestConnect = onStart,
                     )
+                    FirstConnectGuideCard()
                     StatChips(
                         snapshot = snapshot,
                         onOpenShizuku = onOpenShizukuSettings,
@@ -130,6 +132,7 @@ fun HomeScreen(
                     onRequestPermission = onRequestDegradedPermission,
                     onTestConnect = onStart,
                 )
+                FirstConnectGuideCard()
                 StatChips(
                     snapshot = snapshot,
                     onOpenShizuku = onOpenShizukuSettings,
@@ -230,6 +233,43 @@ internal fun LogLineRow(line: String, modifier: Modifier = Modifier) {
             color = if (parsed.level == 'E') color else TextSecondary,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+
+/**
+ * 「首次连接」引导：CarWith 首次配对必须手动点一次，之后同一台车会自动回连。
+ *
+ * 这一步没有对外接口（CarWith 的 Activity 不导出、值存在 CarLife 的私有
+ * SharedPreferences 里），所以只能引导用户在界面上点一次。
+ */
+@Composable
+internal fun FirstConnectGuideCard(modifier: Modifier = Modifier) {
+    GlassPanel(
+        modifier = modifier.fillMaxWidth(),
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 14.dp),
+    ) {
+        Text(
+            text = "首次连接（只需做一次）",
+            style = MaterialTheme.typography.titleSmall,
+            color = TextPrimary,
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = "① 车机侧开始接收（PC/WinPlay 联调时先在 PC 上起 hub）\n" +
+                "② 手机点「启动连接」，等状态到「已连接」\n" +
+                "③ 打开 CarWith → CarLife 连接 → 无线连接 → 车辆热点\n" +
+                "④ 点列表里的车机蓝牙名称 → 下一步 → 开始连接",
+            style = MaterialTheme.typography.bodySmall,
+            color = TextSecondary,
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = "做完这一次，同一台车以后会自动回连。第 ④ 步「开始连接」" +
+                "只有在 CarWith 检测到车机蓝牙时才可用；列表为空就回第 ① 步确认车机在接收。",
+            style = MaterialTheme.typography.labelSmall,
+            color = MintGreen,
         )
     }
 }

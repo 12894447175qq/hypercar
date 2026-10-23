@@ -1,4 +1,4 @@
-package io.github.hypercar.ui.components
+﻿package io.github.hypercar.ui.components
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -53,6 +53,8 @@ import java.util.Locale
 fun StatChips(
     snapshot: SessionSnapshot,
     modifier: Modifier = Modifier,
+    /** 联调模式（PC 侧当 HU）：本机引擎不跑，视频/CarLife/音频统计无从更新，芯片改为说明来源。 */
+    externalMode: Boolean = false,
     onOpenShizuku: (() -> Unit)? = null,
 ) {
     Row(
@@ -61,9 +63,9 @@ fun StatChips(
             .horizontalScroll(rememberScrollState()),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        VideoChip(snapshot.video)
-        CarLifeChip(snapshot.carLife)
-        AudioChip(snapshot.audio)
+        VideoChip(snapshot.video, externalMode)
+        CarLifeChip(snapshot.carLife, externalMode)
+        AudioChip(snapshot.audio, externalMode)
         ShizukuChip(snapshot.shizukuReady, onOpenShizuku)
     }
 }
@@ -123,11 +125,11 @@ private fun StatChip(
 /* ---------- 各链路状态 → 芯片 ---------- */
 
 @Composable
-private fun VideoChip(video: VideoStats) {
+private fun VideoChip(video: VideoStats, external: Boolean = false) {
     val idle = video.fps <= 0
     val accent = if (idle) TextSecondary else ElectricCyan
     val value = if (idle) {
-        "未推流"
+        if (external) "PC 侧推流" else "未推流"
     } else {
         buildString {
             append(video.fps).append(" fps")
@@ -148,11 +150,11 @@ private fun VideoChip(video: VideoStats) {
 }
 
 @Composable
-private fun CarLifeChip(carLife: CarLifeState) {
+private fun CarLifeChip(carLife: CarLifeState, external: Boolean = false) {
     when (carLife) {
         is CarLifeState.Idle -> StatChip(
             label = "CarLife",
-            value = "未接入",
+                value = if (external) "PC 侧接入" else "未接入",
             accent = TextSecondary,
             leadingIcon = Icons.Rounded.GraphicEq,
         )
@@ -174,11 +176,11 @@ private fun CarLifeChip(carLife: CarLifeState) {
 }
 
 @Composable
-private fun AudioChip(audio: AudioStats) {
+private fun AudioChip(audio: AudioStats, external: Boolean = false) {
     val (accent, value) = when {
         audio.ducking -> AmberWarning to "导航闪避中"
         audio.playing -> MintGreen to "播放中"
-        else -> TextSecondary to "待机"
+            else -> TextSecondary to if (external) "PC 侧播放" else "待机"
     }
     StatChip(
         label = "音频",
@@ -212,3 +214,5 @@ private fun formatBitrate(kbps: Long): String = if (kbps >= 1000L) {
 
 /** 芯片最小宽度，保证短文案芯片不至于太窄。 */
 private val ChipMinWidth = 110.dp
+
+

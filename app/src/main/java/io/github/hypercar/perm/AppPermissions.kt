@@ -1,4 +1,4 @@
-package io.github.hypercar.perm
+﻿package io.github.hypercar.perm
 
 import android.Manifest
 import android.app.AppOpsManager
@@ -41,6 +41,9 @@ enum class PermGroup {
 
     /** 通知（前台服务常驻通知）。 */
     Notification,
+
+    /** 麦克风（语音助手：CarLife 要求车机侧供麦克风，本机用手机麦克风）。 */
+    Microphone,
 }
 
 /** 一次性快照，供 UI 判断显示哪些行、是否有待办。 */
@@ -75,6 +78,8 @@ object AppPermissions {
 
         PermGroup.Notification ->
             if (Build.VERSION.SDK_INT >= 33) arrayOf(Manifest.permission.POST_NOTIFICATIONS) else emptyArray()
+
+        PermGroup.Microphone -> arrayOf(Manifest.permission.RECORD_AUDIO)
     }
 
     /** 当前版本下**必需**的运行时权限组。 */
@@ -82,6 +87,7 @@ object AppPermissions {
         add(PermGroup.Nearby)
         if (Build.VERSION.SDK_INT <= 32) add(PermGroup.Location)
         if (Build.VERSION.SDK_INT >= 33) add(PermGroup.Notification)
+          add(PermGroup.Microphone)
     }
 
     /** 缺失的必需组（用于一键申请与连接前预检）。 */
@@ -275,3 +281,4 @@ object AppPermissions {
         return false
     }
 }
+

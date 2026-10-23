@@ -1,4 +1,4 @@
-//! HyperCar 核心层 —— JNI 入口、Tokio 运行时、引擎生命周期。
+﻿//! HyperCar 核心层 —— JNI 入口、Tokio 运行时、引擎生命周期。
 //!
 //! 与「参考文档」的架构差异（docs/NEGOTIATION-GAPS.md）：
 //!  参考文档里 AirPlay 协商留在 Kotlin，Rust 只接「已连通 FD + 已派生密钥」；
@@ -34,7 +34,7 @@ mod timing;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::Arc;
 
-use jni::objects::{GlobalRef, JClass, JObject, JString};
+use jni::objects::{GlobalRef, JClass, JObject, JShortArray, JString};
 use jni::sys::{jboolean, jint, JNI_TRUE, JNI_FALSE};
 use jni::JNIEnv;
 use once_cell::sync::Lazy;
@@ -61,6 +61,8 @@ struct EngineHandle {
     stop: Arc<Notify>,
     touch_tx: mpsc::UnboundedSender<TouchInput>,
     key_tx: mpsc::UnboundedSender<u32>,
+    /// 手机麦克风 PCM → CarLife VR 通道（语音助手用）
+    mic_tx: mpsc::UnboundedSender<Vec<i16>>,
 }
 
 static ENGINE: Lazy<parking_lot::Mutex<Option<EngineHandle>>> =
@@ -348,6 +350,8 @@ fn native_start_impl(
 
     let (touch_tx, touch_rx) = mpsc::unbounded_channel::<TouchInput>();
     let (key_tx, key_rx) = mpsc::unbounded_channel::<u32>();
+    // 手机麦克风 → CarLife VR（语音助手要靠车机喂麦克风）
+    let (mic_tx, mic_rx) = mpsc::unbounded_channel::<Vec<i16>>();
     let stop = Arc::new(Notify::new());
 
     let stop_run = stop.clone();
@@ -362,6 +366,8 @@ fn native_start_impl(
             touch_rx,
             key_tx_engine,
             key_rx,
+            // 手机麦克风（AudioRecord）经 nativeSendMic 注入
+            Some(mic_rx),
             stop_run,
         )
         .await;
@@ -385,6 +391,7 @@ fn native_start_impl(
         stop,
         touch_tx,
         key_tx,
+        mic_tx,
     });
 
     emit_log("nativeStart: 引擎任务已派生");
@@ -407,6 +414,32 @@ fn stop_engine() {
         handle.stop.notify_waiters();
         handle.stop.notify_one();
         emit_log("引擎已停止");
+    }
+}
+
+/// 手机麦克风 PCM（16kHz 单声道 16-bit）→ CarLife VR 通道。
+///
+/// CarLife 的语音助手要求「车机」提供麦克风数据（VR 通道 `VR_MIC_DATA 0x00058001`）；
+/// 本机 HU 就用手机自己的 `AudioRecord` 采，经这里注入，再由 `carlife::inject_mic`
+/// 封帧推给 MD。Android 侧需要在 manifest 申请 RECORD_AUDIO 并运行时授权。
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSendMic(
+    mut env: JNIEnv,
+    _class: JClass,
+    pcm: JShortArray,
+) {
+    let Ok(len) = env.get_array_length(&pcm) else {
+        return;
+    };
+    if len <= 0 {
+        return;
+    }
+    let mut buf = vec![0i16; len as usize];
+    if env.get_short_array_region(&pcm, 0, &mut buf).is_err() {
+        return;
+    }
+    if let Some(handle) = ENGINE.lock().as_ref() {
+        let _ = handle.mic_tx.send(buf);
     }
 }
 
@@ -484,3 +517,6 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeBuildIa
         .expect("jbyteArray 创建失败")
         .into_raw()
 }
+
+
+

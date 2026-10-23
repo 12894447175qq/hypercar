@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "hypercar_hub"
 version = "0.1.0"
 edition = "2021"
@@ -38,3 +38,5 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
+
+

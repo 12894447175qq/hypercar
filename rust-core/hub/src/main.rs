@@ -117,6 +117,8 @@ struct Args {
     md_host: String,
     /// 触摸显示空间 "WxH"（接收端 /info 报 0x0 时用，例 2732x794）
     touch_display: String,
+    /// 特性配置里的 voice：0=车机不提供语音（用手机自己的麦克风），1=HU 推麦克风
+    voice: u32,
 }
 
 impl Args {
@@ -124,14 +126,15 @@ impl Args {
         let mut args = Args {
             airplay: "127.0.0.1:17000".to_string(),
             device_id: String::new(),
-            width: 1920,
-            height: 720,
+            width: 2560,
+            height: 744,
             fps: 60,
             bind: "0.0.0.0".to_string(),
             identity: "controller_identity.txt".to_string(),
             audio: true,
             md_host: String::new(),
             touch_display: String::new(),
+            voice: 0,
         };
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
@@ -146,6 +149,7 @@ impl Args {
                 "--identity" => args.identity = value()?,
                 "--md-host" => args.md_host = value()?,
                 "--touch-display" => args.touch_display = value()?,
+                "--voice" => args.voice = value()?.parse().unwrap_or(0),
                 "--no-audio" => args.audio = false,
                 "-h" | "--help" => return Err(usage()),
                 other => return Err(format!("未知参数 {other}\n{}", usage())),
@@ -244,6 +248,7 @@ async fn run(args: Args) -> Result<(), String> {
     // 2) 通道：触摸/按键注入 + 停止信号
     let (touch_tx, touch_rx) = mpsc::unbounded_channel::<TouchInput>();
     let (key_tx, key_rx) = mpsc::unbounded_channel::<u32>();
+
     let stop = Arc::new(Notify::new());
 
     // Ctrl+C → 通知引擎收摊
@@ -276,6 +281,7 @@ async fn run(args: Args) -> Result<(), String> {
         md_host: if args.md_host.is_empty() { None } else { Some(args.md_host.clone()) },
         touch_display_w,
         touch_display_h,
+        voice: args.voice,
     };
 
     // 3) 交给引擎：它内部会起 CarLife HU，再做 AirPlay 协商与双泵
@@ -287,6 +293,8 @@ async fn run(args: Args) -> Result<(), String> {
         touch_rx,
         key_tx,
         key_rx,
+        // PC 侧不提供麦克风：语音助手用手机自己的麦克风（见 --voice）
+        None,
         stop,
     )
     .await;
@@ -299,5 +307,10 @@ async fn run(args: Args) -> Result<(), String> {
         Err(e) => Err(format!("引擎退出: {e}")),
     }
 }
+
+
+
+
+
 
 

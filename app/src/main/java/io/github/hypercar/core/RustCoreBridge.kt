@@ -1,4 +1,4 @@
-package io.github.hypercar.core
+﻿package io.github.hypercar.core
 
 /**
  * Rust 核心层 JNI 桥（libhypercar_core.so）。
@@ -89,6 +89,9 @@ object RustCoreBridge {
     /** iDrive 旋钮/方向盘媒体键 → CarLife 0x68008 硬按键。 */
     external fun nativeSendHardKey(carlifeKeyCode: Int)
 
+    /** 手机麦克风 PCM（16kHz 单声道）→ CarLife VR 通道（语音助手用）。 */
+    external fun nativeSendMic(pcm: ShortArray)
+
     /** Rust 侧是否在运行（诊断）。 */
     external fun nativeIsRunning(): Boolean
 
@@ -105,3 +108,4 @@ object RustCoreBridge {
         remainDistM: Int
     ): ByteArray
 }
+

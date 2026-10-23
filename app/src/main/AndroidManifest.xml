@@ -39,9 +39,10 @@
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <!-- 注意：不声明 RECORD_AUDIO。本应用只播放下行音频（CarLife → AirPlay），
-         不采集麦克风；此前声明只是"给将来的 AudioPlaybackCapture 兜底"的占位，
-         却会在应用信息页显示"麦克风"权限，属误导，已移除。 -->
+    <!-- 语音助手（2026-10-24 起）：CarLife 的语音识别要求「车机」侧提供麦克风数据
+         （VR 通道 VR_MIC_DATA 0x00058001）。本机 HU 就用手机自己的麦克风采，
+         经 nativeSendMic 注入；除此之外不采集任何音频。 -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <uses-feature
         android:name="android.hardware.bluetooth"
@@ -102,3 +103,4 @@
         </receiver>
     </application>
 </manifest>
+

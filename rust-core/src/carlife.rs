@@ -1,4 +1,4 @@
-//! CarLife HU（车机）侧网关——严格按 CarLifeWirelessBox / apollo-DuerOS 的 HU 实现重构。
+﻿//! CarLife HU（车机）侧网关——严格按 CarLifeWirelessBox / apollo-DuerOS 的 HU 实现重构。
 //!
 //! 我们扮演「车机」，本机 CarLife / CarWith(CarLife 兼容) / 荣耀车联 作为「手机(MD)」连回
 //! 127.0.0.1 的一组标准端口。
@@ -97,6 +97,9 @@ pub struct CarLifeConfig {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    /// 特性配置里的 `voice`：1 = 车机提供语音/麦克风（需要 HU 推 VR 麦克风数据），
+    /// 0 = 车机不提供语音 → MD 回落到**手机自己的麦克风**。
+    pub voice: u32,
 }
 
 /// CarLife 网关：监听 6 条标准通道，产出结构化事件；接受外部触摸/按键注入。
@@ -106,6 +109,10 @@ pub struct CarLifeHub {
     cfg: CarLifeConfig,
     /// 当前编码分辨率共享单元（与 AirPlay 协商/触摸换算共用）。
     encoder_size: Arc<Mutex<(u32, u32)>>,
+    /// VR 通道麦克风帧（HU → MD）
+    mic_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// 麦克风帧时间戳基准
+    mic_start: std::time::Instant,
 }
 
 impl CarLifeHub {
@@ -115,6 +122,8 @@ impl CarLifeHub {
     ) -> Result<(Self, mpsc::UnboundedReceiver<CarLifeEvent>), String> {
         let (events, event_rx) = mpsc::unbounded_channel();
         let (touch_tx, touch_rx) = mpsc::unbounded_channel();
+        let (mic_tx, mut mic_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let voice = cfg.voice;
         // 初始值取设置；AirPlay 的 /info 报到车机真实尺寸后会覆盖它，
         // 手机在 INIT_DONE 里回报实际编码尺寸后再次覆盖。
         let encoder_size: Arc<Mutex<(u32, u32)>> =
@@ -128,7 +137,7 @@ impl CarLifeHub {
             let fps = cfg.fps;
             let size = encoder_size.clone();
             let stop_c = stop.clone();
-            move |stream| handle_cmd_client(stream, events.clone(), size.clone(), fps, stop_c.clone())
+            move |stream| handle_cmd_client(stream, events.clone(), size.clone(), fps, voice, stop_c.clone())
         });
 
         // ---- VIDEO 8240 ----
@@ -138,7 +147,7 @@ impl CarLifeHub {
         // ---- TTS 9241 ----
         spawn_media_channel(PORT_TTS, "TTS", events.clone(), stop.clone(), MediaKind::Tts);
         // ---- VR 9242：只读保活，不消费 ----
-        spawn_drain(PORT_VR, "VR", stop.clone());
+        spawn_vr_listener(PORT_VR, "VR", mic_rx, stop.clone());
 
         // ---- CTRL 9340：触摸/硬按键出向（8 字节 CMD 头）----
         spawn_ctrl_channel(PORT_CTRL, touch_rx, stop.clone());
@@ -155,6 +164,8 @@ impl CarLifeHub {
                 touch_tx,
                 cfg,
                 encoder_size,
+                mic_tx,
+                mic_start: std::time::Instant::now(),
             },
             event_rx,
         ))
@@ -180,6 +191,8 @@ impl CarLifeHub {
     ) -> Result<(Self, mpsc::UnboundedReceiver<CarLifeEvent>), String> {
         let (events, event_rx) = mpsc::unbounded_channel();
         let (touch_tx, touch_rx) = mpsc::unbounded_channel();
+        let (mic_tx, mut mic_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let voice = cfg.voice;
         let encoder_size: Arc<Mutex<(u32, u32)>> =
             Arc::new(Mutex::new((cfg.width.max(2), cfg.height.max(2))));
 
@@ -198,7 +211,7 @@ impl CarLifeHub {
                         dialed = dial(&host, PORT_CMD) => match dialed {
                             Ok(stream) => {
                                 emit_log(&format!("CARLIFE: ✓ CMD 已连上 MD {host}:{PORT_CMD}"));
-                                handle_cmd_client(stream, events.clone(), size.clone(), fps, stop_c.clone()).await;
+                                handle_cmd_client(stream, events.clone(), size.clone(), fps, voice, stop_c.clone()).await;
                                 emit_log("CARLIFE: CMD 通道断开，1s 后重连");
                             }
                             Err(e) => {
@@ -216,12 +229,11 @@ impl CarLifeHub {
             });
         }
 
-        // ---- 媒体通道：VIDEO/MEDIA/TTS 连上就交给同一个 handler；VR 只读 ----
+        // ---- 媒体通道：VIDEO/MEDIA/TTS 连上就交给同一个 handler ----
         for (port, name, kind) in [
             (PORT_VIDEO, "VIDEO", Some(MediaKind::Video)),
             (PORT_MEDIA, "MEDIA", Some(MediaKind::Media)),
             (PORT_TTS, "TTS", Some(MediaKind::Tts)),
-            (PORT_VR, "VR", None),
         ] {
             let events = events.clone();
             let stop_c = stop.clone();
@@ -256,6 +268,35 @@ impl CarLifeHub {
             });
         }
 
+        // ---- VR 9242：麦克风数据（HU → MD）+ 读空保活 ----
+        {
+            let stop_c = stop.clone();
+            let host = md_host.clone();
+            tokio::spawn(async move {
+                let mut throttle = DialLogThrottle::new();
+                loop {
+                    let stream = tokio::select! {
+                        _ = stop_c.notified() => return,
+                        dialed = dial(&host, PORT_VR) => match dialed {
+                            Ok(s) => s,
+                            Err(e) => {
+                                if throttle.ready() {
+                                    emit_log(&format!("CARLIFE: 连 MD {host}:{PORT_VR}（VR）失败: {e}"));
+                                }
+                                tokio::time::sleep(Duration::from_millis(1000)).await;
+                                continue;
+                            }
+                        },
+                    };
+                    emit_log(&format!("CARLIFE: ✓ VR 已连上 MD {host}:{PORT_VR}（麦克风上行）"));
+                    vr_loop(stream, &mut mic_rx, "VR", stop_c.clone()).await;
+                    tokio::select! {
+                        _ = stop_c.notified() => return,
+                        _ = tokio::time::sleep(Duration::from_millis(1000)) => {}
+                    }
+                }
+            });
+        }
         // ---- CTRL 9340：触摸/硬按键出向 ----
         {
             let queue: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -323,6 +364,8 @@ impl CarLifeHub {
                 touch_tx,
                 cfg,
                 encoder_size,
+                mic_tx,
+                mic_start: std::time::Instant::now(),
             },
             event_rx,
         ))
@@ -350,6 +393,22 @@ impl CarLifeHub {
             .send(build_cmd_frame(CTRL_TOUCH_ACTION, &payload));
     }
 
+    /// 麦克风 PCM → CarLife VR 通道（HU → MD，`VR_MIC_DATA 0x00058001`）。
+    ///
+    /// PCM 为 **16kHz 单声道 16-bit 小端**（ASR 通用格式；CarLife 的 MEDIA 侧
+    /// 我们按小端解析，麦克风沿用同一约定）。语音助手靠这条数据做识别，
+    /// 没有它手机上会报「麦克风有问题」。
+    pub fn inject_mic(&self, pcm: &[i16]) {
+        if pcm.is_empty() {
+            return;
+        }
+        let mut payload = Vec::with_capacity(pcm.len() * 2);
+        for s in pcm {
+            payload.extend_from_slice(&s.to_le_bytes());
+        }
+        let ts = self.mic_start.elapsed().as_millis() as u32;
+        let _ = self.mic_tx.send(build_media_frame(VR_MIC_DATA, ts, &payload));
+    }
     /// iDrive 旋钮/媒体键 → CarLife CTRL 通道 HARD_KEY。
     pub fn inject_hard_key(&self, code: u32) {
         let _ = self
@@ -389,6 +448,21 @@ fn touch_proto(action: u32, x: u32, y: u32) -> Vec<u8> {
     varint(0, &mut out);
     out.push(0x28); // pointery = 0
     varint(0, &mut out);
+    out
+}
+
+/// VR 通道「麦克风数据」（HU → MD）：`[u32 BE len][u32 BE ts_ms][u32 BE type][PCM]`。
+/// 车道侧把车机麦克风 PCM 推给手机，CarLife 的语音助手用它做识别；
+/// 协议表见 CarLifeWirelessBox `docs/通讯协议分析报告.md`（VR: HU → MD 语音识别）。
+const VR_MIC_DATA: u32 = 0x0005_8001;
+
+/// 媒体帧（12 字节头）：`[u32 BE len][u32 BE ts_ms][u32 BE type][payload]`。
+fn build_media_frame(service_type: u32, timestamp_ms: u32, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + payload.len());
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(&timestamp_ms.to_be_bytes());
+    out.extend_from_slice(&service_type.to_be_bytes());
+    out.extend_from_slice(payload);
     out
 }
 
@@ -531,6 +605,7 @@ async fn handle_cmd_client(
     events: mpsc::UnboundedSender<CarLifeEvent>,
     encoder_size: Arc<Mutex<(u32, u32)>>,
     fps: u32,
+    voice: u32,
     stop: Arc<Notify>,
 ) {
     let (mut rd, mut wr) = stream.into_split();
@@ -606,7 +681,7 @@ async fn handle_cmd_client(
                         let ok = send_cmd(
                             &mut wr,
                             CMD_HU_FEATURE_CONFIG_RESPONSE,
-                            &proto_feature_config_payload(),
+                            &proto_feature_config_payload(voice),
                         )
                         .await;
                         if !ok {
@@ -787,7 +862,7 @@ fn proto_hu_info_payload() -> Vec<u8> {
     out
 }
 
-fn proto_feature_config_payload() -> Vec<u8> {
+fn proto_feature_config_payload(voice: u32) -> Vec<u8> {
     // CarlifeFeatureConfigList: 1=cnt, 2=repeated {1=key string, 2=value int32},
     // 3=hu_bt_audio_support, 4=hu_bt_name, 5=hu_bt_mac
     let features: [(&str, u32); 6] = [
@@ -796,7 +871,7 @@ fn proto_feature_config_payload() -> Vec<u8> {
         ("touch", 1),
         ("music", 1),
         ("navigation", 1),
-        ("voice", 1),
+        ("voice", voice.clamp(0, 1)),
     ];
     let mut out = Vec::with_capacity(96);
     proto::varint(&mut out, 1, features.len() as u64);
@@ -1254,8 +1329,52 @@ fn spawn_single_client_server<F, Fut>(
     });
 }
 
-/// VR 通道：只接受并读空（语音识别暂不消费）。
-fn spawn_drain(port: u16, name: &'static str, stop: Arc<Notify>) {
+/// VR 通道：读空保活 + **可写**（麦克风数据 HU → MD）。
+///
+/// 语音助手要靠车机把麦克风 PCM 推给手机（`VR_MIC_DATA 0x00058001`，12 字节媒体头）。
+/// 之前这条通道纯 drain，手机上语音助手会报「麦克风有问题」。
+async fn vr_loop(
+    mut stream: TcpStream,
+    mic_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+    name: &'static str,
+    stop: Arc<Notify>,
+) {
+    let (mut rd, mut wr) = stream.split();
+    let mut buf = [0u8; 2048];
+    let mut vr_msgs = 0u32;
+    loop {
+        tokio::select! {
+            _ = stop.notified() => return,
+            r = rd.read(&mut buf) => match r {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    if n >= 12 && vr_msgs < 8 {
+                        vr_msgs += 1;
+                        let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                        let st = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                        emit_log(&format!("CARLIFE: {name} ← 服务类型 0x{st:08X} {len}B"));
+                    }
+                }
+            },
+            frame = mic_rx.recv() => match frame {
+                Some(f) => {
+                    if wr.write_all(&f).await.is_err() {
+                        return;
+                    }
+                }
+                None => return,
+            },
+        }
+    }
+}
+
+/// 监听版 VR 通道（Android 同机回环）：接受后进入 [`vr_loop`]。
+fn spawn_vr_listener(
+    port: u16,
+    name: &'static str,
+    mut mic_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    stop: Arc<Notify>,
+) {
     let listener = match bind_tcp(port) {
         Ok(l) => l,
         Err(_) => return,
@@ -1265,21 +1384,20 @@ fn spawn_drain(port: u16, name: &'static str, stop: Arc<Notify>) {
             tokio::select! {
                 _ = stop.notified() => return,
                 accepted = listener.accept() => {
-                    if let Ok((mut stream, _)) = accepted {
+                    if let Ok((stream, _)) = accepted {
                         emit_log(&format!("CARLIFE: {name} 通道接入"));
-                        let mut buf = [0u8; 2048];
-                        loop {
-                            tokio::select! {
-                                _ = stop.notified() => return,
-                                r = stream.read(&mut buf) => {
-                                    if matches!(r, Ok(0) | Err(_)) { break; }
-                                }
-                            }
-                        }
+                        vr_loop(stream, &mut mic_rx, name, stop.clone()).await;
                     }
                 }
             }
         }
     });
 }
+
+
+
+
+
+
+
 
