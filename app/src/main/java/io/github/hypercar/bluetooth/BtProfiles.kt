@@ -6,6 +6,8 @@ import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.os.SystemClock
 import android.util.Log
+import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
@@ -34,6 +36,12 @@ import java.util.concurrent.atomic.AtomicReference
  */
 object BtProfiles {
     private const val TAG = "BT-PROFILE"
+
+    /** 「自己断开」宽限窗口：足够覆盖广播到达延迟，又不至于把真正的下车事件吞掉。 */
+    private const val SELF_DROP_GRACE_MILLIS = 6_000L
+
+    /** 地址 → 宽限截止时刻（uptimeMillis）。见 [markSelfDrop]。 */
+    private val selfDropUntil = ConcurrentHashMap<String, Long>()
 
     /** 关心的配置文件（按断开优先级排列）。 */
     private val profiles: List<Int> =
@@ -74,6 +82,10 @@ object BtProfiles {
     /**
      * 尽力断开该设备的全部配置文件连接。
      *
+     * 真断开了东西时会先打一条「自己断开」归因标记（见 [markSelfDrop]）：紧接着的系统
+     * `ACTION_ACL_DISCONNECTED` 广播是我们造成的，接收器不能当成下车去拆会话。
+     * 什么都没连（返回空列表）则不动标记——别把宽限窗口白白撑大。
+     *
      * @return 断开前在线的配置文件（空 = 本来就没连接，无需任何动作）
      */
     fun disconnect(
@@ -88,6 +100,7 @@ object BtProfiles {
             }
         val before = connectedNames(context, address)
         if (before.isEmpty()) return emptyList()
+        markSelfDrop(address)
         for (id in profiles) {
             if (profileName(id) !in before) continue
             proxy(context, id)?.let { disconnectProfile(it, device) }
@@ -99,6 +112,32 @@ object BtProfiles {
             awaitDisconnected(context, address, 500L)
         }
         return before
+    }
+
+    /**
+     * 标记「接下来 [graceMillis] 内该地址的 ACL 断开可能是我们自己造成的」。
+     *
+     * 为什么要这个标记：iAP2 的「只配对、不连接」策略会主动断车机的 HFP/A2DP
+     * （个别 ROM 还退到设备级断开），系统随即广播 `ACTION_ACL_DISCONNECTED`。
+     * 那条广播**不是下车**，接收器必须认出来并忽略——否则每次建链都会被自己的
+     * 断开广播拆掉会话，还会和前台服务的 ACTION_STOP 串成刷屏回环。
+     *
+     * 正常不需要直接调：[disconnect] 在真断开前会自动标记。
+     */
+    fun markSelfDrop(
+        address: String,
+        graceMillis: Long = SELF_DROP_GRACE_MILLIS,
+    ) {
+        selfDropUntil[address.uppercase(Locale.US)] = SystemClock.elapsedRealtime() + graceMillis
+    }
+
+    /** 该地址此刻是否处在我们主动断开的宽限窗口内（窗口过期自动清掉）。 */
+    fun isSelfDrop(address: String): Boolean {
+        val key = address.uppercase(Locale.US)
+        val until = selfDropUntil[key] ?: return false
+        if (SystemClock.elapsedRealtime() <= until) return true
+        selfDropUntil.remove(key)
+        return false
     }
 
     /** 断开后仍在线的配置文件（用于日志判断是否真的断开）。 */

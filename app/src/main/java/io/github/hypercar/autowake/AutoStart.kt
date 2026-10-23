@@ -14,6 +14,9 @@ import android.content.Context
  *    若已在前台（isRunning=true，说明是 service 回调过来触发会话），则直接执行会话握手重活。
  *  - connected=false：执行会话拆除（幂等），并确保前台服务收摊
  *    （`context.startService(HyperCarService.stopIntent(ctx, device))`）。
+ *    **只应在 [HyperCarService.isRunning] 为 true 时投递**：service 收到 ACTION_STOP 会
+ *    回灌一次 handler(false)，无条件投递就形成 handler↔service 的 startService 死循环
+ *    （2026-10-23 实测每秒数百轮、日志刷屏且下车后不停）。
  *  - 回调可能被 receiver 与 service 先后各调一次，**必须幂等**；重活一律放后台线程。
  */
 object AutoStart {

@@ -80,6 +80,19 @@ Rust（rust-core，全部协商 + 数据面）
 下车：ACL 断开 → ACTION_STOP → nativeStop + iap2.stop + 网络释放
 ```
 
+断开链路的两个硬约束（2026-10-23 线上刷屏故障的教训）：
+
+- **ACL 断开 ≠ 一定是下车**。iAP2 的「只配对、不连接」会主动断车机 HFP/A2DP
+  （个别 ROM 退到设备级断开），系统随即广播 `ACTION_ACL_DISCONNECTED`。`BtProfiles`
+  在真断开前打「自己断开」标记（6s 宽限），`CarBluetoothReceiver` 见到标记就不按
+  下车处理——否则每次建链都被自己的广播拆掉。
+- **拆除必须幂等、且 ACTION_STOP 只回灌一次**。`HyperCarRepo.runDisconnect` 用
+  `sessionLive` CAS 保证只真正拆一次；`HyperCarService` 只在 `isRunning` 由 true 变
+  false 的那次转交 handler(false)。两条缺一条就会形成
+  `handler(false) → startService(STOP) → onStartCommand → handler(false)` 自激回环：
+  每秒数百次 nativeStop，日志只剩「车机蓝牙 断开 / 会话已断开」两行，且下车后仍在刷。
+  日志层另有一道限流兜底（同一行 10s 内最多 4 次，其后折叠计数）。
+
 ## 4. 数据面细节
 
 - **视频**：CarLife 帧（len/ts/id + AnnexB）→ NAL 切分 → SPS/PPS 变化发

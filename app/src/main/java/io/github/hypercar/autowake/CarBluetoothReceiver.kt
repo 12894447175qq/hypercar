@@ -6,7 +6,9 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import android.os.SystemClock
 import android.util.Log
+import io.github.hypercar.bluetooth.BtProfiles
 import io.github.hypercar.settings.SettingsStore
 
 /**
@@ -54,6 +56,17 @@ class CarBluetoothReceiver : BroadcastReceiver() {
             Log.i(TAG, "忽略非车机蓝牙 $name（$address）")
             return
         }
+        // iAP2 的「只配对、不连接」会主动断车机音频配置文件（个别 ROM 退到设备级断开），
+        // 系统随即广播 ACL 断开——那不是下车，是**我们自己干的**。放行会立刻拆掉刚建的
+        // 会话，并与前台服务的 ACTION_STOP 串成刷屏回环（历史故障）。
+        if (!connected && BtProfiles.isSelfDrop(address)) {
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastSelfDropLogAt > SELF_DROP_LOG_THROTTLE_MILLIS) {
+                lastSelfDropLogAt = now
+                Log.i(TAG, "忽略 ACL 断开（$name）：iAP2 建链主动断开音频配置文件所致，不按「下车」处理")
+            }
+            return
+        }
         val handler = AutoStart.handler
         if (handler == null) {
             Log.i(TAG, "AutoStart.handler 未注入——放弃")
@@ -91,7 +104,14 @@ class CarBluetoothReceiver : BroadcastReceiver() {
         const val TAG = "CarBluetoothReceiver"
         const val PLACEHOLDER_MAC = "02:00:00:00:00:00"
 
+        /** 「自己断开导致的 ACL 断开」日志节流（出站循环每 3s 一轮，别一行一行刷）。 */
+        const val SELF_DROP_LOG_THROTTLE_MILLIS = 30_000L
+
         /** 未选目标车机时的兜底：常见车机蓝牙名关键词（真车 BMW/MINI/宝马）。 */
         val CAR_KEYWORDS = listOf("BMW", "MINI", "宝马")
+
+        /** 日志节流时间戳。放 companion：清单接收器每次广播都是新实例，实例字段记不住。 */
+        @Volatile
+        var lastSelfDropLogAt = 0L
     }
 }

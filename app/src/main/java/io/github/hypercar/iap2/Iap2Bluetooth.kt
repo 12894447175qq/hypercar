@@ -268,6 +268,9 @@ class Iap2Bluetooth(
                 // 文件在线时不开放 iAP2 服务窗口（奥迪 MIB3 实测每 3s 连接失败）。
                 // 只对过了「声明 iAP2 服务/用户选定」闸门的设备做，别误伤耳机。
                 run {
+                    // 注意：BtProfiles.disconnect 内部会打「自己断开」归因标记——断开
+                    // 配置文件（个别 ROM 退到设备级断开）会让系统广播 ACL 断开，接收器
+                    // 靠那个标记认出「这是我们干的」，不按「下车」拆会话。
                     val dropped = BtProfiles.disconnect(appContext, device)
                     if (dropped.isNotEmpty()) {
                         val now = SystemClock.uptimeMillis()

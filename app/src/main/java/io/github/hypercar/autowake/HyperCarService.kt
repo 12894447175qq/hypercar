@@ -31,7 +31,10 @@ import io.github.hypercar.R
  *
  * 循环防护：onStartCommand 置 [isRunning]=true **早于**转交 handler；handler 据此区分
  * 「receiver 首次拉起（isRunning=false→startForegroundService）」与「service 触发会话
- * （isRunning=true→做重活）」，不会形成 receiver↔service 无限循环。
+ * （isRunning=true→做重活）」，不会形成 receiver↔service 无限循环。停止侧同理：
+ * ACTION_STOP 只在 **isRunning 由 true 变 false 的那一次**转交 handler(false)——
+ * handler(false) 内部又会投 ACTION_STOP 收摊前台，无此判据就会 handler↔service 互相
+ * startService 刷屏（历史 bug）。
  */
 class HyperCarService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
@@ -43,9 +46,15 @@ class HyperCarService : Service() {
         val device = deviceOf(intent)
         when (intent?.action) {
             ACTION_STOP -> {
+                // 只在「服务确实在跑」的这一次停止里转交会话层收尾。
+                // 会话层的 handler(connected=false) 自己也会投 ACTION_STOP（收摊前台），
+                // 若这里无条件回灌 handler，就形成
+                //   onStartCommand(STOP) → handler(false) → startService(STOP) → onStartCommand …
+                // 的自激循环：每秒数百次 nativeStop + 快照重置 + 两条日志，且与车机是否在
+                // 场无关（下车后进程还在循环里刷）。wasRunning 判据把循环卡在第一圈。
+                val wasRunning = isRunning
                 isRunning = false
-                // 转交 handler 收摊（幂等）；随后释放前台与锁
-                if (device != null) {
+                if (device != null && wasRunning) {
                     runCatching { AutoStart.handler?.invoke(applicationContext, device, false) }
                         .onFailure { Log.e(TAG, "转交停止失败", it) }
                 }
