@@ -75,7 +75,11 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // R8 压缩：不开的话 Compose/图标库/Shizuku 全量进 dex（实测 41.9MB、
+            // dex 占 40.3MB），开完通常能砍到一半以下。JNI 回调接口必须配 keep 规则
+            // （见 proguard-rules.pro，否则 Rust 侧按名回调会被 R8 改名/裁掉）。
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             if (rootProject.file("keystore.properties").exists()) {
                 signingConfig = signingConfigs.getByName("release")
@@ -114,10 +118,10 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.2")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
-    implementation("androidx.navigation:navigation-compose:2.8.1")
 
+    // 注：未引入 navigation-compose 与 datastore-preferences——
+    // UI 用 state-based 切换、设置用 SharedPreferences，两者都是白占 dex。
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
-    implementation("androidx.datastore:datastore-preferences:1.1.1")
 
     // Shizuku：静默连车机热点 / 真实蓝牙 MAC / shell 能力（cardeck 同款依赖）
     // provider 是 ShizukuProvider 的宿主（清单需声明，缺它 binder 收不到）。

@@ -1,4 +1,20 @@
-# Compose + Shizuku + Kotlin metadata 兼容规则
+# HyperCar R8 规则
+# 开 isMinifyEnabled=true 后必须保住「Rust 侧按 JNI 名字调用」的 Kotlin 符号，
+# 否则 R8 会改名/裁掉，运行期报 NoSuchMethodError 或 JNI 回调静默失效。
+
+# ---- JNI 桥：Rust 通过符号名找方法 ----
+-keep class io.github.hypercar.core.RustCoreBridge { *; }
+-keep interface io.github.hypercar.core.RustCoreBridge$EventListener { *; }
+-keep interface io.github.hypercar.core.RustCoreBridge$SocketProvider { *; }
+# 回调实现类（匿名 object）：方法名与接口一致，接口 keep 后即可，但显式保一下更稳
+-keep class * implements io.github.hypercar.core.RustCoreBridge$EventListener { *; }
+-keep class * implements io.github.hypercar.core.RustCoreBridge$SocketProvider { *; }
+
+# ---- Shizuku（binder 反射 + provider）----
+-keep class dev.rikka.shizuku.** { *; }
+-keep class moe.shizuku.** { *; }
+
+# ---- Kotlin / 注解 ----
 -dontwarn org.jetbrains.annotations.**
 -keep class kotlin.Metadata { *; }
--keep class dev.rikka.shizuku.** { *; }
+-keepattributes Signature,InnerClasses,EnclosingMethod

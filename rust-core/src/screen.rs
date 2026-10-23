@@ -5,7 +5,9 @@
 //!  - `[4]`     u8 opcode：0=VideoFrame，1=VideoConfig，2=KeepAlive，5=KeepAliveWithBody
 //!  - `[6]`     u8 small_param[1]：VideoConfig 置 ScreenFlag::Encrypted(0x04)
 //!  - `[8..16)` params[0]：NTP 32.32 LE 时间戳（VideoFrame 用 pts 换算；config/keepAlive 归零）
-//!  - `[16..24)` params[1] = width f32 LE；`[24..32)` params[2] = height f32 LE（仅 VideoConfig）
+//!  - `[16..20)` params[1] 低 4 字节 = width f32 LE；`[20..24)` = height f32 LE
+//!    （两者同属 params[1]，对照 cardeck `CONFIG_WIDTH_HEIGHT_OFFSET = 16` + 偏移+4；
+//!      仅 VideoConfig 写，VideoFrame/keepAlive 归零）
 //!  - `[120..124)` 0.0f32；`[124..128)` body 长度 f32 LE（仅 KeepAliveWithBody）
 //!  - 其余全零
 //!
@@ -134,8 +136,10 @@ impl ScreenSender {
     pub async fn send_config(&mut self, avcc: &[u8]) -> std::io::Result<()> {
         let mut header = build_header(OP_CONFIG, avcc.len(), &ZERO_TS);
         header[6] = SCREEN_FLAG_ENCRYPTED;
+        // params[1]（偏移 16）里是**两个** f32：width 在 16..20、height 在 20..24。
+        // 曾把 height 写到 24..28（误当 params[2]），车机读到的画布高度成 0 → 黑屏/错缩放。
         header[16..20].copy_from_slice(&self.width.to_le_bytes());
-        header[24..28].copy_from_slice(&self.height.to_le_bytes());
+        header[20..24].copy_from_slice(&self.height.to_le_bytes());
         let mut wire = Vec::with_capacity(HEADER_LEN + avcc.len());
         wire.extend_from_slice(&header);
         wire.extend_from_slice(avcc);
@@ -241,17 +245,28 @@ impl ScreenSender {
         if self.last_keep_alive.elapsed() < Duration::from_millis(KEEPALIVE_INTERVAL_MS) {
             return Ok(());
         }
+        let window = self.last_keep_alive.elapsed().as_secs_f64().max(0.001);
+        // 先把本窗口统计量取出来（下面会清零）
+        let frames_in_window = self.frames_since_keep_alive;
+        let bytes_in_window = self.bytes_since_keep_alive;
         self.last_keep_alive = tokio::time::Instant::now();
-        // 统计游标复位（fps/字节率计算待统计体接入 bplist 时再启用）
         self.frames_since_keep_alive = 0;
         self.bytes_since_keep_alive = 0;
         self.keep_alive_count = self.keep_alive_count.wrapping_add(1);
 
         let (opcode, body): (u8, Vec<u8>) = if self.keep_alive_with_stats {
-            // TODO(bplist)：统计体等 crate::bplist（Value/encode）就绪后替换为真实字典
-            // （txUsageAvg / encoderCurrentFPS / sentFramesAvg / queuedFramesAvg / lossAvg，
-            //  字段名对照 cardeck VideoSender.buildKeepAliveFrame），当前按契约发 32B 全零占位。
-            (OP_KEEP_ALIVE_WITH_BODY, vec![0u8; 32])
+            // 字段名对照 cardeck VideoSender.buildKeepAliveFrame 的 bplist 字典；
+            // 真车会解析这个 body —— 发全零占位会让严格接收端解不出字典。
+            let bytes_per_second = bytes_in_window as f64 / window;
+            let fps = (frames_in_window as f64 / window).round() as i64;
+            let stats = crate::bplist::encode(&crate::bplist::Value::dict(vec![
+                ("txUsageAvg", crate::bplist::Value::real(bytes_per_second)),
+                ("encoderCurrentFPS", crate::bplist::Value::int(fps)),
+                ("sentFramesAvg", crate::bplist::Value::int(frames_in_window as i64)),
+                ("queuedFramesAvg", crate::bplist::Value::int(0)),
+                ("lossAvg", crate::bplist::Value::real(0.0)),
+            ]));
+            (OP_KEEP_ALIVE_WITH_BODY, stats)
         } else {
             (OP_KEEP_ALIVE, Vec::new())
         };

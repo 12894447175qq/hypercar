@@ -675,21 +675,28 @@ impl TlvTransport for RtspTransport<'_> {
     }
 }
 
-/// 事件通道控制密钥（与控制通道同派生规则、独立实例独立计数）。
-/// 返回 (read_key, write_key)——注意方向与控制通道相反（车机发给我们的用 Write）。
+/// 事件通道控制密钥。
+///
+/// **注意：事件通道有独立的 HKDF 域**，不能复用控制通道的 `Control-Salt`——
+/// 对照 cardeck `connectEventChannel`：
+///   phoneWriteKey = HKDF(secret, "Events-Salt", "Events-Read-Encryption-Key")
+///   phoneReadKey  = HKDF(secret, "Events-Salt", "Events-Write-Encryption-Key")
+///   ControlCipher(phoneReadKey, phoneWriteKey)
+/// 即标签按「配件视角」命名，与我们 read/write 是交叉的。
+/// 曾错用 Control-Salt 派生 → 事件通道解密必失败 → 触摸/命令全丢。
 fn derive_event_keys(shared: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
     let write: [u8; 32] = crate::crypto::hkdf_sha512(
         shared,
-        b"Control-Salt",
-        b"Control-Write-Encryption-Key",
+        b"Events-Salt",
+        b"Events-Read-Encryption-Key",
         32,
     )
     .try_into()
     .unwrap();
     let read: [u8; 32] = crate::crypto::hkdf_sha512(
         shared,
-        b"Control-Salt",
-        b"Control-Read-Encryption-Key",
+        b"Events-Salt",
+        b"Events-Write-Encryption-Key",
         32,
     )
     .try_into()
