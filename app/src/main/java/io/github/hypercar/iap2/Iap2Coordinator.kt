@@ -127,7 +127,10 @@ class Iap2Coordinator(
 
     /**
      * 当前会话用的本机 MAC：优先真实值（缓存），未解析到时现场 runBlocking 取一次
-     * （会话线程是后台线程，阻塞安全）；都失败则用占位值并告警。
+     * （会话线程是后台线程，阻塞安全）。
+     *
+     * deviceMacProvider 已是「真 MAC 或稳定伪 MAC」（BluetoothMac.resolveOrStable），
+     * 返回的一定是合法 MAC 格式——无 Shizuku 时的稳定伪 MAC 也是有效值，直接采用。
      */
     private fun currentBluetoothMac(): String {
         resolvedMac?.let { return it }
@@ -135,13 +138,13 @@ class Iap2Coordinator(
             runCatching { runBlocking { deviceMacProvider() } }
                 .getOrNull()
                 ?.trim()
-                ?.takeIf { it.isNotEmpty() && it != PLACEHOLDER_MAC }
+                ?.takeIf { it.isNotEmpty() }
         if (mac != null) {
             resolvedMac = mac
-            log("IAP2: 本机蓝牙 MAC=$mac")
+            log("IAP2: 本机蓝牙标识=$mac")
             return mac
         }
-        log("IAP2: ⚠ 未取到本机真实蓝牙 MAC，本轮用占位 $PLACEHOLDER_MAC（真车可能校验传输标识）")
+        log("IAP2: ⚠ deviceMacProvider 未返回值，本轮用稳定伪 MAC 兜底")
         return PLACEHOLDER_MAC
     }
 
@@ -150,10 +153,10 @@ class Iap2Coordinator(
         runCatching { runBlocking { deviceMacProvider() } }
             .getOrNull()
             ?.trim()
-            ?.takeIf { it.isNotEmpty() && it != PLACEHOLDER_MAC }
+            ?.takeIf { it.isNotEmpty() }
             ?.let { mac ->
                 resolvedMac = mac
-                log("IAP2: 本机蓝牙 MAC 预解析成功=$mac")
+                log("IAP2: 本机蓝牙标识预解析成功=$mac")
             }
     }
 }

@@ -444,10 +444,11 @@ fn spawn_touch_channel(
     // 桥接：hub.touch_tx 发来的帧先进 queue（接收端在此消费）。
     {
         let queue = queue.clone();
+        let stop_fill = stop.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = stop.notified() => return,
+                    _ = stop_fill.notified() => return,
                     frame = touch_rx.recv() => {
                         match frame {
                             Some(f) => {

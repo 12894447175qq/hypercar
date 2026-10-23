@@ -5,6 +5,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.wifi.WifiNetworkSpecifier
 import android.os.SystemClock
 import android.util.Log
 import io.github.hypercar.shizuku.ShizukuTools
@@ -21,19 +22,25 @@ import java.util.concurrent.atomic.AtomicReference
 /**
  * 静默加入车机热点并把进程网络绑上去（cardeck `docs/WIFI-JOIN.md` 的坑全部内化）。
  *
- * 两步式：
- *  1. Shizuku `cmd wifi connect-network`——**0 弹窗**地让系统连上热点（热点进系统已保存网络）。
- *  2. **不带 specifier** 的 `requestNetwork(TRANSPORT_WIFI)` 捕获 `Network` 句柄 → [bindProcess]。
+ * **按 Shizuku 可用性自动分流**（Shizuku 从「必须」降级为「可选增强」）：
+ *  - **有 Shizuku**：`cmd wifi connect-network`——**0 弹窗**地让系统连上热点（进系统已保存网络）。
+ *  - **无 Shizuku**：公开 API `WifiNetworkSpecifier`——**每个热点首次连接弹一次系统确认框**
+ *    （批准结果按 SSID 持久化，之后同样静默）。app 专属网络不落系统已保存网络，
+ *    反而绕开「热点已被保存反而连不上」的地雷（cardeck §13b 大众探歌实测）。
  *
- * 必须绑 `bindProcessToNetwork` 的原因：mDNS `NsdManager.registerService` 没有 Network 参数
- * （API 36 才有 `AdvertisingRequest` 重载），广播跟随进程默认网络；不绑就从蜂窝发出去，车机
- * 永远发现不了手机（0x4301/邀请不到）。它只影响本进程，虚拟屏里的导航/音乐是独立进程不受影响。
+ * 两条路径最终都走 [bindProcess]：
+ *  **必须绑 `bindProcessToNetwork` 的原因**：mDNS `NsdManager.registerService` 没有 Network 参数
+ *  （API 36 才有 `AdvertisingRequest` 重载），广播跟随进程默认网络；不绑就从蜂窝发出去，车机
+ *  永远发现不了手机（0x4301/邀请不到）。它只影响本进程，虚拟屏里的导航/音乐是独立进程不受影响。
  *
- * 三个内化的坑：
+ * 三个内化的坑（Shizuku 路径）：
  *  - `connect-network` 的 **exit=0 不代表已连上**（命令只把连接投给 WifiService 就返回）→
  *    必须轮询 `cmd wifi status` 等 SSID 匹配（断旧网→扫描→关联→DHCP 实测 2~10s，5GHz 更久）。
  *  - SSID 校验用 `cmd wifi status` 而**不是** `WifiInfo`（后者在缺定位权限时返回 `<unknown ssid>`）。
  *  - `onLost` 必须处理（车机熄火热点消失），否则会话层停在「已连接」的假态。
+ *
+ * 无 Shizuku 路径（specifier）额外需要运行时权限：Android 12/12L 要 ACCESS_FINE_LOCATION
+ * 且定位服务开启，13+ 要 NEARBY_WIFI_DEVICES——requestNetwork 会因缺权限直接 onUnavailable。
  */
 class WifiJoiner(
     private val context: Context,
@@ -70,23 +77,32 @@ class WifiJoiner(
     val currentNetwork: Network? get() = boundNetwork.get()
 
     /**
-     * 静默加入车机热点（0 弹窗）。阻塞到连上并拿到 Network 句柄，或失败。可取消。
+     * 加入车机热点并返回可用的 Network 句柄（尚未绑进程，调用 [bindProcess] 后才生效）。
      *
-     * 步骤：① 打开 WiFi → ② `cmd wifi connect-network` → ③ 轮询 `cmd wifi status` 等 SSID
-     * 匹配（15s，可取消）→ ④ 不带 specifier 的 `requestNetwork` 取句柄（15s，onUnavailable 即失败）。
+     * **按 Shizuku 可用性自动分流**：有 Shizuku 走 [joinViaShell]（0 弹窗）；
+     * 无 Shizuku 走 [joinViaSpecifier]（公开 API，热点首连弹一次系统确认框，批准按 SSID 持久化）。
      *
-     * @param ssid 热点名（可能含空格/中文，内部用 shellQuote 转义）。
+     * @param ssid 热点名（可能含空格/中文）。
      * @param psk  热点密码；空=开放热点；WEP 形态返回 [JoinResult.Unsupported]。
      */
-    suspend fun joinCarHotspotSilently(ssid: String, psk: String): JoinResult =
+    suspend fun joinCarHotspotSilently(ssid: String, psk: String): JoinResult {
+        // WEP 无法用 wpa2/开放表达——两条路径都不支持，交调用方兜底
+        if (isWepKey(psk)) return JoinResult.Unsupported
+        // 清掉旧回调/旧绑定，干净起步
+        release()
+        return if (ShizukuTools.isReady) {
+            Log.i(TAG, "Shizuku 可用：走 cmd wifi 静默路径（0 弹窗）")
+            joinViaShell(ssid, psk)
+        } else {
+            Log.i(TAG, "Shizuku 不可用：降级为 WifiNetworkSpecifier（热点首连需确认一次）")
+            joinViaSpecifier(ssid, psk)
+        }
+    }
+
+    /** Shizuku 路径：`cmd wifi connect-network` 静默入网（0 弹窗，热点进系统已保存网络）。 */
+    private suspend fun joinViaShell(ssid: String, psk: String): JoinResult =
         withContext(Dispatchers.IO) {
-            // WEP 无法用 cmd wifi connect-network 的 wpa2/开放表达——交给调用方兜底
-            if (isWepKey(psk)) return@withContext JoinResult.Unsupported
-
-            // 清掉旧回调/旧绑定，干净起步
-            release()
-
-            // ① 确保 WiFi 开关打开（仅 Shizuku 可用时生效）
+            // ① 确保 WiFi 开关打开
             ShizukuTools.exec("cmd wifi set-wifi-enabled enabled")
 
             // ② connect-network：exit=0 仅表示「已投递给 WifiService」，不代表已连上
@@ -110,6 +126,80 @@ class WifiJoiner(
 
             JoinResult.Joined(network)
         }
+
+    /**
+     * 无 Shizuku 兜底：公开 API `WifiNetworkSpecifier` 申请一个 **app 专属** WiFi 网络。
+     *
+     * 与系统「保存并连接」不同，这条路是进程隔离的点对点连接——正合我们 bindProcess 的用法，
+     * 且不落系统已保存网络（避开 cardeck §13b「热点已保存反而连不上」的地雷）。
+     *
+     * 代价：**每个热点首次连接弹一次系统确认框**（批准结果按 SSID+安全类型持久化，之后静默）。
+     * 确认框由 SystemUI 呈现；**后台 FGS 拉起的首连不保证能弹出**——所以无 Shizuku 时的推荐
+     * 用法是：装好后先手动打开一次 App 完成首连确认，之后「上车自动连接」才会全程静默。
+     * 拿不到句柄（框弹不出/用户拒绝/超时）一律返回 Failed，由调用方降级到「绑定当前网络」。
+     */
+    private suspend fun joinViaSpecifier(ssid: String, psk: String): JoinResult =
+        withContext(Dispatchers.IO) {
+            val specifier = WifiNetworkSpecifier.Builder().apply {
+                setSsid(ssid)
+                if (psk.isBlank()) setOpenNetwork() else setWpa2Passphrase(psk)
+            }.build()
+
+            // app 专属网络：只能加 TRANSPORT_WIFI + specifier，
+            // 不能声明 NET_CAPABILITY_INTERNET（车机热点本就无外网，且 specifier 网络不允许）。
+            val request = NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .setNetworkSpecifier(specifier)
+                .build()
+
+            val network = awaitSpecifierHandle(request, SPECIFIER_WAIT_MS)
+                ?: return@withContext JoinResult.Failed
+            JoinResult.Joined(network)
+        }
+
+    /** 用 specifier 请求拿 Network 句柄；首连时系统确认框的等待时间也算在 [timeoutMs] 内。 */
+    private suspend fun awaitSpecifierHandle(request: NetworkRequest, timeoutMs: Long): Network? {
+        val latch = CountDownLatch(1)
+        val result = AtomicReference<Network?>(null)
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                result.set(network)
+                latch.countDown()
+            }
+
+            override fun onUnavailable() {
+                latch.countDown()
+            }
+
+            override fun onLost(network: Network) {
+                if (boundNetwork.compareAndSet(network, null)) {
+                    connectivityManager.bindProcessToNetwork(null)
+                }
+                lostCallback()
+            }
+        }
+        callback.set(cb)
+        try {
+            // 带超时的 requestNetwork：系统确认框期间不超时，用户长期不点才失败
+            connectivityManager.requestNetwork(request, cb, timeoutMs)
+        } catch (t: Throwable) {
+            callback.compareAndSet(cb, null)
+            Log.i(TAG, "specifier requestNetwork 失败：${t.message}")
+            return null
+        }
+        val deadline = SystemClock.uptimeMillis() + timeoutMs
+        while (SystemClock.uptimeMillis() < deadline) {
+            currentCoroutineContext().ensureActive()
+            if (latch.await(200, TimeUnit.MILLISECONDS)) break
+        }
+        val network = result.get()
+        if (network == null) {
+            // 未拿到句柄（含用户拒绝/超时）：注销回调，别泄漏
+            release()
+            return null
+        }
+        return network
+    }
 
     /**
      * 把进程 socket 绑到 [network]（mDNS/裸 socket 跟随进程默认网络，必须显式绑）。
@@ -208,5 +298,8 @@ class WifiJoiner(
         const val TAG = "WifiJoiner"
         const val JOIN_WAIT_MS = 15_000L
         const val HANDLE_WAIT_MS = 15_000L
+
+        /** specifier 路径：首连要等用户点系统确认框，窗口给宽（30s）。 */
+        const val SPECIFIER_WAIT_MS = 30_000L
     }
 }

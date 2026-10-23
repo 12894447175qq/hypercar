@@ -1,6 +1,7 @@
 package io.github.hypercar.net
 
 import android.os.SystemClock
+import io.github.hypercar.settings.SettingsStore
 import io.github.hypercar.shizuku.ShizukuTools
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -55,4 +56,14 @@ object BluetoothMac {
         if (!r.ok) return null
         return MAC_REGEX.find(r.out)?.value?.uppercase()?.takeIf { it != PLACEHOLDER_MAC }
     }
+
+    /**
+     * 取用于协议身份的 deviceID：Shizuku 可用则尽量拿真实 MAC，失败/未装 Shizuku 则回落到
+     * [SettingsStore.stableDeviceId]（持久化稳定伪 MAC）。
+     *
+     * 无 Shizuku 时 Android 11+ 拿不到真 MAC；宝马 iD8.5 实测未校验 MAC，稳定伪 ID 即可通，
+     * 只有 WinPlay/部分奥迪这类按 deviceID 严格过滤的接收端会拒（那时再提示装 Shizuku）。
+     */
+    suspend fun resolveOrStable(force: Boolean = false): String =
+        resolve(force) ?: SettingsStore.stableDeviceId
 }

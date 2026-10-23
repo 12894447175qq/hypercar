@@ -127,19 +127,20 @@ object HyperCarRepo {
 
     private suspend fun runConnect(context: Context) {
         try {
+            // Shizuku 从「必须」降级为「可选增强」：没有它照样能连，只是两条路径降级——
+            //  WiFi 走 WifiNetworkSpecifier（热点首连弹一次系统确认框）+ deviceID 用稳定伪 MAC。
             if (!ShizukuTools.isReady) {
-                fail("Shizuku 未就绪——请先启动 Shizuku 并授权")
-                return
+                log("SHIZUKU: 未就绪——降级模式（热点首连需确认一次，deviceID 用稳定伪 MAC）")
             }
             push(link = LinkState.Negotiating("解析本机蓝牙身份"))
-            val deviceMac = BluetoothMac.resolve() ?: "02:00:00:00:00:00"
+            val deviceMac = BluetoothMac.resolveOrStable()
 
             // ---- iAP2 协商（蓝牙侧）----
             push(link = LinkState.Negotiating("等待车机蓝牙 iAP2 协商"))
             val coordinator = Iap2Coordinator(
                 context,
                 targetMac = { SettingsStore.targetCarMac },
-                deviceMacProvider = { BluetoothMac.resolve() ?: deviceMac },
+                deviceMacProvider = { BluetoothMac.resolveOrStable() },
                 log = ::log,
             )
             iap2 = coordinator

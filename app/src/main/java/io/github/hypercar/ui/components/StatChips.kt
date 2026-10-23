@@ -186,9 +186,11 @@ private fun AudioChip(audio: AudioStats) {
 
 @Composable
 private fun ShizukuChip(ready: Boolean) {
+    // Shizuku 已降级为「可选增强」：没有它也能连车（热点首连弹一次框 + 稳定伪 MAC），
+    // 有则体验最优（0 弹窗 + 真实蓝牙 MAC）。故未就绪时用中性灰、文案标「可选」，不报警色。
     StatChip(
         label = "Shizuku",
-        value = if (ready) "就绪" else "未授权",
+        value = if (ready) "增强已启用" else "可选未启用",
         accent = if (ready) MintGreen else TextSecondary,
         leadingIcon = Icons.Rounded.Security,
     )

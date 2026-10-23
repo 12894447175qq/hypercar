@@ -95,7 +95,9 @@ pub(crate) fn emit_stats(
         env.call_method(
             obj,
             "onStats",
-            "(IJIZZ)V",
+            // Kotlin: onStats(fps:Int, frames:Long, kbps:Long, audioPlaying:Boolean, ducking:Boolean)
+            // → I J J I Z Z（两个 Long 都是 J；曾漏写一个 J 导致 kbps 按 Int 错位解析）
+            "(IJJIZZ)V",
             &[
                 fps.into(),
                 frames.into(),
@@ -125,11 +127,11 @@ fn with_env<T>(
     }
 }
 
-fn call_listener(method: &str, f: impl FnOnce(&mut JNIEnv, JObject) -> jni::errors::Result<()>) {
+fn call_listener(method: &str, f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::errors::Result<()>) {
     let guard = LISTENER.read();
     let Some(global) = guard.as_ref() else { return };
-    // as_obj() 返回 &JObject，f 需按值接收，clone（仅新建一个 JNI 局部引用）
-    let obj = global.as_obj().clone();
+    // JObject 不实现 Clone；as_obj() 返回 &JObject，直接按引用传给 f。
+    let obj = global.as_obj();
     let _ = with_env(|env| f(env, obj));
     let _ = method;
 }

@@ -35,6 +35,7 @@ object SettingsStore {
     private const val KEY_CARLIFE_PKG = "carlife_package"
     private const val KEY_KEEP_ALIVE_STATS = "keep_alive_stats"
     private const val KEY_DEBUG_LOG = "debug_log_enabled"
+    private const val KEY_STABLE_DEVICE_ID = "stable_device_id"
 
     /** 目标车机（多车场景）：null = 自动（来者不拒）。 */
     var targetCarMac: String?
@@ -89,6 +90,26 @@ object SettingsStore {
     var debugLogEnabled: Boolean
         get() = p().getBoolean(KEY_DEBUG_LOG, true)
         set(v) = p().edit().putBoolean(KEY_DEBUG_LOG, v).apply()
+
+    /**
+     * 无 Shizuku 时用的稳定 deviceID（首次生成后持久化，格式仿 MAC）。
+     *
+     * Android 11+ 把本机真实蓝牙 MAC 锁死（无 root/Shizuku 拿不到）。AirPlay 会话级
+     * SETUP 的 deviceID、iAP2 0x4300/0x4E0C/0x4E0E 的传输标识都要它。WinPlay 会按
+     * deviceID 严格 403、奥迪校验 0x4300，但宝马 iD8.5 实测未出现 MAC 校验——
+     * 故无 Shizuku 时退化为一个「本地管理位置位」的稳定伪 MAC，保证同一台手机跨会话
+     * 标识一致（比恒定占位 02:00:00:00:00:00 更不易被当占位值丢弃）。
+     */
+    val stableDeviceId: String
+        get() {
+            p().getString(KEY_STABLE_DEVICE_ID, null)?.let { return it }
+            // 首次生成：本地管理位置位(0x02) + 单播位清零，规避与真实 MAC 撞车
+            val bytes = ByteArray(6).also { java.security.SecureRandom().nextBytes(it) }
+            bytes[0] = ((bytes[0].toInt() and 0xFC) or 0x02).toByte()
+            val mac = bytes.joinToString(":") { "%02X".format(it) }
+            p().edit().putString(KEY_STABLE_DEVICE_ID, mac).apply()
+            return mac
+        }
 
     /** 引擎配置 JSON（Rust EngineConfig::from_json 消费）。 */
     fun engineConfigJson(carIp: String, airplayPort: Int, deviceBluetoothMac: String, identityPath: String): String {
