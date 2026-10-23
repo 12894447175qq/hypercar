@@ -99,7 +99,9 @@ private val FpsOptions = listOf(30, 60)
 
 private val CarLifePackagePresets = listOf(
     "百度 CarLife" to "com.baidu.carlife",
-    "小米 CarWith" to "com.xiaomi.carlink",
+    // 小米定制版 CarLife（HyperOS 预装，包名带 .xiaomi；现场 2026-10-23 实测就是它）
+    "小米 CarLife（定制）" to "com.baidu.carlife.xiaomi",
+    "小米 CarWith" to "com.miui.carlink",
     "荣耀车联" to "com.hihonor.carlink",
 )
 
@@ -892,6 +894,7 @@ private fun FpsSegment() {
 private fun BehaviorSection() {
     var autoConnect by rememberSaveable { mutableStateOf(SettingsStore.autoConnect) }
     var enableAudio by rememberSaveable { mutableStateOf(SettingsStore.enableAudio) }
+    var keepAliveOnly by rememberSaveable { mutableStateOf(SettingsStore.iap2KeepAliveOnly) }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionLabel(text = "行为")
@@ -915,6 +918,17 @@ private fun BehaviorSection() {
                 onCheckedChange = {
                     enableAudio = it
                     SettingsStore.enableAudio = it
+                },
+            )
+            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+            SwitchRow(
+                title = "联调：只保持 iAP2 链路",
+                subtitle = "不启 AirPlay 引擎。接收端（WinPlay）要求蓝牙链路常开、" +
+                    "而 AirPlay 由 PC 侧 hypercar-hub 推送时用这个",
+                checked = keepAliveOnly,
+                onCheckedChange = {
+                    keepAliveOnly = it
+                    SettingsStore.iap2KeepAliveOnly = it
                 },
             )
         }

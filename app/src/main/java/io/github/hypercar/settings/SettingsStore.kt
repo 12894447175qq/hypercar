@@ -33,6 +33,7 @@ object SettingsStore {
     private const val KEY_FPS = "carlife_fps"
     private const val KEY_ENABLE_AUDIO = "enable_audio"
     private const val KEY_CARLIFE_PKG = "carlife_package"
+    private const val KEY_IAP2_KEEPALIVE_ONLY = "iap2_keepalive_only"
     private const val KEY_KEEP_ALIVE_STATS = "keep_alive_stats"
     private const val KEY_DEBUG_LOG = "debug_log_enabled"
     private const val KEY_STABLE_DEVICE_ID = "stable_device_id"
@@ -83,6 +84,17 @@ object SettingsStore {
     var carlifePackage: String
         get() = p().getString(KEY_CARLIFE_PKG, "com.baidu.carlife") ?: "com.baidu.carlife"
         set(v) = p().edit().putString(KEY_CARLIFE_PKG, v).apply()
+
+    /**
+     * 联调开关：只保持 iAP2 链路，不在手机上启动 AirPlay 引擎。
+     *
+     * 用途：接收端（WinPlay）的接收会话与蓝牙 iAP2 强绑定——链路一断它就整进程退出；
+     * 而 CarLife MD 只在「车机」侧（PC 上的 hypercar-hub）才连得上。开启后手机只当
+     * iAP2 保活端，AirPlay 由 PC 侧推，两边不会抢同一条 AirPlay 会话。
+     */
+    var iap2KeepAliveOnly: Boolean
+        get() = p().getBoolean(KEY_IAP2_KEEPALIVE_ONLY, false)
+        set(v) = p().edit().putBoolean(KEY_IAP2_KEEPALIVE_ONLY, v).apply()
 
     /** 车机 /info 声明 keepAliveSendStatsAsBody 时置 true（屏幕 keepAlive 带统计体）。 */
     var keepAliveStats: Boolean

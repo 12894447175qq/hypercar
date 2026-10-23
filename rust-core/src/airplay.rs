@@ -49,6 +49,10 @@ pub struct AirplayParams {
     /// 设置里的 CarLife 编码分辨率（仅作 `/info` 无显示器信息时的兜底）。
     pub width: u32,
     pub height: u32,
+    /// **触摸的显示空间**（接收端屏幕像素）。`/info` 报 0x0 时用它；
+    /// 真车会给真实尺寸，WinPlay 这类接收端固定报 0x0（它按自己的窗口 2732x794 算 HID 坐标）。
+    /// 给错会让触摸整体缩放偏移——越靠右/下越明显（"按钮很难点上"）。
+    pub touch_display: Option<(u32, u32)>,
     /// 当前 CarLife 编码分辨率（共享单元）：
     /// `/info` 报到车机真实显示尺寸后由协商写入，手机在 `VIDEO_ENCODER_INIT_DONE`
     /// 里回报实际选择后由 CarLife 层覆盖。触摸坐标换算与 VideoConfig 都读它。
@@ -253,11 +257,35 @@ pub async fn negotiate(
         let (read_key, write_key) = derive_event_keys(shared);
         event_channel.set_cipher(ControlCipher::new(read_key, write_key));
     }
+    // 事件通道必须活到会话结束：`RtspChannel` 的 `Drop` 会 abort 读任务并关闭 socket。
+    // 之前这里只是临时变量，函数返回时就被丢弃 → 事件通道刚连上即被我们自己关掉，
+    // 接收端（WinPlay）的 close 回调把 eventSock 清回 null，触摸全进 pendingEvents
+    // 队列，攒到 64 条报「事件通道发送队列超限」（现场 2026-10-23 23:33 定位）。
+    {
+        let stop_ev = stop.clone();
+        tokio::spawn(async move {
+            let _keep_alive = event_channel;
+            stop_ev.notified().await;
+        });
+    }
     spawn_event_dispatcher(
         event_rx,
         touch_tx,
         key_tx,
-        (disp_w.max(1), disp_h.max(1)),
+        // 触摸的「显示空间」分母，优先级：
+        //  ① /info 报的显示器尺寸（真车会给真实值）
+        //  ② `--touch-display` 手动指定（WinPlay 固定报 0x0，但它按自己窗口
+        //     2732x794 算 HID 坐标；给错就整体缩放偏移 →「按钮很难点上」）
+        //  ③ 协商的屏幕尺寸
+        // 绝不能用 max(1) 当分母：x_raw*编码宽/1 溢出后被 clamp 到边界，
+        // 表现是「每一下都落在右下角」（2026-10-23 23:38 定位）。
+        {
+            let (dw, dh) = match (disp_w, disp_h) {
+                (0, _) | (_, 0) => p.touch_display.unwrap_or((p.width, p.height)),
+                v => v,
+            };
+            (dw.max(1), dh.max(1))
+        },
         p.encoder_size.clone(),
         stop.clone(),
     );
@@ -610,6 +638,9 @@ fn spawn_event_dispatcher(
     tokio::spawn(async move {
         let mut bad_commands = 0usize;
         let mut tip_down = false; // 上一次报告的按下状态（down/move/up 边沿检测）
+        let mut seen_commands: Vec<String> = Vec::new();
+        let mut hid_reports: u64 = 0;
+        let mut other_lines: u64 = 0;
         loop {
             let msg = tokio::select! {
                 _ = stop.notified() => return,
@@ -619,6 +650,18 @@ fn spawn_event_dispatcher(
                 },
             };
             if !msg.first_line.contains("/command") {
+                // 事件通道上除了 /command 还会有别的东西（RTSP 应答、心跳等）。
+                // 以前这里静默 continue，导致「触控一点都没有」时完全无法判断
+                // 是对方没发、还是报文格式和预期不同（现场 2026-10-23 23:20：
+                // WinPlay 侧已确认发出触摸，我们这边却一条 EVENT 都没有）。
+                other_lines += 1;
+                if other_lines <= 5 {
+                    emit_log(&format!(
+                        "EVENT: 非 /command 报文（第 {other_lines} 条）first_line={:?} body={}B",
+                        msg.first_line,
+                        msg.body.len()
+                    ));
+                }
                 continue;
             }
             let command = match bplist::parse(&msg.body) {
@@ -635,13 +678,39 @@ fn spawn_event_dispatcher(
                 }
             };
             let cmd_type = command.get("type").and_then(Value::as_str).unwrap_or("");
+            // 事件通道是「车机 → 手机」的唯一通道（触摸/HID/命令）。它是否在工作，
+            // 现场只能靠日志判断，所以每类命令第一次出现时记一行（之后不刷屏）。
+            if !seen_commands.iter().any(|c| c == cmd_type) {
+                if seen_commands.len() < 32 {
+                    seen_commands.push(cmd_type.to_string());
+                }
+                emit_log(&format!("EVENT: 车机命令 type={cmd_type}（首次）"));
+            }
             match cmd_type {
                 "hidSendReport" => {
+                    // 两种布局都要认：
+                    //  - 苹果/真车常见：{ params: { report: <data> } }
+                    //  - WinPlay：      { type, uuid, hidReport: <data> }（顶层）
+                    // 只认前者会表现成「收到了 hidSendReport 但没有 HID 报告」，
+                    // 触摸静默失效（现场 2026-10-23 23:33 定位）。
                     let report = command
-                        .get("params")
-                        .and_then(|p| p.get("report"))
-                        .and_then(Value::as_bytes);
+                        .get("hidReport")
+                        .and_then(Value::as_bytes)
+                        .or_else(|| {
+                            command
+                                .get("params")
+                                .and_then(|p| p.get("report"))
+                                .and_then(Value::as_bytes)
+                        });
                     if let Some(report) = report {
+                        hid_reports += 1;
+                        if hid_reports <= 3 || hid_reports % 20 == 0 {
+                            emit_log(&format!(
+                                "EVENT: HID 报告 #{hid_reports} {}B {}",
+                                report.len(),
+                                report.iter().take(6).map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
+                            ));
+                        }
                         handle_hid_report(
                             report,
                             &touch_tx,
@@ -690,11 +759,47 @@ fn handle_hid_report(
     // 用旧快照会让触摸整体偏移（越靠边越明显）。
     let target = *target_size.lock();
     let target = (target.0.max(2), target.1.max(2));
-    let pressed = report[0] & 0x01 != 0;
-    let x_raw = u16::from_le_bytes([report[1], report[2]]) as u32;
-    let y_raw = u16::from_le_bytes([report[3], report[4]]) as u32;
-    let x = (x_raw * target.0 / display.0).min(target.0 - 1);
-    let y = (y_raw * target.1 / display.1).min(target.1 - 1);
+
+    // 两种报告布局：
+    //  ① **每指 6 字节** `[index][touch][X u16LE][Y u16LE]`，最多 2 指（12 字节）——
+    //     苹果触摸描述符 / WinPlay 都是这个（WinPlay: TOUCH_CONTACTS=2、BYTES_PER_FINGER=6）。
+    //  ② 旧的 5 字节 `[tip][X u16LE][Y u16LE]`（cardeck 奥迪实测）。
+    // 之前只按 ② 解析，于是把 6 字节布局里的 `report[0]`（触点 index=0）当成按下位 →
+    // 永远判成"未按下" → 触摸被整段丢弃（现场 2026-10-23 23:35 定位）。
+    let (pressed, x_raw, y_raw) = if report.len() >= 6 && report.len() % 6 == 0 {
+        // 取第一个真正的指（跳过 index 非 0 或未按下的）
+        let mut picked = None;
+        for finger in report.chunks_exact(6) {
+            if finger[1] & 0x01 != 0 {
+                picked = Some(finger);
+                break;
+            }
+        }
+        match picked {
+            Some(f) => (
+                true,
+                u16::from_le_bytes([f[2], f[3]]) as u32,
+                u16::from_le_bytes([f[4], f[5]]) as u32,
+            ),
+            // 全部手指都抬起：沿用上次坐标发 UP（坐标本身对抬起不重要）
+            None => {
+                let f = &report[..6];
+                (
+                    false,
+                    u16::from_le_bytes([f[2], f[3]]) as u32,
+                    u16::from_le_bytes([f[4], f[5]]) as u32,
+                )
+            }
+        }
+    } else {
+        (
+            report[0] & 0x01 != 0,
+            u16::from_le_bytes([report[1], report[2]]) as u32,
+            u16::from_le_bytes([report[3], report[4]]) as u32,
+        )
+    };
+    let x = (x_raw * target.0 / display.0.max(1)).min(target.0 - 1);
+    let y = (y_raw * target.1 / display.1.max(1)).min(target.1 - 1);
     // 动作边沿：按下沿 → DOWN，保持 → MOVE，抬起沿 → UP。
     // 用 **CarLife 语义**（0=DOWN/1=UP/2=MOVE），不是 Android MotionEvent 的 1/2/3——
     // 下游 carlife::inject_touch 直接按 CarLife 裸结构封包。
@@ -857,3 +962,4 @@ fn random_positive_i64() -> i64 {
 fn random_uuid_upper() -> String {
     uuid::Uuid::new_v4().simple().to_string().to_uppercase()
 }
+

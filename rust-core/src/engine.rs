@@ -52,6 +52,20 @@ pub struct EngineConfig {
     #[serde(default)]
     pub keep_alive_stats: bool,
     pub identity_path: String,
+    /// 非空 = CarLife 走**主动连接模式**：不发监听，改为逐个拨 `md_host` 的标准端口。
+    ///
+    /// 小米 CarLife/CarWith「车辆热点 → 开始连接」后是 MD 在监听（7240/8240/…），
+    /// 等车机连入；Android 上（HU 与 MD 同机）保持 `None`，仍用回环监听。
+    #[serde(default)]
+    pub md_host: Option<String>,
+    /// 接收端 `/info` 报 0x0 时的**触摸显示空间**宽/高（0 = 用协商的屏幕尺寸）。
+    ///
+    /// WinPlay 这类接收端固定报 0x0，但它的 HID 坐标按自己窗口像素算
+    /// （实测 2732x794）；不指定就会整体缩放偏移，表现为「按钮很难点上」。
+    #[serde(default)]
+    pub touch_display_w: u32,
+    #[serde(default)]
+    pub touch_display_h: u32,
 }
 
 fn default_true() -> bool {
@@ -79,14 +93,15 @@ pub async fn run_engine(
 
     // ---- CarLife 网关先行：协商期间 CarLife app 即可接入回环 ----
     // （触摸接收端已内化给通道任务，hub 只保留注入 Sender）
-    let (hub, mut life_events) = CarLifeHub::start(
-        CarLifeConfig {
-            width: cfg.width,
-            height: cfg.height,
-            fps: cfg.fps,
-        },
-        stop.clone(),
-    )?;
+    let life_cfg = CarLifeConfig {
+        width: cfg.width,
+        height: cfg.height,
+        fps: cfg.fps,
+    };
+    let (hub, mut life_events) = match cfg.md_host.clone() {
+        Some(host) => CarLifeHub::connect(life_cfg, host, stop.clone())?,
+        None => CarLifeHub::start(life_cfg, stop.clone())?,
+    };
     let hub = Arc::new(hub);
 
     // 触摸/按键注入桥：AirPlay 事件通道 → CarLife 触摸通道
@@ -247,11 +262,24 @@ pub async fn run_engine(
             let mut tts_mix: VecDeque<i16> = VecDeque::with_capacity(48_000 * 2);
             let mut duck_hold: u32 = 0;
             let mut gain: f32 = 1.0;
+            // 音频发包节拍：**绝不漂移**。
+            //
+            // cardeck 的节奏天然正确——它由 AudioRecord.read() 的阻塞读取驱动，
+            // 硬件按 48k 实时吐 352 帧，一包一发，永不累计误差。
+            // 我们这里是「收 CarLife PCM → 自己重排节奏」，所以必须用绝对时刻对齐：
+            //  - Burst：漏掉的拍**立刻补发**（Delay 会永久丢拍 → RTP 时钟持续落后于
+            //    墙钟，接收端表现为 late/discontinuity 一直涨、听感断续）。
+            //  - 补发仍受混音队列上限（~0.5s）约束，不会无限喷包。
+            // 现场 2026-10-23 23:45：WinPlay 侧统计 packets 只有 ~68/s（应为 48000/352≈136/s），
+            // 正好少一半，印证漏拍。
             let mut tick =
                 tokio::time::interval(Duration::from_nanos((SPF as u64) * 1_000_000_000 / TARGET_RATE as u64));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
             let mut sync_tick = tokio::time::interval(Duration::from_secs(1));
             sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // 发包速率自测：每秒记一行，联调时能直接看出节拍对不对。
+            let mut sent_packets: u64 = 0;
+            let mut rate_mark = std::time::Instant::now();
             let mut mixed = vec![0i16; SPF * 2];
             loop {
                 tokio::select! {
@@ -305,17 +333,38 @@ pub async fn run_engine(
                         gain += (target - gain) * 0.15;
 
                         for i in 0..SPF {
-                            let m = take_or_zero(&mut media_mix);
-                            let t = take_or_zero(&mut tts_mix);
-                            let mv = (m as f32 * gain) as i32;
-                            let mixed_v = (mv + t as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                            mixed[i * 2] = mixed_v;
-                            mixed[i * 2 + 1] = mixed_v;
+                            // 混音队列里是**交错立体声**（push_resampled 每帧压 L、R 两个样本）。
+                            // 之前每帧只取一个样本再左右都填它——只消费了一半数据、还把立体声
+                            // 压成单声道，听感就是沙沙声 + 断续（现场 2026-10-23 23:10 定位）。
+                            let ml = take_or_zero(&mut media_mix);
+                            let mr = take_or_zero(&mut media_mix);
+                            let tl = take_or_zero(&mut tts_mix);
+                            let tr = take_or_zero(&mut tts_mix);
+                            let l = (ml as f32 * gain) as i32 + tl as i32;
+                            let r = (mr as f32 * gain) as i32 + tr as i32;
+                            mixed[i * 2] = l.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                            mixed[i * 2 + 1] = r.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
                         }
                         stats.lock().ducking = duck_hold > 0;
                         if let Some(a) = out.as_mut() {
                             // 静音时也发包：保持 RTP 时钟连续（车机按包排播）
+                            let before = a.packets_sent();
                             let _ = a.send_pcm(&mixed).await;
+                            sent_packets += a.packets_sent().saturating_sub(before);
+                        }
+                        // 每秒报一次实际发包速率：48000/352 ≈ 136/s。低于它就是漏拍，
+                        // 接收端会表现为 late/discontinuity 增长、听感断续。
+                        if rate_mark.elapsed() >= Duration::from_secs(1) {
+                            let secs = rate_mark.elapsed().as_secs_f64().max(0.001);
+                            emit_log(&format!(
+                                "AUDIO: 发包 {:.0}/s（应 {:.0}/s） 队列 media={}ms tts={}ms",
+                                sent_packets as f64 / secs,
+                                TARGET_RATE as f64 / SPF as f64,
+                                media_mix.len() * 1000 / (TARGET_RATE as usize).max(1) / 2,
+                                tts_mix.len() * 1000 / (TARGET_RATE as usize).max(1) / 2
+                            ));
+                            sent_packets = 0;
+                            rate_mark = std::time::Instant::now();
                         }
                     }
                 }
@@ -335,6 +384,11 @@ pub async fn run_engine(
         keep_alive_stats: cfg.keep_alive_stats,
         width: cfg.width,
         height: cfg.height,
+        // 接收端 /info 报 0x0 时的触摸显示空间（PC 侧联调用 --touch-display 指定）
+        touch_display: match (cfg.touch_display_w, cfg.touch_display_h) {
+            (w, h) if w > 0 && h > 0 => Some((w, h)),
+            _ => None,
+        },
         // 与 CarLife 层共用：/info 报到车机真实尺寸后写入，手机回报实际值后再覆盖
         encoder_size: hub.encoder_size_handle(),
     };

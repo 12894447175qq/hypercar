@@ -214,7 +214,21 @@ object HyperCarRepo {
                 )
             }
             push(link = LinkState.Negotiating("解析本机蓝牙身份"))
-            val deviceMac = BluetoothMac.resolveOrStable()
+            // deviceID 不是「随便一个唯一值」：按 deviceID 过滤的接收端会逐字符比对。
+            // WinPlay 就是拿它和「目标蓝牙设备」（Windows 里配对的经典蓝牙地址）比，
+            // 不一致直接对会话级 SETUP 回 403（cpStack.ts 的 deviceFilter）。
+            // 所以这里明确区分「真实 MAC」和「伪 MAC」，伪 MAC 时把后果写进日志。
+            val realMac = BluetoothMac.resolve()
+            val deviceMac = realMac ?: BluetoothMac.resolveOrStable()
+            if (realMac == null) {
+                log(
+                    "BT: ⚠ 未解析到真实蓝牙 MAC，本次用伪 ID $deviceMac——" +
+                        "按 deviceID 过滤的接收端（WinPlay / 部分车机）会直接 403；" +
+                        "装 Shizuku 或到设置里「手动指定蓝牙 MAC」填真实地址即可",
+                )
+            } else {
+                log("BT: 使用真实蓝牙 MAC $deviceMac")
+            }
 
             // ---- iAP2 协商（蓝牙侧）----
             push(link = LinkState.Negotiating("等待车机蓝牙 iAP2 协商"))
@@ -242,6 +256,25 @@ object HyperCarRepo {
                         "车机未给出可用 IP（ssid=${seen.ssid ?: "-"} port=${seen.airPlayPort} " +
                             "ips=${seen.ipAddresses}）——检查车机热点是否开启"
                     },
+                )
+                return
+            }
+
+            // ---- 联调开关：只保 iAP2 链路，不起 AirPlay ----
+            // 目的：WinPlay 这类接收端的「接收会话」与蓝牙 iAP2 强绑定（链路一断就整进程退出），
+            // 而 CarLife MD 只在车机侧（PC）才连得上。于是让手机只当 iAP2 保活端，
+            // AirPlay 由 PC 侧 hypercar-hub 去推，两边就不会抢同一条 AirPlay 会话。
+            // 现场 2026-10-23 22:37：手机引擎与 PC hub 同时连 17000，WinPlay 画面被后者顶掉。
+            if (SettingsStore.iap2KeepAliveOnly) {
+                log("联调: 只保持 iAP2 链路（不启动 AirPlay 引擎）——端点 ips=${endpoint.ipAddresses} port=${endpoint.airPlayPort}")
+                // 不 fail、不 return 前关闭协调器：iAP2 链路由 coordinator 自己的保活定时器维持，
+                // 这样接收端（WinPlay）的 BT 桥接不会因链路关闭而退出。
+                push(
+                    link = LinkState.Connected(
+                        carName = SettingsStore.targetCarName ?: "BMW ID8.5",
+                        sinceMillis = System.currentTimeMillis(),
+                    ),
+                    carLife = CarLifeState.Idle,
                 )
                 return
             }
@@ -411,7 +444,8 @@ object HyperCarRepo {
                 val socket = Socket()
                 socket.tcpNoDelay = true
                 socket.connect(InetSocketAddress(host, port), CONTROL_CONNECT_TIMEOUT_MILLIS.toInt())
-                dupForRust(ParcelFileDescriptor.fromSocket(socket).detachFd())
+                keepAliveForRust(socket)
+                ParcelFileDescriptor.fromSocket(socket).detachFd()
             }.getOrNull()
             if (fd != null && fd >= 0) {
                 if (network != null) {
@@ -443,28 +477,37 @@ object HyperCarRepo {
     // ---------------------------------------------------------------- socket 供给（移交 Rust）
 
     /**
-     * 把要交给 Rust 的 fd 先 `dup` 一份。
+     * 交给 Rust 的 socket 宿主（Socket / DatagramSocket）**必须保持可达**。
      *
-     * `detachFd()` 只是把 fd 从 PFD 里摘出来；Java 的 Socket/DatagramSocket 对象仍然持有
-     * 同一个 fd，并在 GC 时 close 它——那一刻 Rust 正在用的 fd 就没了（推流中途断、引擎
-     * 报 EBADF）。dup 之后两边各持一份、各关各的（dup 共享同一 open file description，
-     * 非阻塞标志和连接状态都保持一致）。
+     * `detachFd()` 只是把 fd 从 PFD 里摘出来交给 Rust；Java 的 Socket 对象仍然持有同一个
+     * fd，是它背后的 `FileDescriptor` 负责在 GC 时 close。若此时 Socket 已不可达，GC 会在
+     * Rust 还在用的时候把 fd 关掉（推流中途断流、引擎 EBADF）。这里把宿主对象留一份强引用：
+     * 实际 fd 由 Rust 持有并在 nativeStop 时关闭，Java 这边只是不再去 close 它。
+     * 每个会话只留几个小对象，只增不减（不 close、不回收，避免重复 close 到被复用的 fd 号）。
+     *
+     * 注：不能用 `android.system.Os.dup(int)` 做副本——该重载不是公开 API（只有
+     * `dup(FileDescriptor)`），编译期就过不了。
      */
-    private fun dupForRust(rawFd: Int): Int =
-        runCatching { android.system.Os.dup(rawFd) }.getOrDefault(rawFd)
+    private val socketKeepAlive = java.util.Collections.synchronizedList(mutableListOf<Any>())
+
+    private fun keepAliveForRust(owner: Any) {
+        socketKeepAlive.add(owner)
+    }
 
     private val socketProvider = object : RustCoreBridge.SocketProvider {
         override fun openTcpFd(host: String, port: Int, timeoutMs: Int): Int = runCatching {
             val socket = Socket()
             socket.tcpNoDelay = true
             socket.connect(InetSocketAddress(host, port), timeoutMs.coerceAtLeast(1_000))
-            dupForRust(ParcelFileDescriptor.fromSocket(socket).detachFd())
+            keepAliveForRust(socket)
+            ParcelFileDescriptor.fromSocket(socket).detachFd()
         }.getOrElse { -1 }
 
         override fun openUdpFd(host: String, port: Int): Int = runCatching {
             val udp = DatagramSocket()
             udp.connect(InetSocketAddress(host, port))
-            dupForRust(ParcelFileDescriptor.fromDatagramSocket(udp).detachFd())
+            keepAliveForRust(udp)
+            ParcelFileDescriptor.fromDatagramSocket(udp).detachFd()
         }.getOrElse { -1 }
     }
 
@@ -510,19 +553,97 @@ object HyperCarRepo {
         }
     }
 
-    /** 唤醒本机 CarLife / CarWith·CarLife / 荣耀车联，令其连 127.0.0.1 回环网关。 */
+    /**
+     * CarLife 系 app 的候选包名（按唤醒优先级）。
+     *
+     * `com.baidu.carlife.xiaomi` 是 HyperOS 预装的**小米定制版 CarLife**——现场
+     * 2026-10-23 实测：手机上只有它和 CarWith，设置里默认的 `com.baidu.carlife`
+     * 根本没装，于是广播静默丢弃、7240 永远等不到接入。
+     */
+    private val carLifePackageCandidates = listOf(
+        "com.baidu.carlife",
+        "com.baidu.carlife.xiaomi",
+        "com.miui.carlink",
+        "com.xiaomi.carlink",
+        "com.hihonor.carlink",
+    )
+
+    /** 实际可用的唤醒包名：设置里配的优先；没装就自动换一个装了的，并把换的结果写进日志。 */
+    private fun resolveCarLifePackage(): String {
+        val configured = SettingsStore.carlifePackage
+        val ctx = appContext() ?: return configured
+        fun installed(p: String) = runCatching { ctx.packageManager.getPackageInfo(p, 0) }.isSuccess
+        if (installed(configured)) return configured
+        val fallback = carLifePackageCandidates.firstOrNull { it != configured && installed(it) }
+        if (fallback != null) {
+            log("WAKE: ⚠ 唤醒包名 $configured 未安装，自动改用 $fallback（建议到设置里改过来）")
+            return fallback
+        }
+        log("WAKE: ⚠ 设备上没有 CarLife 系 app（候选：${carLifePackageCandidates.joinToString(", ")}）")
+        return configured
+    }
+
+    /**
+     * 唤醒本机 CarLife / CarWith·CarLife / 荣耀车联，令其连 127.0.0.1 回环网关。
+     *
+     * 三级递进（现场 2026-10-23 22:00：应用内广播发出去后，7240 一个连接都没有）：
+     *  ① 应用内广播 `com.baidu.carlife.Action.StartWireless`——最轻，但 Android 14+
+     *     对「非导出接收器」会静默丢弃，且包名不对时也毫无反馈；
+     *  ② Shizuku 已就绪时用 shell 再广播一次（`am broadcast` 以 shell 身份投递，
+     *     不受导出限制）；
+     *  ③ 仍未接入就把 app 直接拉起来（`monkey -c LAUNCHER`），让它自己走无线连接。
+     * 顺带把设备上「CarLife/CarLink 系」的包名列进日志——包名配错时一眼可见。
+     */
     private fun wakeLocalCarLife() {
-        val pkg = SettingsStore.carlifePackage
+        val pkg = resolveCarLifePackage()
+        _snapshots.value = _snapshots.value.copy(carLife = CarLifeState.Waiting())
         runCatching {
             val intent = android.content.Intent("com.baidu.carlife.Action.StartWireless").apply {
                 setPackage(pkg)
                 addFlags(android.content.Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
             }
-            _snapshots.value = _snapshots.value.copy(carLife = CarLifeState.Waiting())
-            // Android 14+ 静态注册限制：本广播由目标 app 清单接收（CarLife 系一直如此）
             runCatching { appContext()?.sendBroadcast(intent) }
                 .onFailure { log("WAKE: 广播发送失败 - ${it.message}") }
-            log("WAKE: 已广播唤醒 $pkg（连接 127.0.0.1:7240）")
+            log("WAKE: ① 应用内广播 StartWireless → $pkg")
+        }
+        if (!ShizukuTools.isReady) {
+            log("WAKE: 无 Shizuku，跳过 shell 兜底（②③）——若一直 Waiting，检查设置里的唤醒包名")
+            return
+        }
+        scope.launch {
+            // 包名到底存不存在、还有哪些 CarLife 系 app
+            val listed = runCatching {
+                ShizukuTools.exec(
+                    "pm list packages | grep -iE 'carlife|carlink|carwith|carlife'",
+                    6_000,
+                )
+            }.getOrNull()
+            val packages = listed?.out
+                ?.lineSequence()
+                ?.map { it.removePrefix("package:").trim() }
+                ?.filter { it.isNotEmpty() }
+                ?.distinct()
+                ?.toList()
+                .orEmpty()
+            log("WAKE: 设备上 CarLife 系包 = ${if (packages.isEmpty()) "（没找到）" else packages.joinToString(", ")}")
+            if (packages.isNotEmpty() && pkg !in packages) {
+                log("WAKE: ⚠ 设置里的 $pkg 不在上面列表里——很可能是包名不对（改成实际那个）")
+            }
+
+            // ② shell 广播：以 shell 身份投递，绕开 Android 14+ 非导出接收器限制
+            val bcast = runCatching {
+                ShizukuTools.exec(
+                    "am broadcast -a com.baidu.carlife.Action.StartWireless -p $pkg --user 0",
+                    6_000,
+                )
+            }.getOrNull()
+            log("WAKE: ② shell 广播 exit=${bcast?.code} ${bcast?.out?.replace("\n", " ")?.take(160).orEmpty()}")
+
+            // ③ 直接拉起 app（很多人肉点的那一步）
+            val launch = runCatching {
+                ShizukuTools.exec("monkey -p $pkg -c android.intent.category.LAUNCHER 1", 8_000)
+            }.getOrNull()
+            log("WAKE: ③ 拉起 $pkg exit=${launch?.code} ${launch?.out?.lineSequence()?.firstOrNull().orEmpty().take(160)}")
         }
     }
 

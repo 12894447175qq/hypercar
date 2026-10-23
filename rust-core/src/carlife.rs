@@ -165,12 +165,186 @@ impl CarLifeHub {
         self.encoder_size.clone()
     }
 
+    /// **主动连接模式**（盒子角色）：MD（手机上的 CarLife/CarWith）在标准端口上监听，
+    /// 由 HU 侧逐个拨过去。
+    ///
+    /// 为什么需要它：小米 CarLife 走「车辆热点 → 开始连接」时，方向是反的——
+    /// 现场 2026-10-23 22:56 实测，点「开始连接」后手机 `com.baidu.carlife.xiaomi`
+    /// （uid 10345）开始 **LISTEN** `7240/8240/9240/9241/9242/9340`，等车机连入；
+    /// 这与参考实现 `CarLifeWirelessBox` 的 `HuRole.connect(phoneIp, port)` 一致。
+    /// Android 上（HU 与 MD 同机）仍然用 [`Self::start`] 的监听模式。
+    pub fn connect(
+        cfg: CarLifeConfig,
+        md_host: String,
+        stop: Arc<Notify>,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<CarLifeEvent>), String> {
+        let (events, event_rx) = mpsc::unbounded_channel();
+        let (touch_tx, touch_rx) = mpsc::unbounded_channel();
+        let encoder_size: Arc<Mutex<(u32, u32)>> =
+            Arc::new(Mutex::new((cfg.width.max(2), cfg.height.max(2))));
+
+        // ---- CMD 7240：14 步握手（连上就交给同一个 handler）----
+        {
+            let events = events.clone();
+            let size = encoder_size.clone();
+            let stop_c = stop.clone();
+            let host = md_host.clone();
+            let fps = cfg.fps;
+            tokio::spawn(async move {
+                let mut throttle = DialLogThrottle::new();
+                loop {
+                    tokio::select! {
+                        _ = stop_c.notified() => return,
+                        dialed = dial(&host, PORT_CMD) => match dialed {
+                            Ok(stream) => {
+                                emit_log(&format!("CARLIFE: ✓ CMD 已连上 MD {host}:{PORT_CMD}"));
+                                handle_cmd_client(stream, events.clone(), size.clone(), fps, stop_c.clone()).await;
+                                emit_log("CARLIFE: CMD 通道断开，1s 后重连");
+                            }
+                            Err(e) => {
+                                if throttle.ready() {
+                                    emit_log(&format!("CARLIFE: 连 MD {host}:{PORT_CMD} 失败: {e}"));
+                                }
+                            }
+                        },
+                    }
+                    tokio::select! {
+                        _ = stop_c.notified() => return,
+                        _ = tokio::time::sleep(Duration::from_millis(1000)) => {}
+                    }
+                }
+            });
+        }
+
+        // ---- 媒体通道：VIDEO/MEDIA/TTS 连上就交给同一个 handler；VR 只读 ----
+        for (port, name, kind) in [
+            (PORT_VIDEO, "VIDEO", Some(MediaKind::Video)),
+            (PORT_MEDIA, "MEDIA", Some(MediaKind::Media)),
+            (PORT_TTS, "TTS", Some(MediaKind::Tts)),
+            (PORT_VR, "VR", None),
+        ] {
+            let events = events.clone();
+            let stop_c = stop.clone();
+            let host = md_host.clone();
+            tokio::spawn(async move {
+                let mut throttle = DialLogThrottle::new();
+                loop {
+                    let stream = tokio::select! {
+                        _ = stop_c.notified() => return,
+                        dialed = dial(&host, port) => match dialed {
+                            Ok(s) => s,
+                            Err(e) => {
+                                if throttle.ready() {
+                                    emit_log(&format!("CARLIFE: 连 MD {host}:{port}（{name}）失败: {e}"));
+                                }
+                                tokio::time::sleep(Duration::from_millis(1000)).await;
+                                continue;
+                            }
+                        },
+                    };
+                    emit_log(&format!("CARLIFE: ✓ {name} 已连上 MD {host}:{port}"));
+                    match kind {
+                        Some(k) => handle_media_client(stream, events.clone(), k).await,
+                        None => drain_stream(stream).await,
+                    }
+                    emit_log(&format!("CARLIFE: {name} 通道断开，1s 后重连"));
+                    tokio::select! {
+                        _ = stop_c.notified() => return,
+                        _ = tokio::time::sleep(Duration::from_millis(1000)) => {}
+                    }
+                }
+            });
+        }
+
+        // ---- CTRL 9340：触摸/硬按键出向 ----
+        {
+            let queue: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+            {
+                let queue = queue.clone();
+                let stop_fill = stop.clone();
+                tokio::spawn(async move {
+                    let mut touch_rx = touch_rx;
+                    loop {
+                        tokio::select! {
+                            _ = stop_fill.notified() => return,
+                            frame = touch_rx.recv() => match frame {
+                                Some(f) => {
+                                    let mut q = queue.lock();
+                                    if q.len() > 256 {
+                                        q.remove(0);
+                                    }
+                                    q.push(f);
+                                }
+                                None => return,
+                            },
+                        }
+                    }
+                });
+            }
+            let stop_c = stop.clone();
+            let host = md_host.clone();
+            tokio::spawn(async move {
+                let mut throttle = DialLogThrottle::new();
+                loop {
+                    let stream = tokio::select! {
+                        _ = stop_c.notified() => return,
+                        dialed = dial(&host, PORT_CTRL) => match dialed {
+                            Ok(s) => s,
+                            Err(e) => {
+                                if throttle.ready() {
+                                    emit_log(&format!("CARLIFE: 连 MD {host}:{PORT_CTRL}（CTRL）失败: {e}"));
+                                }
+                                tokio::time::sleep(Duration::from_millis(1000)).await;
+                                continue;
+                            }
+                        },
+                    };
+                    emit_log(&format!("CARLIFE: ✓ CTRL 已连上 MD {host}:{PORT_CTRL}（触摸/硬按键就绪）"));
+                    ctrl_write_loop(stream, queue.clone(), stop_c.clone()).await;
+                    tokio::select! {
+                        _ = stop_c.notified() => return,
+                        _ = tokio::time::sleep(Duration::from_millis(1000)) => {}
+                    }
+                }
+            });
+        }
+
+        emit_state(
+            "carlife_waiting",
+            &format!("CarLife 主动连接模式：目标 MD {md_host}"),
+        );
+        emit_log(&format!(
+            "CARLIFE: 主动连接模式 → MD {md_host}（CMD {PORT_CMD} / VIDEO {PORT_VIDEO} / MEDIA {PORT_MEDIA} / TTS {PORT_TTS} / VR {PORT_VR} / CTRL {PORT_CTRL}）"
+        ));
+
+        Ok((
+            Self {
+                events,
+                touch_tx,
+                cfg,
+                encoder_size,
+            },
+            event_rx,
+        ))
+    }
+
     /// 外部（AirPlay 事件通道）注入触摸 → CarLife CTRL 通道 TOUCH_ACTION。
     pub fn inject_touch(&self, action: u32, x: u32, y: u32) {
-        let mut payload = Vec::with_capacity(12);
-        payload.extend_from_slice(&action.to_be_bytes());
-        payload.extend_from_slice(&x.to_be_bytes());
-        payload.extend_from_slice(&y.to_be_bytes());
+        // 载荷是 protobuf `CarlifeTouchAction`（app/src/main/proto/carlife_ctrl.proto），
+        // **不是**裸结构。参考实现 CarLifeWirelessBox 的 MainActivity.forwardTouchEvent
+        // 里专门标注："⚠️ CarWith 期望 protobuf 格式，不是原始字节！"
+        // 我们之前发 [action u32 BE][x u32 BE][y u32 BE]，手机按 protobuf 解不出来 →
+        // 触摸整段无效（现场 2026-10-23 23:42 定位）。
+        let payload = touch_proto(action, x, y);
+        // 注入可观测性：触摸「没反应」时第一步要能区分"没注入"还是"手机不认这一帧"。
+        static TOUCH_INJECTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = TOUCH_INJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 5 || n % 20 == 0 {
+            emit_log(&format!(
+                "CTRL: 注入触摸 #{n} action={action} x={x} y={y}（CTRL 通道{}）",
+                if self.touch_tx.is_closed() { "已关闭" } else { "在线" }
+            ));
+        }
         let _ = self
             .touch_tx
             .send(build_cmd_frame(CTRL_TOUCH_ACTION, &payload));
@@ -189,6 +363,34 @@ impl CarLifeHub {
 }
 
 // ---------------------------------------------------------------- 帧编解码
+
+/// CarLife 触摸载荷 protobuf（`CarlifeTouchAction`）：
+/// `field1=action`、`field2=x`、`field3=y`、`field4=pointerx`、`field5=pointery`，
+/// 全部 `int32` → 线格式是 varint，tag 依次 0x08/0x10/0x18/0x20/0x28。
+///
+/// 依据：参考实现 `app/src/main/proto/carlife_ctrl.proto` 与
+/// `MainActivity.forwardTouchEvent`（那里明确写着 CarWith 期望 protobuf、不是原始字节）。
+fn touch_proto(action: u32, x: u32, y: u32) -> Vec<u8> {
+    fn varint(mut v: u64, out: &mut Vec<u8>) {
+        while v >= 0x80 {
+            out.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+    }
+    let mut out = Vec::with_capacity(16);
+    out.push(0x08);
+    varint(action as u64, &mut out);
+    out.push(0x10);
+    varint(x as u64, &mut out);
+    out.push(0x18);
+    varint(y as u64, &mut out);
+    out.push(0x20); // pointerx = 0（单指）
+    varint(0, &mut out);
+    out.push(0x28); // pointery = 0
+    varint(0, &mut out);
+    out
+}
 
 /// CMD/CTRL 帧（8 字节头）：`[u16 BE len][u16 reserved][u32 BE type][payload]`。
 fn build_cmd_frame(service_type: u32, payload: &[u8]) -> Vec<u8> {
@@ -901,28 +1103,11 @@ fn spawn_ctrl_channel(
             tokio::select! {
                 _ = stop.notified() => return,
                 accepted = listener.accept() => match accepted {
-                    Ok((mut stream, _)) => {
+                    Ok((stream, _)) => {
                         let _ = stream.set_nodelay(true);
                         emit_log("CARLIFE: ✓ CTRL 通道已接入（触摸/硬按键就绪）");
-                        loop {
-                            let frame = {
-                                let mut q = queue.lock();
-                                if q.is_empty() { None } else { Some(q.remove(0)) }
-                            };
-                            match frame {
-                                Some(f) => {
-                                    if stream.write_all(&f).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                None => {
-                                    tokio::select! {
-                                        _ = stop.notified() => return,
-                                        _ = tokio::time::sleep(Duration::from_millis(8)) => {}
-                                    }
-                                }
-                            }
-                        }
+                        // 与主动连接模式共用同一个出向写循环
+                        ctrl_write_loop(stream, queue.clone(), stop.clone()).await;
                     }
                     Err(_) => return,
                 },
@@ -933,11 +1118,96 @@ fn spawn_ctrl_channel(
 
 // ---------------------------------------------------------------- 通用 accept / 保活
 
+/// 拨号失败日志节流：同一通道每 5s 最多一条。
+///
+/// 不节流的话，主动连接模式下 MD 还没开始监听时每条通道每秒一条、共 6 条/秒，
+/// 几秒钟就把日志刷得没法看（现场 2026-10-23 22:55 就是这么炸的）。
+struct DialLogThrottle(std::time::Instant);
+
+impl DialLogThrottle {
+    fn new() -> Self {
+        // 先减掉窗口，保证第一条失败一定打出来
+        Self(std::time::Instant::now() - Duration::from_secs(10))
+    }
+
+    fn ready(&mut self) -> bool {
+        if self.0.elapsed() >= Duration::from_secs(5) {
+            self.0 = std::time::Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// 拨 MD 的某个通道端口（主动连接模式用）。3s 超时，失败交给调用方重试。
+async fn dial(host: &str, port: u16) -> Result<TcpStream, std::io::Error> {
+    match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect((host, port))).await {
+        Ok(Ok(stream)) => {
+            let _ = stream.set_nodelay(true);
+            Ok(stream)
+        }
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "连接超时（MD 未在监听？）",
+        )),
+    }
+}
+
+/// 只读消费一个连接（VR 通道：保活即可，不消费语义）。
+async fn drain_stream(mut stream: TcpStream) {
+    let mut buf = [0u8; 2048];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(_) => return,
+        }
+    }
+}
+
+/// CTRL 出向写循环：注入帧进队列，客户端在线时按 8ms 节拍刷出。
+async fn ctrl_write_loop(
+    mut stream: TcpStream,
+    queue: Arc<Mutex<Vec<Vec<u8>>>>,
+    stop: Arc<Notify>,
+) {
+    loop {
+        let frame = {
+            let mut q = queue.lock();
+            if q.is_empty() {
+                None
+            } else {
+                Some(q.remove(0))
+            }
+        };
+        match frame {
+            Some(f) => {
+                if stream.write_all(&f).await.is_err() {
+                    return;
+                }
+            }
+            None => {
+                tokio::select! {
+                    _ = stop.notified() => return,
+                    _ = tokio::time::sleep(Duration::from_millis(8)) => {}
+                }
+            }
+        }
+    }
+}
+
 fn bind_tcp(port: u16) -> Result<TcpListener, std::io::Error> {
+    // 绑定地址：默认 127.0.0.1——Android 上 HU 与 MD（CarLife）在同一台设备，
+    // 只走回环，既不暴露端口也符合"本机零转码"的设计。
+    // PC 侧联调（rust-core/hub）时手机是**独立设备**，必须局域网可达：
+    // 由 hypercar-hub 在启动前设 CARLIFE_BIND=0.0.0.0 覆盖。
+    let host = std::env::var("CARLIFE_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
     // 重绑竞争：上一会话刚停时端口可能还在旧任务手里，短重试几次
     let mut last_err = None;
     for _ in 0..15 {
-        match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        match std::net::TcpListener::bind((host.as_str(), port)) {
             Ok(listener) => {
                 listener.set_nonblocking(true)?;
                 return TcpListener::from_std(listener);
@@ -1012,3 +1282,4 @@ fn spawn_drain(port: u16, name: &'static str, stop: Arc<Notify>) {
         }
     });
 }
+
