@@ -139,8 +139,17 @@ object HeadUnitProfiles {
         touchDisplay = null,
         pairingHint = "首次要在 MMI 里选「Apple CarPlay」并确认这台手机（车机会弹提示）",
     )
-    /** 全部内置档案（设置页按此顺序展示）。 */
-    val all: List<HeadUnitProfile> = listOf(BMW_ID85, WINPLAY, AUDI_MIB3)
+    /** 内置档案（出厂就有的，断网也一定在）。 */
+    val builtin: List<HeadUnitProfile> = listOf(BMW_ID85, WINPLAY, AUDI_MIB3)
+
+    /**
+     * 全部可用档案 = 内置 + 远程（GitHub 下发的 `profiles/headunits.json`）。
+     *
+     * 远程同 id 会**覆盖**内置（修内置的错不用发版），远程独有的追加在后面。
+     * 没拉过/拉失败就是纯 [builtin]，行为与以前完全一致。
+     */
+    val all: List<HeadUnitProfile>
+        get() = RemoteProfiles.merge(builtin, RemoteProfiles.cached())
 
     /** 按 id 取档案；未知/空值回落到宝马（默认车型）。 */
     fun byId(id: String?): HeadUnitProfile =
@@ -149,6 +158,7 @@ object HeadUnitProfiles {
     /** 当前设置里选中的档案。 */
     fun current(): HeadUnitProfile = byId(SettingsStore.headUnitProfileId)
 }
+
 
 
 

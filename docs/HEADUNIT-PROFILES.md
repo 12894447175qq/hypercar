@@ -111,3 +111,71 @@ val all: List<HeadUnitProfile> = listOf(BMW_ID85, WINPLAY, AUDI_MIB3)
 - 档案默认值 = 真 iPhone 行为。偏离默认值时，只写"确实不同"的那几项，其余留空。
 - 新增档案不需要改 Rust 侧；除非差异涉及数据面（例如视频封装格式）。
 
+## 5. 远程下发：新增车型不发版
+
+内置档案（`BMW_ID85` / `WINPLAY` / `AUDI_MIB3`）改一次就要重新出包、装 APK。
+为了让「加一台车机」变成纯配置动作，App 支持从 GitHub 拉一份 JSON：
+
+```
+仓库 profiles/headunits.json
+        │  HTTPS（raw.githubusercontent.com，可在设置里改成镜像/私有分支）
+        ▼
+App「车机型号 → 从 GitHub 更新车型列表」
+        │  原文存 SharedPreferences，解析失败就保持旧缓存
+        ▼
+HeadUnitProfiles.all = 内置 ∪ 远程（同 id 覆盖，远程独有追加）
+```
+
+### 5.1 文件格式
+
+顶层可以是 `[ {…}, {…} ]`，也可以（推荐）是带元信息的对象：
+
+```json
+{
+  "version": 1,
+  "updated": "2026-10-25",
+  "profiles": [
+    {
+      "id": "bmw_id85",
+      "label": "BMW iD8.5",
+      "model": "MGU-86 / MGU-55",
+      "notes": "真车实测：车机从不发 0x4301、从不回 0xEA03…",
+      "verified": true,
+      "validatesDeviceId": false,
+      "replyPowerUpdates": true,
+      "preferMdnsAirplay": true,
+      "fallbackAirplayPorts": [7000, 7001, 7100],
+      "pairingHint": "首次要在 iDrive 里把这个设备选成 CarPlay 手机"
+    }
+  ]
+}
+```
+
+字段与 §1 的表格一一对应，**除 `id`、`label` 外都可省略**——省略就取默认值
+（默认值即「真 iPhone 实测行为」）。省略 `verified` 视为 `false`（会显示「未实测」角标），
+这样远程新增的车型不会被误当成已验证。
+
+### 5.2 三条覆盖规则
+
+| 情况 | 行为 |
+|---|---|
+| 远程 id 与内置相同 | **远程覆盖内置**（修内置的错不用发版，用户点一下就好） |
+| 远程 id 是新的 | 追加到列表末尾，条目上标「（远程）」 |
+| 远程配置拉取失败 / 解析失败 | 保持上次缓存；从没拉过就等于只有内置档案 |
+
+### 5.3 加一台新车机的完整动作
+
+1. 按 §2 的四步在 `HeadUnitProfile.kt` 里加档案（本地先调通）。
+2. 把同样的字段补进 `profiles/headunits.json` 的 `profiles` 数组（`verified` 先给 `false`）。
+3. push（纯数据改动，可带 `[skip ci]` 跳过构建）。
+4. 用户在手机「车机型号 → 从 GitHub 更新车型列表」点一下，车型就出现了。
+
+实测校准通过后，把该条目的 `verified` 改成 `true` 再 push 一次即可（同样不发版）。
+
+### 5.4 注意事项
+
+- 下载地址可在 `SettingsStore.remoteProfilesUrl` 覆盖（镜像、私有分支、内网 HTTP 测试都行）；
+  空值 = `https://raw.githubusercontent.com/fw867/hypercar/main/profiles/headunits.json`。
+- **只认配置，不执行代码**：远程档案只是布尔/端口/字符串，不含任何可执行内容。
+- `profiles/headunits.json` 里的 `updated` 字段供人看，App 不解析（避免时钟不准导致误判）。
+- 远程档案同样写进设置页的下拉列表，顺序：内置优先（保持稳定），远程独有在后。

@@ -48,6 +48,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -67,6 +68,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.launch
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -1204,6 +1206,18 @@ private fun WakePackageSection() {
 
 
 
+
+/** 「3 分钟前」这类相对时间；用于远程车型列表的更新时间提示。 */
+private fun agoText(atMillis: Long): String {
+    val minutes = (System.currentTimeMillis() - atMillis) / 60_000
+    return when {
+        minutes < 1 -> "刚刚"
+        minutes < 60 -> "$minutes 分钟前"
+        minutes < 60 * 24 -> "${minutes / 60} 小时前"
+        else -> "${minutes / (60 * 24)} 天前"
+    }
+}
+
 /* ---------- 车机档案（品牌/型号） ---------- */
 
 /**
@@ -1217,6 +1231,13 @@ private fun WakePackageSection() {
 private fun HeadUnitSection(connected: Boolean = false) {
     var selectedId by rememberSaveable { mutableStateOf(SettingsStore.headUnitProfileId) }
     var expanded by rememberSaveable { mutableStateOf(false) }
+    // 远程档案（GitHub 下发）：新增车型不用发版，点一下就能拉到
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    var refreshing by remember { mutableStateOf(false) }
+    var refreshNote by remember { mutableStateOf<String?>(null) }
+    var remoteBump by remember { mutableStateOf(0) }
+    // 读一下 remoteBump：远程档案更新后强制重组，重新取 all（否则列表还是旧的）
+    remoteBump
     val profiles = io.github.hypercar.headunit.HeadUnitProfiles.all
     val current = io.github.hypercar.headunit.HeadUnitProfiles.byId(selectedId)
 
@@ -1296,8 +1317,15 @@ private fun HeadUnitSection(connected: Boolean = false) {
                             text = {
                                 Column {
                                     Text(
-                                        text = "${profile.label} · ${profile.model}" +
-                                            if (profile.verified) "" else "（未实测）",
+                                        text = buildString {
+                                            append(profile.label)
+                                            append(" · ")
+                                            append(profile.model)
+                                            if (io.github.hypercar.headunit.RemoteProfiles.isRemote(profile.id)) {
+                                                append("（远程）")
+                                            }
+                                            if (!profile.verified) append("（未实测）")
+                                        },
                                         style = MaterialTheme.typography.bodyMedium,
                                         color = if (profile.id == selectedId) ElectricCyan else TextPrimary,
                                     )
@@ -1327,6 +1355,59 @@ private fun HeadUnitSection(connected: Boolean = false) {
                             },
                         )
                     }
+                    // ---- 远程档案：GitHub 下发（新增车型不用发版）----
+                    HorizontalDivider(color = StrokeGlass)
+                    DropdownMenuItem(
+                        text = {
+                            Column {
+                                Text(
+                                    text = if (refreshing) "正在更新车型列表…" else "从 GitHub 更新车型列表",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = if (refreshing) TextSecondary else ElectricCyan,
+                                )
+                                Text(
+                                    text = refreshNote ?: run {
+                                        val at = SettingsStore.remoteProfilesFetchedAt
+                                        val count = io.github.hypercar.headunit.RemoteProfiles.cached().size
+                                        if (at <= 0L) {
+                                            "尚未更新过（仅内置 ${io.github.hypercar.headunit.HeadUnitProfiles.builtin.size} 个）"
+                                        } else {
+                                            "已缓存 $count 个远程档案 · ${agoText(at)}"
+                                        }
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (refreshNote?.startsWith("失败") == true) {
+                                        AmberWarning
+                                    } else {
+                                        TextSecondary
+                                    },
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        },
+                        onClick = {
+                            if (!refreshing) {
+                                refreshing = true
+                                refreshNote = "正在下载…"
+                                scope.launch {
+                                    val result = runCatching {
+                                        io.github.hypercar.headunit.RemoteProfiles.refresh()
+                                    }
+                                    refreshing = false
+                                    refreshNote = result.fold(
+                                        onSuccess = { n -> "成功：$n 个档案（新车型已在上方列表）" },
+                                        onFailure = { e -> "失败：${e.message ?: "网络不可用"}（继续用缓存）" },
+                                    )
+                                    if (result.isSuccess) {
+                                        remoteBump++
+                                        io.github.hypercar.settings.SettingsRevision.bump()
+                                        expanded = false
+                                    }
+                                }
+                            }
+                        },
+                    )
                 }
             }
             Spacer(modifier = Modifier.height(8.dp))

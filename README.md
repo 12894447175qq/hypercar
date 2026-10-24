@@ -38,9 +38,15 @@
 | **WinPlay**（PC AirPlay 接收端） | 实测 | 校验 `deviceID`（SETUP 必须带真实蓝牙 MAC）；控制面固定 7000；同时进入「只保 iAP2」模式 |
 | **Audi MIB3**（3315） | **未实测** | 会发 `0x4301`（可能晚到 2 分钟以上）；控制会话 id=1；触摸为 5 字节单指 |
 
-加新品牌 = **加一个 `HeadUnitProfile` 常量 + 注册表一行**，UI 自动多一项；
-字段含义、实测校准步骤、症状→字段对照见
-[docs/HEADUNIT-PROFILES.md](docs/HEADUNIT-PROFILES.md)。
+加新品牌有两条路：
+
+1. **改配置（推荐，不用发版）**：仓库 [`profiles/headunits.json`](profiles/headunits.json) 是车型下发文件，
+   补一条 JSON + push，用户在手机上点「车机型号 → 从 GitHub 更新车型列表」就能拿到新车型。
+   远程同 id 会覆盖内置档案，所以内置档案配错了也能这样修。
+2. **改代码**：加一个 `HeadUnitProfile` 常量 + 注册表一行（改协议行为时才需要）。
+
+字段含义、实测校准步骤、症状→字段对照、远程下发格式见
+[docs/HEADUNIT-PROFILES.md](docs/HEADUNIT-PROFILES.md)（§2 加档案 · §5 远程下发）。
 
 ## 特性
 
@@ -73,8 +79,9 @@
 app/           Android 应用（Kotlin + Compose）：薄壳、iAP2 协商、WiFi/秒连、UI
 rust-core/     Rust 核心层（cdylib）：AirPlay 协商 + CarLife 网关 + 零转码推流
 rust-core/hub/ PC 侧可执行 HU（独立 crate，复用同一套协议源码，不含 JNI）
-               双击即开原生 Win32 参数面板（GUi）；带参数启动仍是命令行
+               双击即开原生 Win32 参数面板（GUI）；带参数启动仍是命令行
 tools/         本地构建脚本 + 预编译的联调工具（hypercar-hub.exe）
+profiles/      车型下发配置（headunits.json）：新增车机改这里，不用发版
 docs/          架构、CarLife 协议、协商对比、编译指南、车机档案、**iPhone 抓包手册**
 ```
 
@@ -85,7 +92,7 @@ docs/          架构、CarLife 协议、协商对比、编译指南、车机档
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 整体架构、数据面/控制面分工 |
 | [docs/CARLIFE-PROTOCOL.md](docs/CARLIFE-PROTOCOL.md) | CarLife 六个端口、握手阶段、消息 ID |
 | [docs/NEGOTIATION-GAPS.md](docs/NEGOTIATION-GAPS.md) | AirPlay 协商差异、真车实测、真 iPhone 对照 |
-| [docs/HEADUNIT-PROFILES.md](docs/HEADUNIT-PROFILES.md) | 车机档案字段、**新增品牌四步走** |
+| [docs/HEADUNIT-PROFILES.md](docs/HEADUNIT-PROFILES.md) | 车机档案字段、**新增品牌四步走**、**远程下发（改 JSON 不发版）** |
 | [docs/IPHONE-HCI-CAPTURE.md](docs/IPHONE-HCI-CAPTURE.md) | **iPhone HCI 抓包手册**（描述文件 → sysdiagnose → .pklg） |
 | [docs/BUILD.md](docs/BUILD.md) | 编译环境、本地出包、CI 标记 |
 
@@ -139,5 +146,6 @@ PC 侧联调工具：
   （其协议笔记与坑位记录来自真车实测）。
 - 「CarLife」为百度商标，本项目仅个人研究用途；CarLife 接收端协议参考了
   apollo-DuerOS（Apache 2.0）与 CarLifeWirelessBox（MIT）的公开资料。
+
 
 

@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "updated": "2026-10-25",
+  "_comment": "HyperCar 车机档案下发文件。新增车型改这里 + push 即可，App 端「从 GitHub 更新车型列表」后立即出现。字段含义见 docs/HEADUNIT-PROFILES.md；除 id/label 外都可省略（省略 = 真 iPhone 实测默认行为）。",
+  "profiles": [
+    {
+      "id": "bmw_id85",
+      "label": "BMW iD8.5",
+      "model": "MGU-86 / MGU-55",
+      "notes": "真车实测：车机从不发 0x4301、从不回 0xEA03；端点靠 ctrl 邀请 + mDNS，失败要保活 iAP2。",
+      "verified": true,
+      "validatesDeviceId": false,
+      "sendCarPlayAvailability": false,
+      "openEaSessions": false,
+      "sendTransportIdentifier": false,
+      "replyPowerUpdates": true,
+      "preferMdnsAirplay": true,
+      "fallbackAirplayPorts": [
+        7000,
+        7001,
+        7100
+      ],
+      "keepIap2AliveOnly": false,
+      "pairingHint": "首次要在 iDrive 里把这个设备选成 CarPlay 手机（车机会弹确认）"
+    },
+    {
+      "id": "winplay",
+      "label": "WinPlay",
+      "model": "PC AirPlay 接收端",
+      "notes": "接收端会校验 deviceID（SETUP 必须带本机真实蓝牙 MAC）；控制面固定 7000，/info 只认 GET。",
+      "verified": true,
+      "validatesDeviceId": true,
+      "replyPowerUpdates": true,
+      "preferMdnsAirplay": false,
+      "fallbackAirplayPorts": [
+        7000
+      ],
+      "touchDisplay": "2732x794",
+      "keepIap2AliveOnly": true,
+      "pairingHint": "先在 WinPlay 点「开始接收」，再让手机连（它不监听时连不上）"
+    },
+    {
+      "id": "audi_mib3",
+      "label": "Audi MIB3",
+      "model": "MIB3 / 3315",
+      "notes": "未实车验证：车机会发 0x4301（可能晚到 2 分钟以上），控制会话 id=1，触摸为 5 字节单指。",
+      "verified": false,
+      "replyPowerUpdates": true,
+      "preferMdnsAirplay": true,
+      "fallbackAirplayPorts": [
+        7000,
+        7001,
+        7100
+      ],
+      "pairingHint": "首次要在 MMI 里选「Apple CarPlay」并确认这台手机（车机会弹提示）"
+    }
+  ]
+}

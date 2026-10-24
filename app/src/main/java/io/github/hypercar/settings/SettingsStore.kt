@@ -29,6 +29,9 @@ object SettingsStore {
     private const val KEY_AUTO_CONNECT = "auto_connect_on_bt"
     private const val KEY_MANUAL_BT_MAC = "manual_bt_mac"
     private const val KEY_HEAD_UNIT = "head_unit_profile"
+    private const val KEY_REMOTE_PROFILES = "head_unit_remote_json"
+    private const val KEY_REMOTE_PROFILES_AT = "head_unit_remote_at"
+    private const val KEY_REMOTE_PROFILES_URL = "head_unit_remote_url"
 
     private const val KEY_WIDTH = "carlife_width"
     private const val KEY_HEIGHT = "carlife_height"
@@ -70,6 +73,26 @@ object SettingsStore {
     var headUnitProfileId: String
         get() = p().getString(KEY_HEAD_UNIT, "bmw_id85") ?: "bmw_id85"
         set(v) = p().edit().putString(KEY_HEAD_UNIT, v).apply()
+
+    /**
+     * 远程车机档案（GitHub 下发的 JSON 原文）。空 = 只用内置档案。
+     *
+     * 存原文而不是解析结果：格式升级时不用管旧数据，解析失败也只是回落到内置表。
+     */
+    var remoteHeadUnitProfilesJson: String
+        get() = p().getString(KEY_REMOTE_PROFILES, "") ?: ""
+        set(v) = p().edit().putString(KEY_REMOTE_PROFILES, v).apply()
+
+    /** 上次成功拉取远程档案的时间戳（0 = 从未拉过），设置页显示「x 分钟前」。 */
+    var remoteProfilesFetchedAt: Long
+        get() = p().getLong(KEY_REMOTE_PROFILES_AT, 0L)
+        set(v) = p().edit().putLong(KEY_REMOTE_PROFILES_AT, v).apply()
+
+    /** 远程档案下载地址（可指向镜像/私有分支）；空 = 用内置默认地址。 */
+    var remoteProfilesUrl: String
+        get() = p().getString(KEY_REMOTE_PROFILES_URL, "") ?: ""
+        set(v) = p().edit().putString(KEY_REMOTE_PROFILES_URL, v).apply()
+
 
     var carlifeWidth: Int
         get() = p().getInt(KEY_WIDTH, 2560)
