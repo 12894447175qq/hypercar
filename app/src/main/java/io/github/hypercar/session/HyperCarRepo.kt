@@ -1,4 +1,4 @@
-package io.github.hypercar.session
+﻿package io.github.hypercar.session
 
 import android.bluetooth.BluetoothDevice
 import android.content.Context
@@ -85,6 +85,14 @@ object HyperCarRepo {
     /** AirPlay 会话是否已建立（冗余端点去重，cardeck「推流中忽略 0x5703/0x4301」教训）。 */
     @Volatile
     private var streaming = false
+
+    /** 本轮连接的计时基准（毫秒）；日志里统一打成 `+Nms`，便于定位慢在哪一步。 */
+    @Volatile
+    private var sessionStageStart: Long = 0L
+
+    /** 相对 [sessionStageStart] 的毫秒数，用于阶段日志前缀。 */
+    private fun stageMs(): Long =
+        if (sessionStageStart == 0L) 0L else System.currentTimeMillis() - sessionStageStart
 
     @Volatile
     private var connecting = false
@@ -188,6 +196,8 @@ object HyperCarRepo {
         }
         connecting = true
         sessionLive.set(true)
+        // 阶段计时基准：之后每条 CONNECT 日志都带 +Nms，一眼看出卡在哪一步
+        sessionStageStart = System.currentTimeMillis()
         push(link = LinkState.Negotiating("检查 Shizuku"))
         connectJob?.cancel()
         connectJob = scope.launch { runConnect(context.applicationContext) }
@@ -314,6 +324,16 @@ object HyperCarRepo {
                 fail("端点无可用 IP（0x5703 有凭据、0x4301 未给出地址）")
                 return
             }
+            // 端点定谳：把「凭什么地址」摊开写清楚（真车排查全靠这一行）
+            log(
+                "CONNECT +${stageMs()}ms 端点确定：$host:${endpoint.airPlayPort}" +
+                    " ssid=${endpoint.ssid ?: "-"}" +
+                    " 有密码=${!endpoint.passphrase.isNullOrBlank()}" +
+                    " ips=${endpoint.ipAddresses}" +
+                    " gateway=${endpoint.gateway ?: "-"}" +
+                    " devId=${endpoint.deviceIdentifier ?: "-"}" +
+                    " srcvers=${endpoint.sourceVersion ?: "-"}",
+            )
             val network = joinAndBind(context, endpoint)
 
             // ---- 连 AirPlay 控制端口并移交 FD ----
@@ -329,6 +349,9 @@ object HyperCarRepo {
             push(link = LinkState.Negotiating("Rust 核心层协商 AirPlay 会话"))
             val identityPath = context.filesDir.resolve("controller_identity.txt").absolutePath
             val json = SettingsStore.engineConfigJson(host, endpoint.airPlayPort.takeIf { it > 0 } ?: 7000, deviceMac, identityPath)
+            // 下发配置原样打一行（不含密钥）：分辨率/帧率/md_host/voice 一目了然，
+            // 免得再靠猜「这次到底请求了多大尺寸、是监听还是拨号」
+            log("CORE +${stageMs()}ms 引擎配置：$json")
             // 前后各记一行：原生崩溃（Rust panic 越过 JNI → SIGABRT）会直接把进程带走，
             // 这两行能区分「崩在 nativeStart 里」还是「崩在引擎跑起来之后」。
             log("CORE: 调用 nativeStart（$host:$port fd=$controlFd）")
@@ -530,10 +553,33 @@ object HyperCarRepo {
                 joinedSsid = ssid
                 joinedNetwork = effective
             }
-            log("WIFI: ✓ 已绑定网络（进程级）${if (network == null) "——注意：这是兜底网络，不一定是车机热点" else ""}")
+            // 绑定后把「实际拿到的网络长什么样」打全：IP/网关/DNS/接口名。
+            // 真车排查最常缺的就是这几个值（例如 DIRECT- 链路没有网关、拿到 169.254 自分配）
+            log(
+                "WIFI +${stageMs()}ms ✓ 已绑定网络（进程级）：${describeNetwork(context, effective)}" +
+                    if (network == null) "——注意：这是兜底网络，不一定是车机热点" else "",
+            )
+        } else {
+            log("WIFI +${stageMs()}ms 没有可绑定的网络（Wi-Fi 未连接/未授权）")
         }
         return effective
     }
+
+    /** 把某个 [Network] 的链路属性压成一行（IP/前缀/网关/DNS/接口），供日志排查。 */
+    private suspend fun describeNetwork(context: Context, network: Network): String = runCatching {
+        val cm = context.getSystemService(ConnectivityManager::class.java)
+        val lp = cm?.getLinkProperties(network)
+        val caps = cm?.getNetworkCapabilities(network)
+        val v4 = lp?.linkAddresses?.filter { it.address is java.net.Inet4Address }
+            ?.joinToString(",") { "${it.address.hostAddress}/${it.prefixLength}" }
+        val v6 = lp?.linkAddresses?.count { it.address is java.net.Inet6Address } ?: 0
+        val gw = lp?.routes?.firstOrNull { it.isDefaultRoute }?.gateway?.hostAddress
+        val dns = lp?.dnsServers?.mapNotNull { it.hostAddress }?.joinToString(",")
+        "if=${lp?.interfaceName ?: "?"} ipv4=[${v4 ?: "-"}] ipv6=${v6} gw=${gw ?: "-"} dns=[${dns ?: "-"}]" +
+            " ssid=${currentWifiSsid(context) ?: "-"}" +
+            " validated=${caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) ?: false}" +
+            " internet=${caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) ?: false}"
+    }.getOrElse { "网络属性读取失败（${it.message}）" }
 
     /** 兜底：拿当前默认网络（连上车机热点但静默路径失败时，Android 可能仍选蜂窝）。 */
     private fun currentDefaultNetwork(context: Context): Network? = runCatching {
@@ -688,23 +734,26 @@ object HyperCarRepo {
         for (network in candidates) {
             val label = if (network == null) "进程默认网络" else "Wi-Fi 网络 #$network"
             if (network != null) runCatching { cm?.bindProcessToNetwork(network) }
+            val startedAt = System.currentTimeMillis()
+            var lastError: String? = null
             val fd = runCatching {
                 val socket = Socket()
                 socket.tcpNoDelay = true
                 socket.connect(InetSocketAddress(host, port), CONTROL_CONNECT_TIMEOUT_MILLIS.toInt())
                 keepAliveForRust(socket)
                 ParcelFileDescriptor.fromSocket(socket).detachFd()
-            }.getOrNull()
+            }.onFailure { lastError = it.javaClass.simpleName + ": " + it.message }.getOrNull()
+            val cost = System.currentTimeMillis() - startedAt
             if (fd != null && fd >= 0) {
                 if (network != null) {
                     boundNetwork = network
                     // 同步给 joiner：它的 onLost 只认自己记录的网络，不同步就解不掉绑定
                     wifiJoiner?.bindProcess(network)
                 }
-                log("NET: ✓ $host:$port 已连通（$label）")
+                log("NET +${stageMs()}ms ✓ $host:$port 已连通（$label，耗时 ${cost}ms，fd=$fd）")
                 return@withContext fd
             }
-            log("NET: 经 $label 连 $host:$port 失败")
+            log("NET +${stageMs()}ms ✗ 经 $label 连 $host:$port 失败（${cost}ms，${lastError ?: "未知原因"}）")
         }
         // 全败：恢复默认绑定，别让进程一直卡在一块无外网的网络上
         runCatching { cm?.bindProcessToNetwork(null) }
@@ -950,6 +999,25 @@ object HyperCarRepo {
                 val next = withTimeoutOrNull(ENDPOINT_TICK_MILLIS) { callbacks.receive() }
                 if (next == null) {
                     ticks++
+                    // ① 车机已经来邀请过（GET /ctrl-int/1/connect）→ 直接用邀请方 IP 当端点。
+                    //    BMW MGU-55 实测：清单里声明「0x4301 不发」，等它是死等；而邀请一旦
+                    //    到达，TCP 对端地址就是车机在热点网段上的地址，AirPlay 控制面在 7000。
+                    val inviteIp = advertiser.lastInvitePeerIp
+                    if (inviteIp != null) {
+                        val base = lastSeen.get()
+                        log("SESSION: ✓ 车机已邀请（$inviteIp）——用它当 AirPlay 端点 :7000")
+                        usable = CarPlayEndpoint(
+                            ssid = base?.ssid,
+                            passphrase = base?.passphrase,
+                            airPlayPort = 7000,
+                            deviceIdentifier = base?.deviceIdentifier,
+                            publicKeyHex = base?.publicKeyHex,
+                            sourceVersion = base?.sourceVersion,
+                            ipAddresses = listOf(inviteIp),
+                            gateway = inviteIp,
+                        )
+                        continue
+                    }
                     // ① 静默网关试探：手机刚连上（或本来就该连）车机热点时，不用等 0x4301——
                     //    车机的 AirPlay 控制面通常就在热点网关的 7000 端口。
                     val ssid = currentWifiSsid(context)
@@ -1425,3 +1493,4 @@ object HyperCarRepo {
     /** 重启时从落盘日志带回环形缓冲的行数（够覆盖崩溃前的一段现场）。 */
     private const val DISK_LOG_TAIL_LINES = 120
 }
+

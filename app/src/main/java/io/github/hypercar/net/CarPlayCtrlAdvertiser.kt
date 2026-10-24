@@ -69,6 +69,18 @@ class CarPlayCtrlAdvertiser(
     var inviteCount: Int = 0
         private set
 
+    /**
+     * 最近一次邀请方的 IP —— **这就是车机在热点网段上的地址**。
+     *
+     * 为什么需要它：BMW（MGU-55 实测）在 0x1d01 清单里明确声明
+     * 「CarPlayStartSession(0x4301)=不发」，所以永远等不到 0x4301 里的端点地址；
+     * 但它会主动来 `GET /ctrl-int/1/connect` 邀请手机，TCP 对端地址就是车机自己。
+     * 于是把「邀请方 IP + 7000」当 AirPlay 端点，是这条链路上唯一可靠的来源。
+     */
+    @Volatile
+    var lastInvitePeerIp: String? = null
+        private set
+
     /** 已注册的端口（-1 = 未启动）。 */
     val port: Int get() = serverSocket?.localPort ?: -1
 
@@ -245,6 +257,9 @@ class CarPlayCtrlAdvertiser(
                         }?.substringAfter(':')
                         ?.trim()
                 inviteCount++
+                if (peer != "?" && peer.contains('.')) {
+                    lastInvitePeerIp = peer
+                }
                 log("$TAG: ✓ 车机 ctrl 邀请（第 $inviteCount 次，receiver=${receiverId ?: "?"}）——AirPlay 窗口已开启")
             }
             val response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
