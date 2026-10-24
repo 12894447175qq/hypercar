@@ -187,3 +187,40 @@ x_编码 = x_hid * 编码宽 / 显示宽
 3. **版本号 3.2** 是 CarLifeWirelessBox 的实测默认值；若某版 CarLife 拒绝，可在
    `PROTOCOL_MAJOR/MINOR` 调整。
 
+### 5.1 HU 侧没有「断开/退出」命令（2026-10-25 核实）
+
+现场问题：手机上的 App 点「断开连接」后，CarLife/CarWith **仍在后台编码推流**。
+
+核实了两种公开资料，结论一致：**CarLife 协议里没有 HU→MD 的退出命令**。
+
+- **CarLifeWirelessBox**（MIT，实现了完整 HU 角色，`role/CarLifeMsg.kt` 列了 33 条
+  HU→MD 消息 + 28 条 MD→HU 消息）：HU 侧清单里**没有 EXIT / DISCONNECT**，
+  最接近的只有 `HU_ERROR_CODE 0x18055`、`HU_MODULE_CONTROL 0x18028`、
+  `GO_TO_FOREGROUND 0x18025`。而 `MD_EXIT 0x10059` 只出现在 MD→HU 方向。
+- 该实现的 `HuRole.disconnect()` 做的事就是**关掉所有通道 + 取消协程**，
+  一个字节都不往手机发；收到 `MD_EXIT` 时反过来 `disconnect("Phone requested exit")`。
+- 仓库里虽然带 `CarlifeDisconnectRequest/Response.proto`，但它们**不挂任何消息号**，
+  属于 CarLife SDK（App ↔ 服务）层面的接口，不在 HU↔MD 线协议里。
+
+因此 HU 侧想「让手机停止投屏」只有两条**间接**手段：
+
+| 手段 | 效果 | 代价 |
+|---|---|---|
+| 关流（`SO_LINGER=0` 发 RST，让对端看到连接异常而不是优雅关闭） | 多数实现会判定会话结束 | 手机可能仍把编码器留着等重连 |
+| 结束手机上的 CarLife/CarWith 进程（`am force-stop`，需 Shizuku 或同机） | 一定停 | 不能用于"短暂离开车"的场景 |
+
+本项目的取舍：**不做任何额外处理，断开就只是关流**（与参考实现一致）。
+
+曾试过两种"更狠"的手段，都已回滚，避免引入副作用：
+
+| 试过的做法 | 为什么不保留 |
+|---|---|
+| 关流时 `SO_LINGER=0` 发 RST | 对端只是更快看到"连接断了"，并不改变它是否退出投屏；反而可能让重连路径表现异常 |
+| 断开时 `am force-stop` 掉 CarLife/CarWith | 能停推流，但"短暂离开车再回来"就秒连不了——违背使用习惯 |
+
+结论：手机端停止投屏应由**它自己**决定（车机断链/用户点 CarLife 的退出）。
+我们从 HU 侧只做关流，不去猜它的状态。
+
+> 之前曾按"HU 侧 = MD 侧 + 0x8000"的位 15 约定猜过 `HU_EXIT = 0x18059`，
+> 实测手机无反应，且与上面两份资料都不符——已从代码中移除，避免继续发无意义的帧。
+
