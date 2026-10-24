@@ -296,6 +296,8 @@ Rust 侧的 `AIRPLAY:` 日志。
 ### 10.1 数据来源与解析方式
 
 iPhone 上抓 `sysdiagnose`，取出 `logs/Bluetooth/bluetoothd-hci-latest.pklg`（Apple PacketLogger 格式）。
+**抓取步骤（描述文件怎么装、按键怎么按、文件在哪）见
+[docs/IPHONE-HCI-CAPTURE.md](IPHONE-HCI-CAPTURE.md)。**
 报文是**明文**，可用如下方式定界：
 
 - 帧同步 `0x40 0x40` 之后是 iAP2 负载；本项目的记录布局是
@@ -368,4 +370,5 @@ StartHID(0x6800)            = 会发
 | `0xAE01` PowerUpdate | **从不回** | **收到 `0xAE00` 立即回 3 条**（原样重放真机字节） | 真机必回；参数语义未定谳，故只重放不解释 |
 | AirPlay 失败后的 iAP2 | 立即拆除（~5s） | **原地重试 6×2.5s，不拆链路** | 真机 ≥34s 不拆；拆除会让车机收起 CarPlay 图标 |
 | AirPlay 端点端口 | 写死 7000 | **mDNS `_airplay._tcp` 优先，失败退 7000/7001/7100** | 车机确实广播该服务（unified log 可见）；写死 7000 收到 `455` |
+
 

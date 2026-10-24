@@ -37,3 +37,9 @@ identity-cache.txt
 gui.ini
 *.identity
 tools/*.identity
+
+# ---- 抓包文件（含隐私，绝不入库）----
+*.pklg
+sysdiagnose*
+*.tar.gz
+
