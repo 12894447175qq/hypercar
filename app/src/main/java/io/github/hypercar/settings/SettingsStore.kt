@@ -28,6 +28,8 @@ object SettingsStore {
     private const val KEY_TARGET_NAME = "target_car_name"
     private const val KEY_AUTO_CONNECT = "auto_connect_on_bt"
     private const val KEY_MANUAL_BT_MAC = "manual_bt_mac"
+    private const val KEY_HEAD_UNIT = "head_unit_profile"
+
     private const val KEY_WIDTH = "carlife_width"
     private const val KEY_HEIGHT = "carlife_height"
     private const val KEY_FPS = "carlife_fps"
@@ -64,6 +66,11 @@ object SettingsStore {
      * 手机在 `VIDEO_ENCODER_INIT_DONE` 里回报实际值后再覆盖——所以设置里的
      * 数值与车机原生分辨率不同也不会影响画质。
      */
+    /** 选中的车机档案 id（见 `headunit/HeadUnitProfile.kt`）；默认宝马 iD8.5。 */
+    var headUnitProfileId: String
+        get() = p().getString(KEY_HEAD_UNIT, "bmw_id85") ?: "bmw_id85"
+        set(v) = p().edit().putString(KEY_HEAD_UNIT, v).apply()
+
     var carlifeWidth: Int
         get() = p().getInt(KEY_WIDTH, 2560)
         set(v) = p().edit().putInt(KEY_WIDTH, v.coerceAtLeast(2)).apply()
@@ -177,3 +184,4 @@ object SettingsStore {
         }
     }
 }
+

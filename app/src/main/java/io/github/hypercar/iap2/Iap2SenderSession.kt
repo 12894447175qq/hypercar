@@ -68,6 +68,9 @@ class Iap2SenderSession(
     private val onEndpoint: (CarPlayEndpoint) -> Unit,
     /** 仅用于 MFi 挑战长度的按车机持久化记忆；null = 只用进程内内存表（纯 JVM 单测）。 */
     private val context: android.content.Context? = null,
+    /** 车机档案：品牌特有的行为差异都从这里读（见 `headunit/HeadUnitProfile.kt`）。 */
+    private val profile: io.github.hypercar.headunit.HeadUnitProfile =
+        io.github.hypercar.headunit.HeadUnitProfiles.BMW_ID85,
 ) {
     private val parser = Iap2Csm.Parser()
 
@@ -238,12 +241,12 @@ class Iap2SenderSession(
         if (eaProtocols.isNotEmpty()) {
             log("iap2 车机声明 EA 协议(${eaProtocols.size})=" + eaProtocols.joinToString { "${it.protocolId}:${it.name}" })
         }
-        if (!ENABLE_EA_SESSIONS) {
+        if (!profile.openEaSessions) {
             // 2026-10-24 iPhone HCI 对照：真 iPhone **一个 0xEA00 都不发**，车机也从不回 0xEA03。
             // 我们发 8 条、全无应答，只会让车机的状态机多走一遍不确定分支。
             // CarPlay 的媒体面走 AirPlay（Wi-Fi），不依赖 EA 隧道，故默认关闭；
             // 若哪天需要 EA 隧道（例如 iD9 的 ap 信息走 EA），把常量改 true 即恢复。
-            if (eaProtocols.isNotEmpty()) log("iap2 跳过 0xea00 EA 会话（默认关闭，对齐真 iPhone 行为）")
+            if (eaProtocols.isNotEmpty()) log("iap2 跳过 0xea00 EA 会话（档案 ${profile.id} 不要求，对齐真 iPhone 行为）")
         } else {
             for (protocol in eaProtocols) {
                 sendFireAndForget(Iap2MessageIds.EA_OPEN_SESSION, Iap2Messages.eaOpenSession(protocol.protocolId, protocol.name))
@@ -341,10 +344,20 @@ class Iap2SenderSession(
         // （0x4c01 0x4c04 0x4e09 0x4e0a 0x4e0b 0x4e0c 0x4e0d 0x5001 0x5702 0x6801 0xae01 0xea00 0xea01）。
         // 对没有该能力的车机硬发，可能把它推进「会话已请求」的状态——之后 AirPlay 侧
         // `GET /info` 就回 `455 Method Not Valid In This State`（真车 2026-10-24 实测）。
-        if (ident.declaresReceive(Iap2MessageIds.CARPLAY_AVAILABILITY) != false) {
+        if (profile.sendCarPlayAvailability &&
+            ident.declaresReceive(Iap2MessageIds.CARPLAY_AVAILABILITY) != false
+        ) {
             sendFireAndForget(Iap2MessageIds.CARPLAY_AVAILABILITY, Iap2Messages.carPlayAvailability(bluetoothMac))
+            log("iap2 tx=0x4300 CarPlayAvailability（档案 ${profile.id} 要求且车机可收）")
         } else {
-            log("iap2 车机未声明可收 0x4300（CarPlayAvailability）——跳过不发（对齐真 iPhone 行为）")
+            log(
+                "iap2 跳过 0x4300（CarPlayAvailability）——" +
+                    if (!profile.sendCarPlayAvailability) {
+                        "档案 ${profile.id} 不要求（对齐真 iPhone：iPhone 从不发）"
+                    } else {
+                        "车机未声明可收"
+                    },
+            )
         }
         val declaresStartSession = ident.declaresSend(Iap2MessageIds.CARPLAY_START_SESSION)
         // 没拿到 0x5703（新协议车机）时 0x4301 是**唯一** AP 来源——窗口给足；
@@ -407,11 +420,11 @@ class Iap2SenderSession(
         // 但 2026-10-24 用真 iPhone 的 HCI 日志对照：真 iPhone **不发 0x4E0E**
         // （只发 4E09/4E0A/4E0B/4E0C），MGU-55 也只是 ACK 掉。
         // 为减少与真机行为的差异，默认不发；需要时把 SEND_TRANSPORT_IDENTIFIER 改 true。
-        if (SEND_TRANSPORT_IDENTIFIER) {
+        if (profile.sendTransportIdentifier) {
             sendFireAndForget(Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER, Iap2Csm.string(0, bluetoothMac))
             log("iap2 tx=0x4e0e 设备传输标识（mac=$bluetoothMac）")
         } else {
-            log("iap2 跳过 0x4e0e 传输标识（默认关闭，对齐真 iPhone 行为）")
+            log("iap2 跳过 0x4e0e 传输标识（档案 ${profile.id} 不要求，对齐真 iPhone 行为）")
         }
         log(
             if (endpoint.ssid.isNullOrEmpty() && endpoint.ipAddresses.isEmpty()) {
@@ -1078,3 +1091,4 @@ class Iap2SenderSession(
         return remaining.coerceIn(0, 60_000L)
     }
 }
+

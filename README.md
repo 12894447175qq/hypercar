@@ -1,4 +1,4 @@
-# HyperCar
+﻿# HyperCar
 
 **CarPlay + CarLife 零转码网关** —— 让 HyperOS 手机（Android 17）上的 CarLife / 小米
 CarWith 产出的 H.264 与 PCM，经 **Rust 核心层**零转码直推 AirPlay 接收端
@@ -37,6 +37,8 @@ CarWith 产出的 H.264 与 PCM，经 **Rust 核心层**零转码直推 AirPlay 
   采集经 VR 通道（`VR_MIC_DATA 0x58001`）推给 MD；也可在车机端设置里切到
   「手机麦克风录音」由 CarLife 自己录。
 - **可调编码分辨率**：设置页直接填宽/高（默认 2560×744），手机回报实际尺寸后自动跟随。
+- **按车机型号配置**：品牌差异收敛在「车机档案」里（内置 BMW iD8.5 / WinPlay），
+  设置页可切换；新增品牌见 [docs/HEADUNIT-PROFILES.md](docs/HEADUNIT-PROFILES.md)。
 - **现代 UI**：Compose 深空黑 + 电光青 + 玻璃拟态，状态大卡 + 实时统计 +
   免 adb 诊断日志，内置「首次连接」引导。
 
@@ -47,7 +49,7 @@ app/          Android 应用（Kotlin + Compose）：薄壳、iAP2 协商、WiFi
 rust-core/    Rust 核心层（cdylib）：AirPlay 协商 + CarLife 网关 + 零转码推流
 rust-core/hub/ PC 侧可执行 HU（独立 crate，复用同一套协议源码，不含 JNI）
 tools/        本地构建脚本（build-local.ps1 / .cmd）
-docs/         架构、CarLife 协议、协商对比、编译指南
+docs/         架构、CarLife 协议、协商对比、编译指南、**车机档案（新增品牌）**
 ```
 
 ## 快速开始
@@ -92,3 +94,4 @@ cargo build --release
   （其协议笔记与坑位记录来自真车实测）。
 - 「CarLife」为百度商标，本项目仅个人研究用途；CarLife 接收端协议参考了
   apollo-DuerOS（Apache 2.0）与 CarLifeWirelessBox（MIT）的公开资料。
+

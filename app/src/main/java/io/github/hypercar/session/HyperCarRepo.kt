@@ -155,6 +155,10 @@ object HyperCarRepo {
     @Volatile
     private var sessionDeviceMac: String = ""
 
+    /** 当前车机档案（设置里可切换；每次连接重新读取）。 */
+    private val headUnitProfile: io.github.hypercar.headunit.HeadUnitProfile
+        get() = io.github.hypercar.headunit.HeadUnitProfiles.current()
+
     /** 相对 [sessionStageStart] 的毫秒数，用于阶段日志前缀。 */
     private fun stageMs(): Long =
         if (sessionStageStart == 0L) 0L else System.currentTimeMillis() - sessionStageStart
@@ -407,14 +411,19 @@ object HyperCarRepo {
 
             // ---- 定端口：mDNS 自报优先，拿不到再试 7000/7001/7100 ----
             push(link = LinkState.Negotiating("查找车机 AirPlay 服务"))
-            val mdnsEndpoint = AirplayServiceProbe(context, ::log).browse(boundNetwork)
+            // 车机档案决定端口策略：宝马走 mDNS（车机确实广播 _airplay._tcp），
+            // WinPlay 是固定 7000 的普通接收端——先问 mDNS 只会白等 3 秒。
+            val headUnit = headUnitProfile
+            val mdnsEndpoint = if (headUnit.preferMdnsAirplay) {
+                AirplayServiceProbe(context, ::log).browse(boundNetwork)
+            } else {
+                null
+            }
             val apHost = mdnsEndpoint?.host ?: host
-            // 车机不广播（或局域网屏蔽多播）时的兜底：先 7000（AirPlay 惯例），
-            // 再 7001/7100（部分车机把控制面挪到这两个）。
             val candidatePorts = if (mdnsEndpoint != null) {
                 listOf(mdnsEndpoint.port)
             } else {
-                listOf(7000, 7001, 7100).distinct()
+                headUnit.fallbackAirplayPorts.distinct().ifEmpty { listOf(7000) }
             }
             log(
                 "CONNECT +${stageMs()}ms AirPlay 目标：" +
@@ -1629,6 +1638,7 @@ object HyperCarRepo {
     /** 重启时从落盘日志带回环形缓冲的行数（够覆盖崩溃前的一段现场）。 */
     private const val DISK_LOG_TAIL_LINES = 120
 }
+
 
 
 

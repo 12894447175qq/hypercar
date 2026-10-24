@@ -250,11 +250,22 @@ internal fun FirstConnectGuideCard(modifier: Modifier = Modifier) {
         modifier = modifier.fillMaxWidth(),
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 14.dp),
     ) {
-        Text(
-            text = "首次连接（只需做一次）",
-            style = MaterialTheme.typography.titleSmall,
-            color = TextPrimary,
-        )
+        // 车机档案：品牌/型号决定这套协议按谁的习惯跑，引导里必须点名，
+        // 否则用户不知道自己选的对不对（设置里可改）。
+        val headUnit = io.github.hypercar.headunit.HeadUnitProfiles.current()
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = "首次连接（只需做一次）",
+                style = MaterialTheme.typography.titleSmall,
+                color = TextPrimary,
+            )
+            Spacer(modifier = Modifier.weight(1f))
+            Text(
+                text = "车机：${headUnit.label}",
+                style = MaterialTheme.typography.labelSmall,
+                color = io.github.hypercar.ui.theme.ElectricCyan,
+            )
+        }
         Spacer(modifier = Modifier.height(8.dp))
         Text(
             text = "① 车机侧开始接收（PC/WinPlay 联调时先在 PC 上起 hub）\n" +
@@ -264,7 +275,35 @@ internal fun FirstConnectGuideCard(modifier: Modifier = Modifier) {
             style = MaterialTheme.typography.bodySmall,
             color = TextSecondary,
         )
+        if (!headUnit.pairingHint.isNullOrBlank()) {
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = "这台车机：" + headUnit.pairingHint,
+                style = MaterialTheme.typography.labelSmall,
+                color = TextSecondary,
+            )
+        }
         Spacer(modifier = Modifier.height(8.dp))
+        // 适配新车型的说明在仓库文档里：给一个可点的入口
+        Spacer(modifier = Modifier.height(6.dp))
+        val context = androidx.compose.ui.platform.LocalContext.current
+        Text(
+            text = "换车机 / 新增品牌？看「车机档案」说明 →",
+            style = MaterialTheme.typography.labelSmall,
+            color = io.github.hypercar.ui.theme.ElectricCyan,
+            modifier = Modifier.clickable {
+                runCatching {
+                    context.startActivity(
+                        android.content.Intent(
+                            android.content.Intent.ACTION_VIEW,
+                            android.net.Uri.parse(
+                                "https://github.com/fw867/hypercar/blob/main/docs/HEADUNIT-PROFILES.md",
+                            ),
+                        ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                    )
+                }
+            },
+        )
         Text(
             text = "做完这一次，同一台车以后会自动回连。第 ④ 步「开始连接」" +
                 "只有在 CarWith 检测到车机蓝牙时才可用；列表为空就回第 ① 步确认车机在接收。",

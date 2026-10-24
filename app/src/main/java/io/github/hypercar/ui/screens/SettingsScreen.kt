@@ -1,4 +1,4 @@
-package io.github.hypercar.ui.screens
+﻿package io.github.hypercar.ui.screens
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -34,6 +34,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
@@ -119,6 +120,7 @@ fun SettingsScreen(modifier: Modifier = Modifier) {
         BehaviorSection()
         WakePackageSection()
         // ---- 一次性配置 ----
+        HeadUnitSection()
         TargetCarSection()
         PermissionSettingsSection()
         // ---- 高级 ----
@@ -1117,3 +1119,81 @@ private fun WakePackageSection() {
 }
 
 
+
+/* ---------- 车机档案（品牌/型号） ---------- */
+
+/**
+ * 车机档案选择：把品牌差异收敛到 `headunit/HeadUnitProfile.kt` 的档案里。
+ *
+ * 用户只需选「哪台车机」，其余行为（是否校验 deviceID、端口策略、
+ * 0x4300/0xEA00/0x4E0E/0xAE01 的支持情况、触摸像素空间）由档案给出，
+ * 新增品牌不需要改这里，只在 [io.github.hypercar.headunit.HeadUnitProfiles.all] 注册。
+ */
+@Composable
+private fun HeadUnitSection() {
+    var selectedId by rememberSaveable { mutableStateOf(SettingsStore.headUnitProfileId) }
+    val profiles = io.github.hypercar.headunit.HeadUnitProfiles.all
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        SectionLabel(text = "车机型号")
+        GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp)) {
+            Text(
+                text = "决定这套协议按哪台车机的习惯跑（iAP2 支持哪些消息、AirPlay 端口怎么找、" +
+                    "触摸坐标按谁的空间算）。选错的典型表现是「能连上但点不准」或「车机上没有 CarPlay 图标」。",
+                style = MaterialTheme.typography.bodySmall,
+                color = TextSecondary,
+            )
+            Spacer(modifier = Modifier.height(10.dp))
+            profiles.forEach { profile ->
+                val selected = profile.id == selectedId
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable {
+                            selectedId = profile.id
+                            SettingsStore.headUnitProfileId = profile.id
+                        }
+                        .padding(vertical = 10.dp, horizontal = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    RadioButton(
+                        selected = selected,
+                        onClick = {
+                            selectedId = profile.id
+                            SettingsStore.headUnitProfileId = profile.id
+                        },
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = "${profile.label} · ${profile.model}",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = if (selected) ElectricCyan else TextPrimary,
+                            )
+                            if (!profile.verified) {
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "未实测",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = AmberWarning,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .background(AmberWarning.copy(alpha = 0.12f))
+                                        .padding(horizontal = 6.dp, vertical = 2.dp),
+                                )
+                            }
+                        }
+                        Text(
+                            text = profile.notes,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = TextSecondary,
+                            maxLines = 3,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}

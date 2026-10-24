@@ -1,4 +1,4 @@
-package io.github.hypercar.iap2
+﻿package io.github.hypercar.iap2
 
 import android.Manifest
 import android.annotation.SuppressLint
@@ -747,3 +747,4 @@ private class RfcommLinkChannel(
         val POISON = ByteArray(0)
     }
 }
+
