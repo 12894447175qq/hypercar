@@ -1,5 +1,6 @@
-# HyperCar —— 每次 push 自动构建**正式签名**的 Release APK；
+﻿# HyperCar —— 每次 push 自动构建**正式签名**的 Release APK；
 # **提交信息带 `[release]`（或 `[publish]`）时才发布 GitHub Release**，其余 push 只进 Artifacts。
+# **提交信息带 `[skip ci]` 时整条流水线不跑**（只改文档/注释时用）。
 #
 # 与 CarDeck CI 的差异：构建前多一步 **Rust 核心层交叉编译**（cargo-ndk →
 # app/src/main/jniLibs/arm64-v8a/libhypercar_core.so），其余发布判定/签名闸门/
@@ -50,6 +51,8 @@ concurrency:
 jobs:
   build:
     name: 构建正式签名 APK
+    # 提交信息里带 [skip ci] 就整条流水线不跑（只改文档/注释时省 CI 时间）
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
     runs-on: ubuntu-latest
     timeout-minutes: 55 # 比 CarDeck 多一步 Rust 交叉编译
     steps:
@@ -346,3 +349,4 @@ jobs:
             app/build/test-results/**
           if-no-files-found: ignore
           retention-days: 7
+
