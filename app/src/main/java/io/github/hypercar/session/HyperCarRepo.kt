@@ -18,6 +18,7 @@ import io.github.hypercar.core.VideoStats
 import io.github.hypercar.iap2.CarPlayEndpoint
 import io.github.hypercar.iap2.Iap2Coordinator
 import io.github.hypercar.net.BluetoothMac
+import io.github.hypercar.net.AirplayServiceProbe
 import io.github.hypercar.net.CarPlayCtrlAdvertiser
 import io.github.hypercar.net.SpecifierPermissions
 import io.github.hypercar.net.WifiJoiner
@@ -31,6 +32,7 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.isActive
@@ -86,9 +88,72 @@ object HyperCarRepo {
     @Volatile
     private var streaming = false
 
+    /**
+     * AirPlay 协商失败时的「原地重试」：**不拆 iAP2 链路**，重开控制 socket 再谈一次。
+     *
+     * 依据（2026-10-24 真车 + 版本对照）：车机的 CarPlay 图标与窗口挂在 iAP2 会话上。
+     * 旧行为是 AirPlay 一失败就 [fail] → 拆 BT/Wi-Fi，车机立刻把图标收回去；
+     * 用户看到的现象正是「装了新版本后车机上没有 CarPlay 图标了」。
+     * 现在保留链路、按 2.5s 间隔重试 [AIRPLAY_MAX_ATTEMPTS] 次，仍不行才真失败。
+     */
+    private fun retryAirplayOrFail(detail: String) {
+        val host = airplayHost
+        val port = airplayPort
+        val canRetry = host != null && port > 0 && airplayAttempts < AIRPLAY_MAX_ATTEMPTS && sessionLive.get()
+        if (!canRetry) {
+            fail(detail)
+            return
+        }
+        airplayAttempts++
+        val attempt = airplayAttempts
+        log(
+            "SESSION: AirPlay 协商失败（$detail）——保留 iAP2 链路（车机继续显示 CarPlay），" +
+                "第 $attempt/$AIRPLAY_MAX_ATTEMPTS 次原地重试",
+        )
+        push(link = LinkState.Negotiating("AirPlay 重试 $attempt/$AIRPLAY_MAX_ATTEMPTS"))
+        scope.launch {
+            runCatching { RustCoreBridge.nativeStop() }
+            delay(AIRPLAY_RETRY_DELAY_MILLIS)
+            if (!sessionLive.get()) return@launch
+            val context = appContext() ?: return@launch
+            val fd = openControlFd(context, host!!, port)
+            if (fd == null || fd < 0) {
+                retryAirplayOrFail("控制端口重连失败 $host:$port")
+                return@launch
+            }
+            val identityPath = context.filesDir.resolve("controller_identity.txt").absolutePath
+            val json = SettingsStore.engineConfigJson(host, port, sessionDeviceMac, identityPath)
+            log("CORE: 重试 nativeStart（$host:$port fd=$fd，第 $attempt 次）")
+            val started = RustCoreBridge.nativeStart(json, fd, socketProvider)
+            log("CORE: 重试 nativeStart 返回 $started")
+            if (!started) retryAirplayOrFail("核心层重启失败")
+        }
+    }
+
     /** 本轮连接的计时基准（毫秒）；日志里统一打成 `+Nms`，便于定位慢在哪一步。 */
     @Volatile
     private var sessionStageStart: Long = 0L
+
+    /**
+     * AirPlay 侧已确定的端点与重试计数（失败重试用）。
+     *
+     * 为什么要重试而不是直接失败：车机的 CarPlay 图标/窗口与 **iAP2 链路的存活**绑定。
+     * 2026-10-24 实测：拿到 ctrl 邀请后 AirPlay 若在 ~5s 内失败，我们会立刻拆 iAP2、
+     * 车机随即把 CarPlay 图标收回去——表现为「车机上根本看不到我们的 CarPlay」。
+     * 保留链路、原地重试，车机才会一直把窗口开着，也才有机会把 /info 走通。
+     */
+    @Volatile
+    private var airplayHost: String? = null
+
+    @Volatile
+    private var airplayPort: Int = 0
+
+    @Volatile
+    private var airplayAttempts: Int = 0
+
+    /** 本机蓝牙 MAC（AirPlay 重试时重建引擎配置要用）。 */
+    @Volatile
+    private var sessionDeviceMac: String = ""
 
     /** 相对 [sessionStageStart] 的毫秒数，用于阶段日志前缀。 */
     private fun stageMs(): Long =
@@ -245,6 +310,7 @@ object HyperCarRepo {
             // 所以这里明确区分「真实 MAC」和「伪 MAC」，伪 MAC 时把后果写进日志。
             val realMac = BluetoothMac.resolve()
             val deviceMac = realMac ?: BluetoothMac.resolveOrStable()
+            sessionDeviceMac = deviceMac
             if (realMac == null) {
                 log(
                     "BT: ⚠ 未解析到真实蓝牙 MAC，本次用伪 ID $deviceMac——" +
@@ -335,26 +401,61 @@ object HyperCarRepo {
                     " srcvers=${endpoint.sourceVersion ?: "-"}",
             )
             val network = joinAndBind(context, endpoint)
+            // 车机上还有哪些端口在听？AirPlay 控制面未必是 7000（真车 455 之后需要这个答案）。
+            // 只探测、不改变行为，结果进日志。
+            probeCarPorts(context, host)
+
+            // ---- 定端口：mDNS 自报优先，拿不到再试 7000/7001/7100 ----
+            push(link = LinkState.Negotiating("查找车机 AirPlay 服务"))
+            val mdnsEndpoint = AirplayServiceProbe(context, ::log).browse(boundNetwork)
+            val apHost = mdnsEndpoint?.host ?: host
+            // 车机不广播（或局域网屏蔽多播）时的兜底：先 7000（AirPlay 惯例），
+            // 再 7001/7100（部分车机把控制面挪到这两个）。
+            val candidatePorts = if (mdnsEndpoint != null) {
+                listOf(mdnsEndpoint.port)
+            } else {
+                listOf(7000, 7001, 7100).distinct()
+            }
+            log(
+                "CONNECT +${stageMs()}ms AirPlay 目标：" +
+                    if (mdnsEndpoint != null) {
+                        "$apHost:${mdnsEndpoint.port}（mDNS _airplay._tcp，实例=${mdnsEndpoint.instance}" +
+                            (mdnsEndpoint.model?.let { "，model=$it" } ?: "") + "）"
+                    } else {
+                        "$apHost 候选端口=$candidatePorts（mDNS 未拿到，逐个试连）"
+                    },
+            )
+            airplayHost = apHost
+            airplayAttempts = 0
 
             // ---- 连 AirPlay 控制端口并移交 FD ----
             push(link = LinkState.Negotiating("连接车机 AirPlay 端口"))
-            val port = endpoint.airPlayPort.takeIf { it > 0 } ?: 7000
-            val controlFd = openControlFd(context, host, port)
-            if (controlFd == null || controlFd < 0) {
-                fail("AirPlay 控制端口连接失败 $host:$port（默认网络/Wi-Fi 网络都试过了）")
+            var port = 0
+            var controlFd: Int? = null
+            for (candidate in candidatePorts) {
+                val fd = openControlFd(context, apHost, candidate)
+                if (fd != null && fd >= 0) {
+                    port = candidate
+                    controlFd = fd
+                    break
+                }
+            }
+            if (controlFd == null || controlFd < 0 || port == 0) {
+                fail("AirPlay 控制端口连接失败 $apHost（试过 $candidatePorts）")
                 return
             }
+            airplayPort = port
 
             // ---- 启动 Rust 引擎（协商在 Rust 内继续）----
             push(link = LinkState.Negotiating("Rust 核心层协商 AirPlay 会话"))
             val identityPath = context.filesDir.resolve("controller_identity.txt").absolutePath
-            val json = SettingsStore.engineConfigJson(host, endpoint.airPlayPort.takeIf { it > 0 } ?: 7000, deviceMac, identityPath)
+            val json = SettingsStore.engineConfigJson(apHost, port, deviceMac, identityPath)
             // 下发配置原样打一行（不含密钥）：分辨率/帧率/md_host/voice 一目了然，
             // 免得再靠猜「这次到底请求了多大尺寸、是监听还是拨号」
             log("CORE +${stageMs()}ms 引擎配置：$json")
             // 前后各记一行：原生崩溃（Rust panic 越过 JNI → SIGABRT）会直接把进程带走，
             // 这两行能区分「崩在 nativeStart 里」还是「崩在引擎跑起来之后」。
-            log("CORE: 调用 nativeStart（$host:$port fd=$controlFd）")
+            log("CORE: 调用 nativeStart（$apHost:$port fd=$controlFd）")
             val started = RustCoreBridge.nativeStart(json, controlFd, socketProvider)
             log("CORE: nativeStart 返回 $started")
             if (!started) {
@@ -580,6 +681,35 @@ object HyperCarRepo {
             " validated=${caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) ?: false}" +
             " internet=${caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) ?: false}"
     }.getOrElse { "网络属性读取失败（${it.message}）" }
+
+    /**
+     * 车机端口快探（只写日志，不改变行为）。
+     *
+     * 为什么需要：真车（BMW MGU-55）在 7000 端口上对 `GET /info` 回 455，
+     * 说明「有个 RTSP 服务在听，但不是我们能用的那个状态」。AirPlay 接收端
+     * 也可能在 7001/7100/5000/62078 上（Roku/Apple TV/BMW 各家不同），
+     * 扫一遍把「哪些端口活着」记下来，比盲猜快。
+     */
+    private fun probeCarPorts(context: Context, host: String) {
+        scope.launch(Dispatchers.IO) {
+            val ports = listOf(7000, 7001, 7100, 5000, 62078)
+            val network = boundNetwork
+            val results = ports.map { port ->
+                val startedAt = System.currentTimeMillis()
+                val ok = runCatching {
+                    val socket = Socket()
+                    socket.tcpNoDelay = true
+                    if (network != null) network.bindSocket(socket)
+                    socket.connect(InetSocketAddress(host, port), 600)
+                    socket.close()
+                    true
+                }.getOrDefault(false)
+                val cost = System.currentTimeMillis() - startedAt
+                "${port}=${if (ok) "开(${cost}ms)" else "关"}"
+            }
+            log("PROBE 车机端口 $host → ${results.joinToString(" ")}")
+        }
+    }
 
     /** 兜底：拿当前默认网络（连上车机热点但静默路径失败时，Android 可能仍选蜂窝）。 */
     private fun currentDefaultNetwork(context: Context): Network? = runCatching {
@@ -832,7 +962,7 @@ object HyperCarRepo {
                 "carlife_waiting" -> push(carLife = CarLifeState.Waiting())
                 // Rust 侧 CarLife 14 步握手完成（VIDEO_ENCODER_START 已发）
                 "carlife_active" -> push(carLife = CarLifeState.Active())
-                "failed" -> fail(detail)
+                "failed" -> retryAirplayOrFail(detail)
                 "ended" -> {
                     scope.launch { runDisconnect(detail) }
                 }
@@ -1451,6 +1581,12 @@ object HyperCarRepo {
      */
     private const val ENDPOINT_TIMEOUT_MILLIS = 300_000L
 
+    /** AirPlay 协商失败后原地重试的次数上限（不拆 iAP2 链路，保持车机 CarPlay 窗口）。 */
+    private const val AIRPLAY_MAX_ATTEMPTS = 6
+
+    /** 两次 AirPlay 重试之间的间隔。 */
+    private const val AIRPLAY_RETRY_DELAY_MILLIS = 2_500L
+
     /** 同一次 ACL 事件会被 receiver 与 service 各转交一次：这段时间内只记一行。 */
     private const val ACL_EVENT_LOG_DEDUPE_MILLIS = 1_500L
 
@@ -1493,4 +1629,7 @@ object HyperCarRepo {
     /** 重启时从落盘日志带回环形缓冲的行数（够覆盖崩溃前的一段现场）。 */
     private const val DISK_LOG_TAIL_LINES = 120
 }
+
+
+
 

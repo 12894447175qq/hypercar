@@ -84,6 +84,9 @@ class Iap2SenderSession(
      */
     private val pendingFrames = ArrayDeque<Iap2Csm.Frame>()
 
+    /** 是否已经打过「开始回应电源更新」的日志（车机周期发 0xAE00，日志只留第一条）。 */
+    private var powerUpdateReplied = false
+
     /** 暂存区上限：车机订阅类消息可能在长等待期间持续到达，无上限会吃内存。 */
     private val maxPendingFrames = 256
     private var pendingOverflowLogged = false
@@ -158,6 +161,20 @@ class Iap2SenderSession(
 
         /** 0xEA00 没被 0xEA03 确认时最多补开几轮（再多会变成骚扰车机）。 */
         const val EA_REOPEN_ATTEMPTS = 6
+        /**
+         * 是否开 iAP2 EA 会话（0xEA00）。
+         *
+         * 2026-10-24 用真 iPhone 的 HCI 日志对照：iPhone 一个都不发，车机也从不回 0xEA03；
+         * CarPlay 的媒体面走 AirPlay（Wi-Fi），不依赖 EA 隧道。默认关闭以减少与车机状态机的分歧；
+         * 若某车型确实需要 EA 隧道，改 true 即恢复（EA_REOPEN_ATTEMPTS 的重发逻辑一并生效）。
+         */
+        const val ENABLE_EA_SESSIONS = false
+        /**
+     * 是否发 0x4E0E（设备传输标识）。
+     *
+     * 真 iPhone 不发它（HCI 实测），MGU-55 也只是 ACK，故默认关闭。
+     */
+        const val SEND_TRANSPORT_IDENTIFIER = false
 
         /** 未知消息体 dump 上限（够看清 TLV 结构，又不刷屏）。 */
         const val BODY_DUMP_BYTES = 256
@@ -221,9 +238,17 @@ class Iap2SenderSession(
         if (eaProtocols.isNotEmpty()) {
             log("iap2 车机声明 EA 协议(${eaProtocols.size})=" + eaProtocols.joinToString { "${it.protocolId}:${it.name}" })
         }
-        for (protocol in eaProtocols) {
-            sendFireAndForget(Iap2MessageIds.EA_OPEN_SESSION, Iap2Messages.eaOpenSession(protocol.protocolId, protocol.name))
-            log("iap2 tx=0xea00 startEASession protocol=${protocol.protocolId} name=${protocol.name}")
+        if (!ENABLE_EA_SESSIONS) {
+            // 2026-10-24 iPhone HCI 对照：真 iPhone **一个 0xEA00 都不发**，车机也从不回 0xEA03。
+            // 我们发 8 条、全无应答，只会让车机的状态机多走一遍不确定分支。
+            // CarPlay 的媒体面走 AirPlay（Wi-Fi），不依赖 EA 隧道，故默认关闭；
+            // 若哪天需要 EA 隧道（例如 iD9 的 ap 信息走 EA），把常量改 true 即恢复。
+            if (eaProtocols.isNotEmpty()) log("iap2 跳过 0xea00 EA 会话（默认关闭，对齐真 iPhone 行为）")
+        } else {
+            for (protocol in eaProtocols) {
+                sendFireAndForget(Iap2MessageIds.EA_OPEN_SESSION, Iap2Messages.eaOpenSession(protocol.protocolId, protocol.name))
+                log("iap2 tx=0xea00 startEASession protocol=${protocol.protocolId} name=${protocol.name}")
+            }
         }
         if (eaProtocols.isNotEmpty() && ident.declaresSend(Iap2MessageIds.EA_SESSION_STATUS) != false) {
             // 探 800ms 的 0xEA03 并记日志——回没回一眼可见（§9j 处置 1）
@@ -310,7 +335,17 @@ class Iap2SenderSession(
         // ---- CarPlay 会话启动 ----
         // 0x4300 发后不管：Audi 实测车机曾对它停止 ACK（其余包毫秒级 ACK），
         // 计入重传清单会让看门狗在 +20s 杀掉整条蓝牙链路。
-        sendFireAndForget(Iap2MessageIds.CARPLAY_AVAILABILITY, Iap2Messages.carPlayAvailability(bluetoothMac))
+        //
+        // **只在车机声明可收时才发**（2026-10-24 iPhone HCI 对照）：
+        // 真 iPhone 从不发 0x4300；BMW MGU-55 的接收清单里也没有它
+        // （0x4c01 0x4c04 0x4e09 0x4e0a 0x4e0b 0x4e0c 0x4e0d 0x5001 0x5702 0x6801 0xae01 0xea00 0xea01）。
+        // 对没有该能力的车机硬发，可能把它推进「会话已请求」的状态——之后 AirPlay 侧
+        // `GET /info` 就回 `455 Method Not Valid In This State`（真车 2026-10-24 实测）。
+        if (ident.declaresReceive(Iap2MessageIds.CARPLAY_AVAILABILITY) != false) {
+            sendFireAndForget(Iap2MessageIds.CARPLAY_AVAILABILITY, Iap2Messages.carPlayAvailability(bluetoothMac))
+        } else {
+            log("iap2 车机未声明可收 0x4300（CarPlayAvailability）——跳过不发（对齐真 iPhone 行为）")
+        }
         val declaresStartSession = ident.declaresSend(Iap2MessageIds.CARPLAY_START_SESSION)
         // 没拿到 0x5703（新协议车机）时 0x4301 是**唯一** AP 来源——窗口给足；
         // 已有 0x5703 的旧协议车机保持 3 秒短窗口（应答都在毫秒级）。
@@ -368,8 +403,16 @@ class Iap2SenderSession(
         //
         // **不能按清单声明拦**（cardeck 2026-10-22 定谳：清单只能证明「有」）：
         // 同日日志里 0x4E0D/0x4E0B/0x4E0E 三条不在清单里，车机逐条 ACK 到位。
-        sendFireAndForget(Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER, Iap2Csm.string(0, bluetoothMac))
-        log("iap2 tx=0x4e0e 设备传输标识（mac=$bluetoothMac）")
+        //
+        // 但 2026-10-24 用真 iPhone 的 HCI 日志对照：真 iPhone **不发 0x4E0E**
+        // （只发 4E09/4E0A/4E0B/4E0C），MGU-55 也只是 ACK 掉。
+        // 为减少与真机行为的差异，默认不发；需要时把 SEND_TRANSPORT_IDENTIFIER 改 true。
+        if (SEND_TRANSPORT_IDENTIFIER) {
+            sendFireAndForget(Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER, Iap2Csm.string(0, bluetoothMac))
+            log("iap2 tx=0x4e0e 设备传输标识（mac=$bluetoothMac）")
+        } else {
+            log("iap2 跳过 0x4e0e 传输标识（默认关闭，对齐真 iPhone 行为）")
+        }
         log(
             if (endpoint.ssid.isNullOrEmpty() && endpoint.ipAddresses.isEmpty()) {
                 "iap2 Phase 1 完成：尚无热点凭据/AirPlay 端点——进入保活等待车机下发"
@@ -458,6 +501,17 @@ class Iap2SenderSession(
                 Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION -> handleLateWifiConfiguration(frame)
                 Iap2MessageIds.EA_SESSION_STATUS -> handleEaSessionStatus(frame, phase1 = false)
                 Iap2MessageIds.IDENTIFICATION_INFORMATION -> handleReidentification(frame)
+                // 车机要「电源更新」：真 iPhone 会回 3 条 0xAE01（HCI 实测），我们此前从不回。
+                // 只回一次就够（车机周期发 0xAE00，我们也跟着周期回），避免刷屏。
+                Iap2MessageIds.START_POWER_UPDATES -> {
+                    if (!powerUpdateReplied) {
+                        powerUpdateReplied = true
+                        log("iap2 rx=0xae00 StartPowerUpdates → 回 3 条 0xae01 PowerUpdate（对齐真 iPhone）")
+                    }
+                    for (body in Iap2Messages.powerUpdates()) {
+                        runCatching { sendFireAndForget(Iap2MessageIds.POWER_UPDATE, body) }
+                    }
+                }
                 else -> Unit
             }
             // 未知消息的报文结构只能靠原始体定谳；每个 id 只 dump 一次
@@ -628,8 +682,29 @@ class Iap2SenderSession(
                     "(${Iap2MessageIds.nameOf(frame.messageId)})，非预期，暂存待后续消费",
             )
             dumpBodyOnce(frame)
+            // 0xAE00 在 Phase 1 的等待窗口里也会到（车机一问就要答）；
+            // 若只靠主循环的 when 分支，第一条就被暂存区吞掉了——这里直接回。
+            if (frame.messageId == Iap2MessageIds.START_POWER_UPDATES) {
+                replyPowerUpdates()
+            }
             pendingFrames += frame
             if (pendingFrames.size > maxPendingFrames) pendingFrames.removeFirst()
+        }
+    }
+
+    /**
+     * 回 0xAE01 PowerUpdate（3 条，与真 iPhone 一致）。
+     *
+     * 车机在 MFi 通过后立刻发 0xAE00 要电源状态；真 iPhone 回 3 条、我们此前一条不回。
+     * 报文来自真机抓包（见 `Iap2Messages.powerUpdates`），只重放不自造数值。
+     */
+    private fun replyPowerUpdates() {
+        if (!powerUpdateReplied) {
+            powerUpdateReplied = true
+            log("iap2 rx=0xae00 StartPowerUpdates → 回 3 条 0xae01 PowerUpdate（对齐真 iPhone）")
+        }
+        for (body in Iap2Messages.powerUpdates()) {
+            runCatching { sendFireAndForget(Iap2MessageIds.POWER_UPDATE, body) }
         }
     }
 

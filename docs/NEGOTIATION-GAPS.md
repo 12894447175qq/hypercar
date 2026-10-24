@@ -1,4 +1,4 @@
-# 协商层对比分析：参考文档 vs cardeck 实测协议
+﻿# 协商层对比分析：参考文档 vs cardeck 实测协议
 
 > 对比对象：
 >  - **参考文档**：`E:\核心层rust实现.txt`（Kotlin 交 FD + 密钥、Rust 只做数据面转发的方案）
@@ -190,7 +190,7 @@ hypercar 的 Kotlin iAP2 层（`iap2/`）按 cardeck docs §3/§4/§5/§9h/§9j 
    |---|---|---|---|---|
    | `CarDeck-log-20261021-202434`（0.1.12） | BMW 31726 / MGU-86-BMW | 20:22:39 **A**(14 项) → 20:23:07 **B**(16 项) → 20:23:20 **A** → 20:23:43 **B** | **一轮都没到** | 每轮在 0x5702 之后 **5.4~6.5s** |
    | `CarDeck-log-20261022-135133`（0.1.17-debug） | BMW 17713 / MGU-86 | 5 轮**全是 B**(16 项) | **一轮都没到** | 每轮在 0x5702 之后 **5.37s** |
-   | 本仓 2026-10-24（BMW 53636 / MGU-55-BMW） | 11:01:21、11:01:31 两轮**全是 A**(14 项) | — | 无 | 我们自己在 1.3s 内关的链 |
+   | 本仓 2026-10-24（BMW ***** / MGU-55-BMW） | 11:01:21、11:01:31 两轮**全是 A**(14 项) | — | 无 | 我们自己在 1.3s 内关的链 |
 
    三条结论：
    ① **A/B 由车机单方面决定，且会来回切**（同一台车 27 秒内 A→B→A→B，与手机发什么无关）；
@@ -254,11 +254,11 @@ hypercar 的 Kotlin iAP2 层（`iap2/`）按 cardeck docs §3/§4/§5/§9h/§9j 
 
 | 阶段 | 现象 | 结论 |
 |---|---|---|
-| iAP2 建链 | `0x1d00/0x1d01` → `0x1d02`，`0xaa00/0xaa01` MFi → `0xaa02/0xaa03` → `0xaa05` | 正常，车机 `BMW 53636 / MGU-55-BMW` |
+| iAP2 建链 | `0x1d00/0x1d01` → `0x1d02`，`0xaa00/0xaa01` MFi → `0xaa02/0xaa03` → `0xaa05` | 正常，车机 `BMW ***** / MGU-55-BMW` |
 | EA 会话 | 连续 `0xea00`（8 个 a4a 协议），**`0xea03` 始终未到** | 车机不确认也不影响后续，先忽略 |
-| 热点凭据 | `0x5702` → `0x5703`：`ssid=DIRECT-BMW 53636 channel=157 security=2` | 正常 |
+| 热点凭据 | `0x5702` → `0x5703`：`ssid=DIRECT-BMW ***** channel=157 security=2` | 正常 |
 | 入网 | 静默加入 + 进程级绑定成功 | 正常 |
-| ctrl 广播 | `_carplay-ctrl._tcp` 注册成功，车机 `172.16.222.97` 主动 `GET /ctrl-int/1/connect` | **车机已开 AirPlay 窗口** |
+| ctrl 广播 | `_carplay-ctrl._tcp` 注册成功，车机 `172.16.*.*` 主动 `GET /ctrl-int/1/connect` | **车机已开 AirPlay 窗口** |
 | 端点地址 | `0x4301` **永远不来**；网关兜底也失败（DIRECT- 链路无默认网关，`0.0.0.0:7000`） | **卡点** |
 | 结果 | 15s 超时 → 主动拆会话 → 车机 3s 后重连 → 循环 | 表现为「连不上」 |
 
@@ -269,8 +269,8 @@ hypercar 的 Kotlin iAP2 层（`iap2/`）按 cardeck docs §3/§4/§5/§9h/§9j 
 收到 `GET /ctrl-int/1/connect` 即视为端点可用，取 `对端IP:7000` 继续：
 
 ```
-CTRL: 172.16.222.97 -> [GET /ctrl-int/1/connect ...]   ← 邀请
-SESSION: ✓ 车机已邀请（172.16.222.97）——用它当 AirPlay 端点 :7000
+CTRL: 172.16.*.* -> [GET /ctrl-int/1/connect ...]   ← 邀请
+SESSION: ✓ 车机已邀请（172.16.*.*）——用它当 AirPlay 端点 :7000
 ```
 
 > 端口 7000 是 AirPlay 惯例值；若某车型不是 7000，下一步改成浏览 `_airplay._tcp`
@@ -282,7 +282,7 @@ SESSION: ✓ 车机已邀请（172.16.222.97）——用它当 AirPlay 端点 :7
 
 ```
 CONNECT +0ms     端点确定：<ip>:<port> ssid=… 有密码=… ips=[…] gateway=… devId=… srcvers=…
-WIFI +820ms      ✓ 已绑定网络（进程级）：if=wlan0 ipv4=[172.16.222.x/24] ipv6=1 gw=- dns=[…] validated=false
+WIFI +820ms      ✓ 已绑定网络（进程级）：if=wlan0 ipv4=[172.16.*.x/24] ipv6=1 gw=- dns=[…] validated=false
 NET  +1100ms     ✓ <ip>:7000 已连通（Wi-Fi 网络 #N，耗时 63ms，fd=57）
 CORE +1150ms     引擎配置：{"width":2560,…}
 ```
@@ -290,3 +290,82 @@ CORE +1150ms     引擎配置：{"width":2560,…}
 排查时直接看**最后一条 +Nms** 就知道停在哪一步：停在 `WIFI` = 入网/绑网问题，
 停在 `NET` = 端口/路由问题（每行都带失败原因与耗时），进到 `CORE` 之后才轮到
 Rust 侧的 `AIRPLAY:` 日志。
+
+## 10. 真 iPhone HCI 对照（2026-10-24，同一台 BMW MGU-55）
+
+### 10.1 数据来源与解析方式
+
+iPhone 上抓 `sysdiagnose`，取出 `logs/Bluetooth/bluetoothd-hci-latest.pklg`（Apple PacketLogger 格式）。
+报文是**明文**，可用如下方式定界：
+
+- 帧同步 `0x40 0x40` 之后是 iAP2 负载；本项目的记录布局是
+  `40 40 | len(u16 BE) | msgID(u16 BE) | params…`（`len` 只覆盖 msgID+params 之后的部分）。
+- 记录容器是 `[len u32][ts_sec u32][ts_usec u32][type u8][data…]`；其中
+  `ts` 存的是**本地时间当 UTC**，换算回本地要减时区。
+- 参数按 `[len u16][id u16][value]` 或 TLV8（`<type><len><value>`）解析。
+
+> 隐私：本文只保留协议结构。设备名、热点 SSID、PSK、蓝牙 MAC、传输 UUID、
+> 车机标识串、IP 末段一律以 `*` 掩码；抓包文件本身不入库。
+
+### 10.2 同一台车机对真 iPhone 的报文清单
+
+`0x1D01` 的发送/接收清单与对我们的**逐字节一致**，关键声明也一致：
+
+```
+CarPlayStartSession(0x4301) = 不发        ← 这台车永远不主动给 AirPlay 端点地址
+StartHID(0x6800)            = 会发
+可收：0x4C01 0x4C04 0x4E09 0x4E0A 0x4E0B 0x4E0C 0x4E0D 0x5001 0x5702 0x6801 0xAE01 0xEA00 0xEA01
+       （注意：**没有** 0x4300，也没有 0x4E0E）
+```
+
+### 10.3 真机的 iAP2 时间轴（相对首条报文）
+
+| 时刻 | 方向 | 报文 | 说明 |
+|---|---|---|---|
+| +0.00s | 手机→车机 | `0x1D00` StartIDPS | |
+| +0.16s | 车机→手机 | `0x1D01` IDPS | 清单见上 |
+| +0.30s | 手机→车机 | `0x1D02` IDPSAccepted | |
+| +0.30s | 手机→车机 | `0xAA00` DevAuthInfo | |
+| +0.51s | 车机→手机 | `0xAA06` DevAuthFailed | 第一次签名被拒（随后重试成功） |
+| +0.51s | 手机→车机 | `0xAA02` DevAuthChallenge | |
+| +1.07s | 车机→手机 | `0xAA03` DevAuthSignature | |
+| +1.14s | 手机→车机 | `0xAA05` DevAuthSucceeded | |
+| +1.14s | 手机→车机 | `0x4E0C` TransportComponent | 载荷含一个 UUID（本文掩码） |
+| +1.15s | 手机→车机 | `0x4E0A` | |
+| **+1.32s** | 车机→手机 | **`0xAE00` StartPowerUpdates** | 车机要"电源状态上报" |
+| +1.51s | 手机→车机 | `0x4E0B`、`0x4E0D` | |
+| **+1.51s** | 手机→车机 | **`0xAE01` PowerUpdate ×3** | **真机会回，我们此前从不回** |
+| +1.57s | 车机→手机 | `0x5703` WiFiConfigResp | ssid/psk/channel/security |
+| +2.45s | 手机→车机 | `0x5702` 再请求一次 | |
+| +2.47s | 车机→手机 | `0x5703` 第二次 | |
+| — | — | （此后无 iAP2 报文） | AirPlay 全部走 Wi-Fi |
+
+真机**从不发送**：`0x4300`、`0xEA00`、`0x4E0E`；
+真机**从不接收**：`0x4301`、`0xEA03`。
+
+### 10.4 链路存活：抓包里能证明什么、不能证明什么
+
+时间对齐后（pklg 时钟 = 本地时间当 UTC）：
+
+- iAP2 交换发生在抓取结束前约 34 秒；
+- **这 34 秒内没有任何 `DisconnectionComplete`**，且最后一条记录正好是
+  sysdiagnose 抓取结束的时刻 → **日志结束是抓取结束，不是链路断开**；
+- 这 34 秒里真机**一条 iAP2 报文都没发**（连电源更新/keep-alive 都没有）。
+
+由此可得的下限结论：**拿完 0x5703 之后至少 34 秒，真机不会主动拆 iAP2**，
+且保活**不需要周期性发消息**。至于更长时间是否拆，这份抓包无法回答（需要一次完整会话的 sysdiagnose）。
+
+> 反例检查：若"车机在 34 秒后自动关机"，ACL 必然先断，日志里应有
+> `DisconnectionComplete`——实际一条都没有，故该解释不成立。
+
+### 10.5 由对照得出的实现决策
+
+| 行为 | 旧实现 | 决策 | 依据 |
+|---|---|---|---|
+| `0x4300` CarPlayAvailability | 无条件发送 | **仅当车机声明可收才发**（MGU-55 声明里没有 → 不发） | 真机从不发；硬发可能把车机推进"会话已请求"态 |
+| `0xEA00` EA 会话 | 逐条开 8 个 | **默认关闭**（`ENABLE_EA_SESSIONS=false`） | 真机一条不发，车机也从不回 `0xEA03` |
+| `0x4E0E` 传输标识 | 发送 | **默认关闭**（`SEND_TRANSPORT_IDENTIFIER=false`） | 真机不发 |
+| `0xAE01` PowerUpdate | **从不回** | **收到 `0xAE00` 立即回 3 条**（原样重放真机字节） | 真机必回；参数语义未定谳，故只重放不解释 |
+| AirPlay 失败后的 iAP2 | 立即拆除（~5s） | **原地重试 6×2.5s，不拆链路** | 真机 ≥34s 不拆；拆除会让车机收起 CarPlay 图标 |
+| AirPlay 端点端口 | 写死 7000 | **mDNS `_airplay._tcp` 优先，失败退 7000/7001/7100** | 车机确实广播该服务（unified log 可见）；写死 7000 收到 `455` |
+

@@ -1,4 +1,4 @@
-//! AirPlay 发送端会话（协商整体下沉 Rust —— 与参考文档的关键差异，见 docs/NEGOTIATION-GAPS.md）。
+﻿//! AirPlay 发送端会话（协商整体下沉 Rust —— 与参考文档的关键差异，见 docs/NEGOTIATION-GAPS.md）。
 //!
 //! 流程（cardeck 真车验证的顺序，Audi MIB3 / BMW iD8.5 通用骨架）：
 //!  1. `GET /info`（带空 bplist 体 + plist Content-Type，老固件对缺体的 /info 回 400/455）
@@ -384,23 +384,48 @@ pub async fn negotiate(
 
 async fn fetch_info(channel: &Arc<RtspChannel>) -> Result<Value, String> {
     let body = bplist::encode(&Value::dict(vec![]));
-    let resp = channel
-        .request(
+    // /info 的方法在各代固件上不一样：
+    //  - AirPlay 1 / WinPlay：`GET /info`（空 bplist 体 + plist Content-Type）
+    //  - AirPlay 2（真车 BMW MGU-55 实测）：只认 **POST /info**，对 GET 直接回
+    //    `455 Method Not Valid In This State`（2026-10-24 真车日志）
+    // 所以按 GET → POST → GET（带 AirPlay 2 头）依次试，并把每次的原始应答记下来。
+    let attempts: [(&str, &[(&str, String)]); 3] = [
+        ("GET", &[]),
+        ("POST", &[]),
+        (
             "GET",
-            "/info",
-            &body,
-            "application/x-apple-binary-plist",
-            &[],
-            Duration::from_secs(10),
-        )
-        .await?;
-    if resp.status() != 200 {
-        return Err(format!("/info 应答 [{}]", resp.first_line));
+            &[
+                ("X-Apple-ProtocolVersion", "1".to_string()),
+                ("X-Apple-Device-ID", "0x0".to_string()),
+                ("X-Apple-Session-ID", "1".to_string()),
+            ],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (method, extra) in attempts {
+        let resp = channel
+            .request(method, "/info", &body, "application/x-apple-binary-plist", extra, Duration::from_secs(10))
+            .await?;
+        let status = resp.status();
+        if status != 200 {
+            // 把车机原话完整记下来：状态行 + 头部（Server/X-Apple-* 头能直接看出它在跑什么）
+            let mut head: Vec<String> = resp.headers.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            head.sort();
+            let noted = format!(
+                "{method} /info → [{}] 头部[{}]",
+                resp.first_line,
+                if head.is_empty() { "无".to_string() } else { head.join(", ") }
+            );
+            emit_log(&format!("AIRPLAY: ✗ {noted}"));
+            failures.push(noted);
+            continue;
+        }
+        if resp.body.is_empty() {
+            return Ok(Value::dict(vec![]));
+        }
+        return bplist::parse(&resp.body).map_err(|e| format!("/info 解析失败: {e}"));
     }
-    if resp.body.is_empty() {
-        return Ok(Value::dict(vec![]));
-    }
-    bplist::parse(&resp.body).map_err(|e| format!("/info 解析失败: {e}"))
+    Err(format!("/info 三次尝试都被拒：{}", failures.join("；")))
 }
 
 // ---------------------------------------------------------------- SETUP 报文体
@@ -962,4 +987,5 @@ fn random_positive_i64() -> i64 {
 fn random_uuid_upper() -> String {
     uuid::Uuid::new_v4().simple().to_string().to_uppercase()
 }
+
 

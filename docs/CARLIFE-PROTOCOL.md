@@ -1,4 +1,4 @@
-# CarLife HU 侧协议（HyperCar 网关）
+﻿# CarLife HU 侧协议（HyperCar 网关）
 
 > 依据：**pitate7777777/CarLifeWirelessBox**（MIT，实测兼容小米 CarWith 的 CarLife 连接）
 > 的 HU 实现与 `docs/DEVELOPMENT.md`、`docs/通讯协议分析报告.md`，与 apollo-DuerOS 同源。
@@ -168,7 +168,7 @@ x_编码 = x_hid * 编码宽 / 显示宽
 | Android 同机（HU 与 CarLife 同设备） | **HU** 监听 `127.0.0.1:7240…`，MD 连入 | `CarLifeHub::start` |
 | 盒子角色（小米 CarWith「车辆热点 → 开始连接」） | **MD** 监听 `7240…`，HU 拨过去 | `CarLifeHub::connect(md_host)` |
 
-现场实测（2026-10-23 22:56，Xiaomi M154FF + CarWith 4.0.16 + CarLife 8.8.5）：
+现场实测（2026-10-23 22:56，Xiaomi ****（型号略）+ CarWith 4.0.16 + CarLife 8.8.5）：
 点「开始连接」后手机 `com.baidu.carlife.xiaomi`（uid 10345）开始 **LISTEN**
 `7240/8240/9240/9241/9242/9340`，等待车机连入；PC 侧拨过去后 14 步握手一次跑通，
 首帧 `NAL=[7,8,5]`。这与参考实现 `CarLifeWirelessBox` 的
@@ -186,3 +186,4 @@ x_编码 = x_hid * 编码宽 / 显示宽
    实现里两者都会推进到「发编码器初始化」，不会卡死。
 3. **版本号 3.2** 是 CarLifeWirelessBox 的实测默认值；若某版 CarLife 拒绝，可在
    `PROTOCOL_MAJOR/MINOR` 调整。
+

@@ -1,4 +1,4 @@
-package io.github.hypercar.iap2
+﻿package io.github.hypercar.iap2
 
 /**
  * 无线 CarPlay 会话中「发送端（iPhone 角色）」视角的消息目录 + 参数编解码。
@@ -64,6 +64,9 @@ object Iap2MessageIds {
     const val STOP_NOW_PLAYING_UPDATES = 0x5001
     const val START_ROUTE_GUIDANCE_UPDATES = 0x5200
     const val START_POWER_UPDATES = 0xAE00
+
+    /** 0xAE01 电源状态上报（车机发 0xAE00 后手机回）。 */
+    const val POWER_UPDATE = 0xAE01
     const val START_COMMUNICATIONS_UPDATES = 0x4157
     const val START_CALL_STATE_UPDATES = 0x4154
 
@@ -307,6 +310,24 @@ object Iap2Messages {
     fun eaOpenSession(protocolId: Int, protocolName: String): ByteArray =
         Iap2Csm.u8(0, protocolId) + Iap2Csm.string(1, protocolName)
 
+
+    /**
+     * 0xAE01 PowerUpdate：**原样重放真 iPhone 的报文**（2026-10-24 HCI 抓包，BMW MGU-55）。
+     *
+     * 参数语义尚未定谳（param 0x0006 / 0x0004，值按小端浮点解释疑似「电池电压 3.66」与
+     * 「供电状态」），所以这里**不解释、不自造数值**，直接复用真机字节：
+     * 车机要的是「有正常 iOS 设备的电源上报」，而不是某个具体读数。
+     *
+     * 原始抓包（含 msgID，供核对）：
+     *   ae01 0006 0006 004f6a40 0000
+     *   ae01 0005 0004 00bd40   0000
+     * 末尾 0000 是链路帧尾，不属于消息体。
+     */
+    fun powerUpdates(): List<ByteArray> = listOf(
+        byteArrayOf(0x00, 0x06, 0x00, 0x06, 0x00, 0x4f, 0x6a, 0x40),
+        byteArrayOf(0x00, 0x05, 0x00, 0x04, 0x00, 0xbd.toByte(), 0x40),
+        byteArrayOf(0x00, 0x06, 0x00, 0x06, 0x00, 0x4f, 0x6a, 0x40),
+    )
     /** 0x4300：无线组件（transport=1 蓝牙）+ 传输标识（本机蓝牙 MAC）。 */
     fun carPlayAvailability(bluetoothMac: String): ByteArray =
         Iap2Csm.group(1, Iap2Csm.u8(0, 1), Iap2Csm.string(1, bluetoothMac))
@@ -317,3 +338,4 @@ object Iap2Messages {
             Iap2Csm.s16(1, timezoneOffsetMinutes) +
             Iap2Csm.u8(2, daylightSaving)
 }
+
