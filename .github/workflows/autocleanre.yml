@@ -1,0 +1,20 @@
+name: Cleanup Old Releases
+on:
+  workflow_dispatch: # 允许在 Actions 页面手动点击运行
+  schedule:
+    - cron: '0 0 * * 0' # 也可以设置定时任务，例如每周日运行一次
+
+permissions:
+  contents: write
+
+jobs:
+  delete-older-releases:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete older releases
+        uses: dev-drprasad/delete-older-releases@v0.3.3
+        with:
+          keep_latest: 5 # 保留最新的 5 个 Release，其他的全删掉
+          delete_tags: true # 是否同时删除对应的 Git Tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
