@@ -145,3 +145,46 @@ hypercar 的 Kotlin iAP2 层（`iap2/`）按 cardeck docs §3/§4/§5/§9h/§9j 
 4. **0x5702 是否必须带参数**（BMW 空体接受性）——cardeck 同样未定谳，需要一次
    真 iPhone 同车抓包。
 
+5. **BMW MGU-55（iD8.5 实车，2026-10-24）不下发无线 CarPlay 凭据**：这台车机的
+   0x1D01 清单里**没有** 0x5702/0x5703（WiFi 配置）、也没有 0x4300/0x4301（CarPlay
+   会话启动），只声明了 iPod/BMW Apps 那一套（0x4C00/02/03/05/07 发送、
+   0x4C01/04 接收、0x5000/01、0x6800/01、0xAE00/01、0xEA00/01/03，加 7 条
+   `de.bmw.a4a.*` EA 协议），识别里也没有 WirelessCarPlayTransportComponent。
+
+   **与 cardeck（fw867/cardeck）逐项对照后定谳**：cardeck PROTOCOL-NOTES §9j 记录
+   BMW iD8.5（MGU-86）有 **A/B 两套能力档案**，本车当前这两轮全是 **档案 A**：
+
+   | 档案 | 发送清单 | EA 协议 | 0x5702/0x5703 |
+   |---|---|---|---|
+   | **A**（本车现状，14 项） | 无 0x5703 | `de.bmw.a4a.bt` protocol=7 | 收=否 / 发=否 |
+   | **B**（真车正常无线 CarPlay，16 项） | 含 0x5703、0xaa06 | `com.bmw.carplay` protocol=8 | **收=是 / 发=是** |
+
+   档案 A = 车机**没开无线 CarPlay 窗口**（真 iPhone 此时也不会被当成 CarPlay 设备）；
+   档案 B 才是能跑通的那一档。对照 cardeck 后本仓补齐了四处缺失（旧实现正是因为这四处，
+   即使车机进了档案 B 也走不通）：
+
+   1. **0x4E0D WirelessCarPlayUpdate（u8=1）**：真 iPhone 在 0xAA05 之后会发这条
+      「本机支持无线 CarPlay」的可用性通知；旧实现只发 0x4E0C/0x4E0A/0x4E0B/0x4E09。
+      本车可收清单里**恰有 0x4E0D**——车机很可能就是靠它判断对方是不是 CarPlay 设备。
+   2. **0x4E0E DeviceTransportIdentifier（蓝牙 MAC）**：真机顺序是 0x4301 之后回它，
+      车机按它把 iAP2 设备与 RFCOMM 对端关联（发后不管，Audi 实测从不 ACK）。
+   3. **`_carplay-ctrl._tcp` mDNS 广播 + `GET /ctrl-int/1/connect` 应答**
+      （`net/CarPlayCtrlAdvertiser.kt`）：真车是**邀请驱动**——车机在 WiFi 上发现该服务后
+      反连手机发邀请，**邀请成功才下发 0x4301**。旧实现完全没有 mDNS，而且「等 0x4301 才
+      入网」= 双方互等死锁（cardeck 在奥迪上实测过同一死锁）。现在 0x5703 一到就
+      入网 + 广播（TXT `id`=真实蓝牙 MAC、`srcvers`=950.7.1，两者改动需先真车复测）。
+   4. **0x6800 StartHID → 0x6801 应答**（`[u16 0][u8 0]`）与**EA 协议逐条开**（修掉
+      同 id 重复参数被 `associateBy` 压成一条的 bug，BMW 的 7 条 EA 协议里
+      `de.bmw.a4a.pairing` 从未被打开过）。
+
+   现场处置（已实现）：拿不到凭据**不再拆链**（旧行为 throw → 关 RFCOMM → 车机断 ACL →
+   上层拆会话 → 3s 后重连，形成连-断死循环），链路保持 + 5s/30s 节奏重探 0x5702/0x4300、
+   补开未确认的 0xEA00；未知消息体（尤其 0x4Cxx）与非控制会话数据帧的原始体各 dump 一次；
+   档案 A/B 在日志里直接判读（`iap2 无线 CarPlay 档案=A/B`）。
+
+   仍需现场确认：a) 车机在 iDrive 里点 Apple CarPlay 之后，是否重开一轮 iAP2 并变成档案 B；
+   b) 档案 B 下 0x5703 是否下发、ctrl 邀请是否到达（日志 `CTRL: ✓ 车机 ctrl 邀请`）；
+   c) 若真车始终只给档案 A，说明车机认的是「iPhone 蓝牙 EIR 里的 CarPlay UUID」
+   （`2D8D2466-E14D-451C-88BC-7301ABEA291A`，Android 侧做不出来）——那就只能走手动入网 +
+   ctrl 广播 + 网关 7000 兜底这条非 iAP2 路径。
+

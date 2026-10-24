@@ -149,8 +149,8 @@ class Iap2LinkEngine(
     /** 诊断：首次采纳对端会话表时回调（打印对端提议的会话表，便于真车排查）。 */
     var onPeerSynchronizationAdopted: ((SynchronizationPayload) -> Unit)? = null
 
-    /** 诊断：丢弃未知会话 ID 的数据帧时回调（(sessionId, bytes)）。 */
-    var onUnknownSessionData: ((Int, Int) -> Unit)? = null
+    /** 诊断：丢弃未知会话 ID 的数据帧时回调（(sessionId, payload)）。 */
+    var onUnknownSessionData: ((Int, ByteArray) -> Unit)? = null
 
     /** 诊断：每个入向链路帧的摘要，真车排查用。 */
     var onFrameReceived: ((control: Int, sequence: Int, ack: Int, sessionId: Int, size: Int) -> Unit)? = null
@@ -396,8 +396,10 @@ class Iap2LinkEngine(
             } else {
                 // EA/文件传输等其它会话的数据帧：ACK 掉（否则对端窗口卡死）但不上抛——
                 // 触摸/HID 由 Rust 侧经 AirPlay 事件通道处理，iAP2 层不消费。
+                // **载荷必须交给上层 dump**：BMW 的 EA 协议（de.bmw.a4a.pairing 等）
+                // 若要把热点凭据送过来，唯一通道就是某条 EA 会话的数据帧（2026-10-24）。
                 unknownSessionDropped++
-                if (unknownSessionDropped <= 5) onUnknownSessionData?.invoke(sessionId, payload!!.size)
+                if (unknownSessionDropped <= 5) onUnknownSessionData?.invoke(sessionId, payload!!)
                 sendAcknowledgement()
             }
         }

@@ -68,6 +68,15 @@ class Iap2Bluetooth(
         private const val FAILURE_LOG_THROTTLE_MILLIS = 15_000L
         private const val PROFILE_LOG_THROTTLE_MILLIS = 15_000L
 
+        /**
+         * 首轮出站前的「等车机主动连入」宽限：BMW 是车机拨我们（…cafe）。
+         * 若我们先走「只配对、不连接」（断它的 HFP/A2DP），车机往往把整条 ACL 也拽掉，
+         * 于是系统广播 ACL 断开 → 上层拆会话 → 再连、再断（2026-10-24 实车 10:55~11:01
+         * 那串「蓝牙已连接——已断开 / 车机蓝牙连上 / 断开」刷屏就是这个自激环）。
+         * 只等**首轮**：等到了就不碰配置文件；等不到照旧走 outbound（Audi 是这条）。
+         */
+        private const val INBOUND_GRACE_MILLIS = 8_000L
+
         /** SDP 服务探测等待窗（fetchUuidsWithSdp → ACTION_UUID 广播）。 */
         private const val SDP_PROBE_TIMEOUT_MILLIS = 2_500L
     }
@@ -240,11 +249,25 @@ class Iap2Bluetooth(
     @SuppressLint("MissingPermission")
     private fun connectLoop(myGeneration: Long) {
         val adapter = adapterOrNull() ?: return
+        var inboundGraceDone = false
         while (running && generation.get() == myGeneration) {
             // 会话期间静默：两条 RFCOMM 会互相踩（见 sessionActive 注释）
             if (sessionActive.get()) {
                 sleepQuietly(2_000)
                 continue
+            }
+            // 首轮先给车机 8s 主动连入的机会（BMW/MGU 是车机拨我们）。等到了就完全不碰
+            // 它的 HFP/A2DP——否则「只配对、不连接」会把 ACL 也搞断，形成连-断自激。
+            if (!inboundGraceDone) {
+                inboundGraceDone = true
+                val deadline = SystemClock.uptimeMillis() + INBOUND_GRACE_MILLIS
+                while (running && generation.get() == myGeneration &&
+                    !sessionActive.get() && SystemClock.uptimeMillis() < deadline
+                ) {
+                    sleepQuietly(250)
+                }
+                if (sessionActive.get() || !running || generation.get() != myGeneration) continue
+                log("BT-C: ${INBOUND_GRACE_MILLIS / 1000}s 内车机未主动连入——改走出站（会先断开该车机的 HFP/A2DP）")
             }
             val target = targetProvider()
             val candidates = candidateDevices(adapter, target)
@@ -532,8 +555,15 @@ private class RfcommLinkChannel(
                     "sessions=" + sync.sessions.joinToString { "${it.id}/k${it.kind}/v${it.version}" },
             )
         }
-        engine.onUnknownSessionData = { sessionId, size ->
-            log("LINK: 会话 $sessionId 的数据帧已 ACK 不上抛（$size 字节；触摸/HID 走 AirPlay 事件通道）")
+        engine.onUnknownSessionData = { sessionId, payload ->
+            // 只 dump 前 96 字节：EA 会话的报文结构（BMW 私有协议）从这几行就能看出
+            // 是 TLV 还是明文文本；ACK 已由链路层回掉，不影响对端窗口。
+            val shown = payload.take(96).joinToString("") { "%02x".format(it) }
+            val tail = if (payload.size > 96) "…" else ""
+            log(
+                "LINK: 会话 $sessionId 数据 ${payload.size}B 已 ACK 未处理（EA/私有通道）=" +
+                    shown + tail,
+            )
         }
         engine.onFrameReceived = { control, sequence, ack, sessionId, size ->
             if (rxFrameLogs < FRAME_LOG_LIMIT) {

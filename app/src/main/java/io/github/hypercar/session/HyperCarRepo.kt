@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.session
+package io.github.hypercar.session
 
 import android.bluetooth.BluetoothDevice
 import android.content.Context
@@ -18,6 +18,7 @@ import io.github.hypercar.core.VideoStats
 import io.github.hypercar.iap2.CarPlayEndpoint
 import io.github.hypercar.iap2.Iap2Coordinator
 import io.github.hypercar.net.BluetoothMac
+import io.github.hypercar.net.CarPlayCtrlAdvertiser
 import io.github.hypercar.net.SpecifierPermissions
 import io.github.hypercar.net.WifiJoiner
 import io.github.hypercar.settings.SettingsStore
@@ -67,6 +68,19 @@ object HyperCarRepo {
     private var iap2: Iap2Coordinator? = null
 
     private var wifiJoiner: WifiJoiner? = null
+
+    /**
+     * `_carplay-ctrl._tcp` 广播器（真车邀请驱动流程的核心：车机在 WiFi 上发现它才下发
+     * 0x4301）。生命周期与本会话一致：拿到 0x5703 → 绑网 → 注册；拆除时注销。
+     */
+    private var ctrlAdvertiser: CarPlayCtrlAdvertiser? = null
+
+    /** 本轮已经静默加入过的车机热点（避免「先拿凭据入网」与「端点到了再入网」重复连接）。 */
+    @Volatile
+    private var joinedSsid: String? = null
+
+    @Volatile
+    private var joinedNetwork: Network? = null
 
     /** AirPlay 会话是否已建立（冗余端点去重，cardeck「推流中忽略 0x5703/0x4301」教训）。 */
     @Volatile
@@ -246,13 +260,25 @@ object HyperCarRepo {
             // 谁先到由车机决定。WinPlay 实测 0x5703 先到、0x4301 晚 143ms：
             // 旧实现取首个回调就继续，于是在 19:46:57.019 立刻判「端点无可用 IP」失败，
             // 而真正可用的 ips=[192.168.137.1] 在下一条消息里被当成「冗余端点」丢掉。
+            //
+            // **真车死锁的解药**（2026-10-24 对照 cardeck 定谳）：0x5703 一到就立刻
+            // 绑 WiFi + 广播 `_carplay-ctrl._tcp`——车机是在 WiFi 上发现该服务后
+            // `GET /ctrl-int/1/connect` 邀请手机，**邀请成功才下发 0x4301**。
+            // 若等 0x4301 才去入网，双方互等（旧实现就是这样，真车上永远拿不到端点）。
+            val advertiser = CarPlayCtrlAdvertiser(context, { deviceMac }, ::log)
+            ctrlAdvertiser = advertiser
             val lastSeen = AtomicReference<CarPlayEndpoint?>(null)
-            val endpoint = awaitUsableEndpoint(coordinator, lastSeen)
+            val endpoint =
+                awaitUsableEndpoint(context, coordinator, lastSeen, advertiser)
+                    ?: gatewayFallbackEndpoint(context, lastSeen.get())
             if (endpoint == null) {
                 val seen = lastSeen.get()
                 fail(
                     if (seen == null) {
-                        "等待车机 iAP2 端点超时（${ENDPOINT_TIMEOUT_MILLIS / 1000}s）——车机未开放无线 CarPlay 窗口？"
+                        "等车机无线 CarPlay 端点超时（${ENDPOINT_TIMEOUT_MILLIS / 1000}s）——" +
+                            "车机没下发 0x5703/0x4301。请在车机上进入「移动设备 → 本机 → Apple CarPlay」" +
+                            "点一次（车机只在打开 CarPlay 窗口后才下发热点凭据与 AirPlay 端点）；" +
+                            "若已知车机热点密码，也可先把手机手动连上该热点，本机会用网关 7000 端口兜底"
                     } else {
                         "车机未给出可用 IP（ssid=${seen.ssid ?: "-"} port=${seen.airPlayPort} " +
                             "ips=${seen.ipAddresses}）——检查车机热点是否开启"
@@ -367,8 +393,12 @@ object HyperCarRepo {
         runCatching { RustCoreBridge.nativeStop() }
         runCatching { iap2?.stop() }
         iap2 = null
+        runCatching { ctrlAdvertiser?.stop() }
+        ctrlAdvertiser = null
         runCatching { wifiJoiner?.release() }
         wifiJoiner = null
+        joinedSsid = null
+        joinedNetwork = null
         boundNetwork = null
     }
 
@@ -448,6 +478,13 @@ object HyperCarRepo {
     // ---------------------------------------------------------------- WiFi
 
     private suspend fun joinAndBind(context: Context, endpoint: CarPlayEndpoint): Network? {
+        val ssid = endpoint.ssid
+        val psk = endpoint.passphrase
+        // 幂等：先拿 0x5703 入过网、端点到了又走一遍（0x4301 晚到）时不要重复 connect-network
+        if (!ssid.isNullOrBlank() && ssid == joinedSsid && joinedNetwork != null) {
+            log("WIFI: 本轮已加入热点 $ssid——复用网络，不重复连接")
+            return joinedNetwork
+        }
         val joiner = WifiJoiner(context) {
             // 车机熄火热点消失：结束会话，回到待机
             log("WIFI: 车机热点消失（熄火/离开）");
@@ -455,8 +492,6 @@ object HyperCarRepo {
         }
         wifiJoiner = joiner
 
-        val ssid = endpoint.ssid
-        val psk = endpoint.passphrase
         val network: Network? = if (!ssid.isNullOrBlank() && !psk.isNullOrBlank()) {
             log("WIFI: 尝试静默加入热点 $ssid（Wi-Fi 开关=${if (joiner.isWifiEnabled()) "开" else "关"}）")
             when (val result = joiner.joinCarHotspotSilently(ssid, psk)) {
@@ -483,6 +518,10 @@ object HyperCarRepo {
         if (effective != null) {
             joiner.bindProcess(effective)
             boundNetwork = effective
+            if (!ssid.isNullOrBlank() && network != null) {
+                joinedSsid = ssid
+                joinedNetwork = effective
+            }
             log("WIFI: ✓ 已绑定网络（进程级）${if (network == null) "——注意：这是兜底网络，不一定是车机热点" else ""}")
         }
         return effective
@@ -492,6 +531,50 @@ object HyperCarRepo {
     private fun currentDefaultNetwork(context: Context): Network? = runCatching {
         context.getSystemService(ConnectivityManager::class.java)?.activeNetwork
     }.getOrNull()
+
+    /**
+     * 「网关兜底」：iAP2 没给出可连的 AirPlay 地址时，拿当前 Wi-Fi 的默认网关 + 7000 端口当端点。
+     *
+     * 两种场景都要覆盖：
+     *  - **已拿到 0x5703、也已入网**，但车机没下发 0x4301（真车等 ctrl 邀请超时/邀请失败）——
+     *    车机的 AirPlay 接收端通常就在热点网内以 7000 端口提供 RTSP 控制面；
+     *  - **一个凭据都没拿到**，但用户手动连了车机热点。
+     * 失败不比现状更差：照旧报错退出（只多花几次 2.5s 超时）。端口 7000 是 AirPlay 惯例值。
+     */
+    private fun gatewayFallbackEndpoint(
+        context: Context,
+        seen: CarPlayEndpoint?,
+    ): CarPlayEndpoint? {
+        val gateway = wifiGateway(context) ?: return null
+        log(
+            "SESSION: 车机未给可用 AirPlay 地址" +
+                (if (seen?.ssid.isNullOrEmpty()) "" else "（已拿到热点凭据 ssid=${seen?.ssid}）") +
+                "——尝试网关兜底 $gateway:7000",
+        )
+        return CarPlayEndpoint(
+            ssid = seen?.ssid,
+            passphrase = seen?.passphrase,
+            airPlayPort = 7000,
+            deviceIdentifier = seen?.deviceIdentifier,
+            publicKeyHex = seen?.publicKeyHex,
+            sourceVersion = seen?.sourceVersion,
+            ipAddresses = listOf(gateway),
+            gateway = gateway,
+        )
+    }
+
+    /** 当前所有 Wi-Fi 网络里第一个「有默认路由」的网关地址（IPv4 优先）。 */
+    private fun wifiGateway(context: Context): String? {
+        val cm = context.getSystemService(ConnectivityManager::class.java) ?: return null
+        return runCatching {
+            cm.allNetworks
+                .asSequence()
+                .filter { cm.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true }
+                .mapNotNull { network -> cm.getLinkProperties(network)?.routes?.firstOrNull { it.isDefaultRoute }?.gateway }
+                .mapNotNull { it.hostAddress }
+                .firstOrNull { it.contains('.') && !it.contains(':') }
+        }.getOrNull()
+    }
 
     /**
      * 连车机 AirPlay 控制端口（TCP），按候选网络逐个试，成功返回已 detach 的 FD。
@@ -748,12 +831,19 @@ object HyperCarRepo {
      * 0x4301 才带端口与车机地址，先后顺序由车机决定。WinPlay 实测 0x5703 先到、
      * 0x4301 晚 143ms（真车同理）。取首个回调 = 拿凭据那一份去要 IP，必然立刻失败。
      *
+     * **拿到 0x5703 就立刻入网 + 广播 `_carplay-ctrl._tcp`**（不等 0x4301）：
+     * 真车（Audi MIB3 / BMW）是「在 WiFi 上发现手机 ctrl 服务 → `GET /ctrl-int/1/connect`
+     * 邀请 → 邀请成功才下发 0x4301」。若等 0x4301 才入网，两边互等，永远拿不到端点
+     * （cardeck 在奥迪上实测的死锁；hypercar 旧流程同样只有 0x4301 一条来源）。
+     *
      * 用无界 Channel 收集回调而不是首个回调 resume：0x5703/0x4301 可能连续到达，一条都不能丢；
      * 等待结束（或超时）后 close，晚到的回调 trySend 失败即静默丢弃。
      */
     private suspend fun awaitUsableEndpoint(
+        context: Context,
         coordinator: Iap2Coordinator,
         lastSeen: AtomicReference<CarPlayEndpoint?>,
+        advertiser: CarPlayCtrlAdvertiser,
     ): CarPlayEndpoint? = withTimeoutOrNull(ENDPOINT_TIMEOUT_MILLIS) {
         val callbacks = Channel<CarPlayEndpoint>(Channel.UNLIMITED)
         coordinator.start { endpoint -> callbacks.trySend(endpoint) }
@@ -761,6 +851,7 @@ object HyperCarRepo {
             var usable: CarPlayEndpoint? = null
             var ticks = 0
             var partialKey: String? = null
+            var wifiJoined = false
             while (usable == null) {
                 val next = withTimeoutOrNull(ENDPOINT_PROGRESS_MILLIS) { callbacks.receive() }
                 if (next == null) {
@@ -769,7 +860,8 @@ object HyperCarRepo {
                     val waited = ticks * ENDPOINT_PROGRESS_MILLIS / 1000
                     log(
                         if (seen == null) {
-                            "SESSION: 仍在等车机端点（还没收到 0x5703/0x4301，已等 ${waited}s）"
+                            "SESSION: 仍在等车机端点（还没收到 0x5703/0x4301，已等 ${waited}s）" +
+                                "——链路保持中，请在车机上点一次「Apple CarPlay/手机」"
                         } else {
                             "SESSION: 仍在等车机地址（ssid=${seen.ssid ?: "-"} port=${seen.airPlayPort} " +
                                 "ips=${seen.ipAddresses}，已等 ${waited}s）"
@@ -779,6 +871,16 @@ object HyperCarRepo {
                 }
                 val merged = mergeEndpoint(lastSeen.get(), next)
                 lastSeen.set(merged)
+                // 0x5703 只给 ssid/psk：先入网 + 广播，车机才可能邀请并下发 0x4301
+                if (!wifiJoined && !merged.ssid.isNullOrBlank()) {
+                    wifiJoined = true
+                    log("SESSION: 先拿到热点凭据（0x5703）——立即入网 + 广播 _carplay-ctrl，再等 0x4301")
+                    joinAndBind(context, merged)
+                    val ssid = merged.ssid
+                    if (ssid != null) {
+                        advertiser.ensureForNetwork(ssid, force = true, network = boundNetwork)
+                    }
+                }
                 if (pickHost(merged) != null) {
                     usable = merged
                     continue

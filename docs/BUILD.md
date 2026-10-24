@@ -107,6 +107,16 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 - 常见失败：
   - `Shizuku 未就绪` → 启动 Shizuku 并重新授权。
   - `0x5702 后无 0x5703` → 车机未开无线 CarPlay 窗口；在车机上点一次手机图标。
+  - 日志里出现 `车机既未声明 0x5702/0x5703，也未声明 0x4301` + `仍在等车机下发……`
+    （典型：BMW MGU-55 实车）→ 车机只提供了 iPod/BMW Apps 那套 iAP2 能力，
+    **还没把本机当 CarPlay 设备**（cardeck 称「档案 A」）。处置顺序：
+    ① 在 iDrive「移动设备」里选中本机、点 Apple CarPlay（链路会一直保持，不必重连）；
+       车机重开一轮 iAP2 后日志会出现 `iap2 无线 CarPlay 档案=B`；
+    ② 看日志里有没有 `0x1d01（重新识别）`、`0x4c00 原始体`、`会话 N 数据 …`——
+       这些行把车机私有通道的报文结构记下来了，是下一步定谳的依据；
+    ③ 拿到 0x5703 后 App 会自动入网并广播 `_carplay-ctrl._tcp`，等车机
+       `GET /ctrl-int/1/connect` 邀请（日志 `CTRL: ✓ 车机 ctrl 邀请`）后才会有 0x4301；
+    ④ 若已知车机热点密码，先手动把手机连上该热点，App 会走「网关兜底 `网关:7000`」。
   - `会话 SETUP 被拒 403` → 车机按 deviceID 过滤；确认设置里的目标车机与本机蓝牙 MAC 匹配。
   - `CarLife 一直 Waiting` → 先确认唤醒包名：HyperOS 上是 `com.baidu.carlife.xiaomi`
     （不是 `com.baidu.carlife`），App 会自动纠错并在日志里写明替换结果，仍不行就在设置里手选。

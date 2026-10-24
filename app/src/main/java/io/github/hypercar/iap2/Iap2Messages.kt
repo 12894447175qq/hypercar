@@ -190,23 +190,34 @@ object Iap2Messages {
         val wirelessAp: WifiConfiguration?,
     )
 
-    /** 纯函数解析 0x1D01。 */
+    /**
+     * 纯函数解析 0x1D01。
+     *
+     * **同一个参数 id 允许重复出现**：EA 协议组就是「一条协议一个 id=10 参数」。
+     * BMW MGU-55 实测声明了 7 条 EA 协议（de.bmw.a4a.pairing/data/tc/ar/metadata/
+     * mainline/bt，全部 id=10）。旧实现 `associateBy { it.id }` 把它们压成一条（只剩
+     * 最后一个 de.bmw.a4a.bt），于是 0xEA00 只给最后那条协议开过会话——
+     * de.bmw.a4a.pairing 这种「配对通道」根本没打开过（2026-10-24 实车日志定谳）。
+     */
     fun parseIdentification(body: ByteArray): Identification {
-        val params = Iap2Csm.parseParams(body).associateBy { it.id }
-        val sendIds = params[IDENT_SEND_IDS]?.asU16List()?.takeIf { it.isNotEmpty() }?.toSet()
-        val receiveIds = params[IDENT_RECEIVE_IDS]?.asU16List()?.takeIf { it.isNotEmpty() }?.toSet()
+        val params = Iap2Csm.parseParams(body)
+        // 标量字段取首个出现值；重复 id 只对 EA 组有语义，不能整体 associateBy
+        val firstById = params.groupBy { it.id }.mapValues { it.value.first() }
+        val sendIds = firstById[IDENT_SEND_IDS]?.asU16List()?.takeIf { it.isNotEmpty() }?.toSet()
+        val receiveIds = firstById[IDENT_RECEIVE_IDS]?.asU16List()?.takeIf { it.isNotEmpty() }?.toSet()
         val ea = ArrayList<EaProtocol>()
-        for (groupId in IDENT_EA_GROUP_FIRST..IDENT_EA_GROUP_LAST) {
-            val value = params[groupId]?.value ?: continue
-            val sub = Iap2Csm.parseParams(value).associateBy { it.id }
+        // 按出现顺序（车机给的顺序就是它的优先级），不要再按 id 排序/去重
+        for (param in params) {
+            if (param.id !in IDENT_EA_GROUP_FIRST..IDENT_EA_GROUP_LAST) continue
+            val sub = Iap2Csm.parseParams(param.value).groupBy { it.id }.mapValues { it.value.first() }
             val protocolId = sub[0]?.asU8() ?: continue
             val name = sub[1]?.asStringOrEmpty() ?: "?"
             ea += EaProtocol(protocolId, name)
         }
         return Identification(
-            name = params[IDENT_NAME]?.asStringOrNull(),
-            model = params[IDENT_MODEL]?.asStringOrNull(),
-            manufacturer = params[IDENT_MANUFACTURER]?.asStringOrNull(),
+            name = firstById[IDENT_NAME]?.asStringOrNull(),
+            model = firstById[IDENT_MODEL]?.asStringOrNull(),
+            manufacturer = firstById[IDENT_MANUFACTURER]?.asStringOrNull(),
             sendIds = sendIds,
             receiveIds = receiveIds,
             eaProtocols = ea,
