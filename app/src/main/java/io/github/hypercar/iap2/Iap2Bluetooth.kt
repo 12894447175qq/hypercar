@@ -471,6 +471,11 @@ class Iap2Bluetooth(
             // Phase 1 完成：进入保活泵，直到链路断开（0x4301 等生命周期消息在此处理）
             session.pumpIncomingForever()
             onSessionEnded("链路断开")
+        } catch (profileA: NoCarPlayWindowException) {
+            // 档案 A 不是「失败」而是「这一轮车机没给机会」：不拆上层会话、不记为错误，
+            // 立刻放掉这条 RFCOMM，让车机下一次连入能被 accept 接住（下一轮很可能就是档案 B）。
+            log("$tag ${profileA.message}——结束本轮，等车机下一次连入")
+            onSessionEnded(profileA.message ?: "档案 A")
         } catch (error: IOException) {
             log("$tag SESSION 失败: ${error.message}")
             onSessionEnded(error.message ?: "IO 错误")

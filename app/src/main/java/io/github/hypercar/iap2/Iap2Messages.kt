@@ -134,6 +134,9 @@ object Iap2Messages {
     const val IDENT_EA_GROUP_FIRST = 10 // EA 协议组起始 id（10/11/12 均可能）
     const val IDENT_EA_GROUP_LAST = 12
 
+    /** 无线 CarPlay 传输组件（BMW 档案 B 才有；值里含热点 SSID 类信息）。 */
+    const val IDENT_WIRELESS_CARPLAY_COMPONENT = 24
+
     // ---- 0x5703 WiFi 配置参数 id ----
     const val WIFI_SSID = 1
     const val WIFI_PASSPHRASE = 2
@@ -158,6 +161,14 @@ object Iap2Messages {
         val receiveIds: Set<Int>?,
         /** ExternalAccessory 协议（(协议号, 协议名)）。 */
         val eaProtocols: List<EaProtocol>,
+        /**
+         * 是否声明了 **WirelessCarPlayTransportComponent（参数 id=0x18=24）**。
+         *
+         * 这是「车机当前愿意做无线 CarPlay」的组件级证据：BMW iD8.5 的档案 B 才带它
+         * （component 名形如 `BMW 31726 Wifi`），档案 A 里没有（cardeck 2026-10-21
+         * 两份 0x1D01 原始体对照定谳）。A/B 判定用它做第三判据。
+         */
+        val hasWirelessCarPlayComponent: Boolean,
     ) {
         /** 车机是否声明会发某消息；null = 未提供清单（未知）。 */
         fun declaresSend(messageId: Int): Boolean? = sendIds?.contains(messageId)
@@ -221,6 +232,7 @@ object Iap2Messages {
             sendIds = sendIds,
             receiveIds = receiveIds,
             eaProtocols = ea,
+            hasWirelessCarPlayComponent = firstById[IDENT_WIRELESS_CARPLAY_COMPONENT] != null,
         )
     }
 

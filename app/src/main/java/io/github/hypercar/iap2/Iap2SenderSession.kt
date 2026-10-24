@@ -32,6 +32,14 @@ interface Iap2LinkChannel {
 }
 
 /**
+ * 车机本次为「档案 A」：0x1D01 里没有任何无线 CarPlay 能力（无 0x5703/0x4301，
+ * EA 里也没有 `com.bmw.carplay`）。此时继续等、继续发请求都不会有结果——
+ * 但**也不能一直握着这条会话**：车机下一次连入会被 [Iap2Bluetooth] 的
+ * `sessionActive` 门闸挡掉，而车机的下一轮很可能就是档案 B（BMW 实测 A/B 交替）。
+ */
+class NoCarPlayWindowException(message: String) : IOException(message)
+
+/**
  * iAP2 发送端（iPhone 角色）控制会话：走通无线 CarPlay 的 bring-up 序列，
  * 产出 [CarPlayEndpoint]（热点凭据 + AirPlay 端点）交给上层。
  *
@@ -227,6 +235,19 @@ class Iap2SenderSession(
             }
         }
 
+        // ---- 档案 A（BMW 常见）：车机本次没开无线 CarPlay 窗口 ----
+        // 车机单方面决定 A/B（cardeck 2026-10-21 日志：同一台车每轮 A/B 交替），
+        // 发什么都改不了；而握着这条会话会挡掉车机下一次连入（sessionActive 门闸），
+        // 所以这里**主动结束**，让车机重开——下一轮很可能就是档案 B。
+        // 只对能确认是 BMW 形态（身份含 BMW，或 EA 里有 de.bmw.*）的车机做，
+        // 其它车机（清单稀疏/只走 mDNS 的老接收端）保持原来的等待行为。
+        val looksLikeBmw =
+            identityText.contains("bmw") ||
+                ident.eaProtocols.any { it.name.startsWith("de.bmw.", ignoreCase = true) }
+        if (looksLikeBmw && !isCarPlayProfileB(ident)) {
+            throw NoCarPlayWindowException("车机本次为档案 A（无 0x5703/0x4301、EA 无 com.bmw.carplay）")
+        }
+
         // ---- StartHID（0x6800 → 0x6801）：真 iPhone 会应答，漏了车机可能判定设备未就绪 ----
         awaitOptionalHid(deadline)
 
@@ -351,27 +372,38 @@ class Iap2SenderSession(
      * 车机「无线 CarPlay 档案」判定（BMW iD8.5 的 A/B 两套清单，见 docs/NEGOTIATION-GAPS §8.5
      * 与 cardeck PROTOCOL-NOTES §9j）：
      *  - **B**：发送清单含 0x5703（或 0x4301）、EA 里有 `com.bmw.carplay` = 车机已把
-     *    「无线 CarPlay」这一档能力打开（iDrive 里这台手机被选为 CarPlay 设备）；
+     *    「无线 CarPlay」这一档能力打开；
      *  - **A**：以上都没有，只有 iPod/BMW Apps 那一套（0x4Cxx/0x5000/0x6800/0xAE00/EA
-     *    `de.bmw.a4a.*`）= 车机没开 CarPlay 窗口，此时无论怎么请求都拿不到热点凭据。
+     *    `de.bmw.a4a.*`）= 车机没开 CarPlay 窗口。
      *
-     * 档案 A 下唯一要做的事就是**保持链路 + 等**（用户去 iDrive 里点一次，车机重开一轮
-     * iAP2 就是档案 B）；旧实现直接拆链，于是永远停在 A。
+     * **A/B 是车机单方面给的，手机发什么都改不了它**（cardeck 2026-10-21 日志：同一台
+     * BMW 31726 在 20:22:39=A、20:23:07=B、20:23:20=A、20:23:43=B 来回切）。
+     * 所以档案 A 下唯一有意义的事是**尽快结束本会话**，让车机下一次连入（很可能就是 B）。
+     * 旧实现直接拆链看似一样，但它会连带把上层会话拆掉（ACL 断开 → disconnect()），
+     * 而且 3 分钟的端点等待期间车机再连入会被 sessionActive 挡掉。
      */
+    private fun isCarPlayProfileB(ident: Iap2Messages.Identification): Boolean {
+        val declaresWifi = ident.declaresSend(Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION) == true
+        val declaresStart = ident.declaresSend(Iap2MessageIds.CARPLAY_START_SESSION) == true
+        val bmwCarplay = ident.eaProtocols.any { it.name.contains("com.bmw.carplay", ignoreCase = true) }
+        return declaresWifi || declaresStart || bmwCarplay || ident.hasWirelessCarPlayComponent
+    }
+
     private fun logWirelessCarPlayProfile(ident: Iap2Messages.Identification) {
         val declaresWifi = ident.declaresSend(Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION) == true
         val declaresStart = ident.declaresSend(Iap2MessageIds.CARPLAY_START_SESSION) == true
         val eaNames = ident.eaProtocols.map { it.name }
         val bmwCarplay = eaNames.any { it.contains("com.bmw.carplay", ignoreCase = true) }
-        if (declaresWifi || declaresStart || bmwCarplay) {
+        if (isCarPlayProfileB(ident)) {
             log(
                 "iap2 无线 CarPlay 档案=B（车机已开放 CarPlay 窗口：0x5703=$declaresWifi " +
-                    "0x4301=$declaresStart com.bmw.carplay=$bmwCarplay）",
+                    "0x4301=$declaresStart com.bmw.carplay=$bmwCarplay " +
+                    "WirelessCarPlay组件=${ident.hasWirelessCarPlayComponent}）",
             )
         } else {
             log(
-                "iap2 无线 CarPlay 档案=A（车机没开 CarPlay 窗口：无 0x5703/0x4301，" +
-                    "EA=${eaNames.joinToString("/").ifEmpty { "-" }}）——保持链路等车机重开",
+                "iap2 无线 CarPlay 档案=A（车机没开 CarPlay 窗口：无 0x5703/0x4301、无 WirelessCarPlay 组件，" +
+                    "EA=${eaNames.joinToString("/").ifEmpty { "-" }}）——尽快结束本会话让车机重开",
             )
         }
     }
