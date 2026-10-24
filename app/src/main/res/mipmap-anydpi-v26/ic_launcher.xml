@@ -1,9 +1,10 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!-- 自适应图标：深海军蓝底 + 冷白 H 字标。
-     foreground 为全出血画布（已含背景与光影），形状遮罩由系统施加；
-     monochrome 供 Android 13+「主题图标」使用，系统会按壁纸取色重新着色。 -->
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标：深空底 + 车形/投屏/无线弧（与 PC 侧 hypercar-hub 同一图形语言）。
+     background 为纯色底，foreground 是透明底图形（内容约占 68%，落在系统 72dp 安全区内），
+     monochrome 供 Android 13+「主题图标」使用，系统按壁纸取色重新着色。 -->
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@color/ic_launcher_background" />
     <foreground android:drawable="@drawable/ic_launcher_glyph" />
     <monochrome android:drawable="@drawable/ic_launcher_monochrome" />
 </adaptive-icon>
+

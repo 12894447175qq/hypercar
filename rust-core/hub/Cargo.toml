@@ -8,7 +8,14 @@ description = "PC 侧联调 HU：手机上的 CarLife(MD) → 本机 CarLife HU 
 name = "hypercar-hub"
 path = "src/main.rs"
 
+[build-dependencies]
+# 把 .ico 编进 exe（windres）
+embed-resource = "2"
+
 [dependencies]
+# 原生 Win32 窗口（参数面板），不再依赖 PowerShell 脚本
+native-windows-gui = "1.0"
+# 也不用再借 PowerShell 拉起窗体。
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal"] }
 bytes = "1"
 log = "0.4"
@@ -38,5 +45,9 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
+
+
+
+
 
 

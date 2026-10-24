@@ -1,4 +1,4 @@
-package io.github.hypercar.ui
+﻿package io.github.hypercar.ui
 
 import android.content.Intent
 import android.net.Uri
@@ -299,7 +299,9 @@ private fun MainContent() {
                         onOpenShizukuSettings = { tabIndex = AppTab.Settings.ordinal },
                     )
 
-                    AppTab.Settings -> SettingsScreen()
+                    AppTab.Settings -> SettingsScreen(
+                            linkConnected = snapshot.link is io.github.hypercar.core.LinkState.Connected ||
+                                snapshot.link is io.github.hypercar.core.LinkState.Negotiating,)
 
                     AppTab.Diagnostics -> DiagnosticsScreen(
                         logs = snapshot.recentLogs,
@@ -372,3 +374,5 @@ private fun StatusStrip(link: LinkState, modifier: Modifier = Modifier) {
         )
     }
 }
+
+

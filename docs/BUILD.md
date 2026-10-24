@@ -1,4 +1,4 @@
-# 编译指南
+﻿# 编译指南
 
 ## 0. 环境
 
@@ -35,6 +35,13 @@ pwsh -File tools\build-local.ps1 -Release -SkipRust          # 只改 Kotlin 时
 外置、NDK 环境变量，并把 `.so` 拷到 `app/src/main/jniLibs`。
 
 ### 1.2 PC 侧 HU（盒子角色 / 联调）
+
+> 仓库里带了一个**预编译好的** `tools/hypercar-hub.exe`（约 1.5 MB，Windows x64）：
+> **双击它直接打开原生 Win32 参数面板**（Rust + `native-windows-gui`，不依赖 PowerShell），
+> 可填参数、点「自动检测」经 adb 取值、保存到 `%LOCALAPPDATA%\hypercar-hub\gui.ini`、
+> 点「启动」跑 headless 子进程并把日志实时显示在窗口里。
+> 带参数启动仍是命令行模式（`--no-gui` 可强制）。
+> 改了 Rust 代码后记得用下面的命令重新构建并覆盖它。
 
 独立 crate `rust-core/hub`，用 `#[path]` 复用同一批协议源码（不含 JNI/android_logger），
 **不影响 Android 构建**：
@@ -128,4 +135,6 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
   - 语音助手「麦克风有问题 / 不响应」 → 见 `docs/CARLIFE-PROTOCOL.md`：CarLife 期望
     「车机」供麦（VR `VR_MIC_DATA 0x58001`），或把车机端设置切到「手机麦克风录音」；
     MIUI 会把 CarWith 的后台录音静音（appops 锁在 foreground），此时只能靠本 App 供麦。
+
+
 

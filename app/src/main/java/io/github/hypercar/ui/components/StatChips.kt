@@ -6,9 +6,11 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -46,27 +48,43 @@ import io.github.hypercar.ui.theme.TextSecondary
 import java.util.Locale
 
 /**
- * 统计芯片行：视频 / CarLife / 音频 / Shizuku。
- * 单行横向滚动（窄屏也能全部看到），每枚芯片最小高度 52dp 保证触达一致。
+ * 统计芯片：视频 / CarLife / 音频 / Shizuku。
+ *
+ * 布局（现场 2026-10-24 两轮反馈后定稿）：
+ *  - 第一行三枚等分：视频 │ CarLife │ 音频；
+ *  - Shizuku 单独一行、整宽（与上面三枚总宽对齐），因此可以写完整说明文字；
+ *  - 四枚统一装进一张 GlassPanel，与首页其它卡片视觉一致（原来是单行横滑，
+ *    Shizuku 在窄屏被挤出屏幕，要左滑才看得到）。
  */
 @Composable
-fun StatChips(
+fun StatGrid(
     snapshot: SessionSnapshot,
     modifier: Modifier = Modifier,
     /** 联调模式（PC 侧当 HU）：本机引擎不跑，视频/CarLife/音频统计无从更新，芯片改为说明来源。 */
     externalMode: Boolean = false,
     onOpenShizuku: (() -> Unit)? = null,
+    /** 降级模式说明（原首页下方那张大卡，已并到 Shizuku 芯片）。 */
+    degradedHint: String? = null,
 ) {
-    Row(
-        modifier = modifier
-            .fillMaxWidth()
-            .horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    GlassPanel(
+        modifier = modifier.fillMaxWidth(),
+        contentPadding = PaddingValues(14.dp),
     ) {
-        VideoChip(snapshot.video, externalMode)
-        CarLifeChip(snapshot.carLife, externalMode)
-        AudioChip(snapshot.audio, externalMode)
-        ShizukuChip(snapshot.shizukuReady, onOpenShizuku)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            VideoChip(snapshot.video, externalMode, Modifier.weight(1f))
+            CarLifeChip(snapshot.carLife, externalMode, Modifier.weight(1f))
+            AudioChip(snapshot.audio, externalMode, Modifier.weight(1f))
+        }
+        Spacer(modifier = Modifier.height(10.dp))
+        ShizukuChip(
+            ready = snapshot.shizukuReady,
+            onClick = onOpenShizuku,
+            degradedHint = degradedHint,
+            modifier = Modifier.fillMaxWidth(),
+        )
     }
 }
 
@@ -84,12 +102,11 @@ private fun StatChip(
     Row(
         modifier = modifier
             .heightIn(min = 52.dp)
-            .widthIn(min = ChipMinWidth)
             .clip(RoundedCornerShape(16.dp))
             .background(SurfaceInset.copy(alpha = 0.65f))
             .border(1.dp, StrokeGlass, RoundedCornerShape(16.dp))
             .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
-            .padding(horizontal = 14.dp, vertical = 10.dp),
+            .padding(horizontal = 10.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         if (leadingIcon != null) {
@@ -104,7 +121,7 @@ private fun StatChip(
             StatusDot(color = accent)
             Spacer(modifier = Modifier.width(8.dp))
         }
-        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(
                 text = label,
                 style = MaterialTheme.typography.labelSmall,
@@ -125,7 +142,7 @@ private fun StatChip(
 /* ---------- 各链路状态 → 芯片 ---------- */
 
 @Composable
-private fun VideoChip(video: VideoStats, external: Boolean = false) {
+private fun VideoChip(video: VideoStats, external: Boolean = false, modifier: Modifier = Modifier) {
     val idle = video.fps <= 0
     val accent = if (idle) TextSecondary else ElectricCyan
     val value = if (idle) {
@@ -146,17 +163,19 @@ private fun VideoChip(video: VideoStats, external: Boolean = false) {
         value = value,
         accent = accent,
         leadingIcon = Icons.Rounded.Videocam,
+        modifier = modifier,
     )
 }
 
 @Composable
-private fun CarLifeChip(carLife: CarLifeState, external: Boolean = false) {
+private fun CarLifeChip(carLife: CarLifeState, external: Boolean = false, modifier: Modifier = Modifier) {
     when (carLife) {
         is CarLifeState.Idle -> StatChip(
             label = "CarLife",
                 value = if (external) "PC 侧接入" else "未接入",
             accent = TextSecondary,
             leadingIcon = Icons.Rounded.GraphicEq,
+            modifier = modifier,
         )
 
         is CarLifeState.Waiting -> StatChip(
@@ -164,6 +183,7 @@ private fun CarLifeChip(carLife: CarLifeState, external: Boolean = false) {
             value = "等待接入 :${carLife.port}",
             accent = AmberWarning,
             leadingIcon = Icons.Rounded.GraphicEq,
+            modifier = modifier,
         )
 
         is CarLifeState.Active -> StatChip(
@@ -171,12 +191,13 @@ private fun CarLifeChip(carLife: CarLifeState, external: Boolean = false) {
             value = "已接入 · ${carLife.appLabel}",
             accent = MintGreen,
             leadingIcon = Icons.Rounded.GraphicEq,
+            modifier = modifier,
         )
     }
 }
 
 @Composable
-private fun AudioChip(audio: AudioStats, external: Boolean = false) {
+private fun AudioChip(audio: AudioStats, external: Boolean = false, modifier: Modifier = Modifier) {
     val (accent, value) = when {
         audio.ducking -> AmberWarning to "导航闪避中"
         audio.playing -> MintGreen to "播放中"
@@ -187,17 +208,27 @@ private fun AudioChip(audio: AudioStats, external: Boolean = false) {
         value = value,
         accent = accent,
         leadingIcon = Icons.Rounded.Navigation,
+        modifier = modifier,
     )
 }
 
 @Composable
-private fun ShizukuChip(ready: Boolean, onClick: (() -> Unit)? = null) {
+private fun ShizukuChip(
+    ready: Boolean,
+    onClick: (() -> Unit)? = null,
+    degradedHint: String? = null,
+    modifier: Modifier = Modifier,
+) {
     // Shizuku 已降级为「可选增强」：没有它也能连车（热点首连弹一次框 + 稳定伪 MAC），
     // 有则体验最优（0 弹窗 + 真实蓝牙 MAC）。故未就绪时用中性灰、文案标「可选」，不报警色。
     // 未就绪时可点进设置页授权（此前只有只读文案，用户找不到入口）。
     StatChip(
         label = "Shizuku",
-        value = if (ready) "增强已启用" else "未启用 · 点此设置",
+        value = when {
+            ready -> "增强已启用 · 静默入网、真实蓝牙 MAC"
+            !degradedHint.isNullOrBlank() -> degradedHint
+            else -> "未启用 · 点此设置"
+        },
         accent = if (ready) MintGreen else TextSecondary,
         leadingIcon = Icons.Rounded.Security,
         onClick = if (ready) null else onClick,
@@ -214,5 +245,10 @@ private fun formatBitrate(kbps: Long): String = if (kbps >= 1000L) {
 
 /** 芯片最小宽度，保证短文案芯片不至于太窄。 */
 private val ChipMinWidth = 110.dp
+
+
+
+
+
 
 

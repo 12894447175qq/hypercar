@@ -1,4 +1,4 @@
-package io.github.hypercar.ui.components
+﻿package io.github.hypercar.ui.components
 
 import android.content.Intent
 import android.provider.Settings
@@ -47,7 +47,7 @@ fun DegradedGuidanceCard(
     locationOn: Boolean,
     firstConnectDone: Boolean,
     onRequestPermission: () -> Unit,
-    onTestConnect: () -> Unit,
+
     modifier: Modifier = Modifier,
 ) {
     // 三种待办态取最紧迫的一种；无待办则不渲染
@@ -94,7 +94,7 @@ fun DegradedGuidanceCard(
         Spacer(modifier = Modifier.height(14.dp))
         state.ActionButton(
             onRequestPermission = onRequestPermission,
-            onTestConnect = onTestConnect,
+    
         )
     }
 }
@@ -134,7 +134,7 @@ private enum class GuidanceState {
         }
 
     @Composable
-    fun ActionButton(onRequestPermission: () -> Unit, onTestConnect: () -> Unit) {
+    fun ActionButton(onRequestPermission: () -> Unit) {
         val context = LocalContext.current
         when (this) {
             NeedPermission -> CapsuleButton(
@@ -157,15 +157,8 @@ private enum class GuidanceState {
                 filled = true,
                 leadingIcon = Icons.Rounded.Place,
             )
+            NeedFirstConnect -> Unit   // 首连提示只留文字，不再放「测试连接」按钮（首页按钮已移除）
 
-            NeedFirstConnect -> CapsuleButton(
-                text = "测试连接",
-                onClick = onTestConnect,
-                modifier = Modifier.fillMaxWidth(),
-                filled = true,
-                containerColor = MintGreen,
-                leadingIcon = Icons.Rounded.WifiProtectedSetup,
-            )
         }
     }
 }

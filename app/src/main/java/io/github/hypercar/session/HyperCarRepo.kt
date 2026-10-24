@@ -231,6 +231,8 @@ object HyperCarRepo {
             // Rust 回调 → 快照（Rust 工作线程回调，直接改 StateFlow 是安全的）
             RustCoreBridge.setListener(rustListener)
         }
+            // 首启时快照还没读过系统态：这里先算一次（否则 Shizuku 已授权也显示降级模式）
+            push()
     }
 
     /**
@@ -1638,6 +1640,7 @@ object HyperCarRepo {
     /** 重启时从落盘日志带回环形缓冲的行数（够覆盖崩溃前的一段现场）。 */
     private const val DISK_LOG_TAIL_LINES = 120
 }
+
 
 
 

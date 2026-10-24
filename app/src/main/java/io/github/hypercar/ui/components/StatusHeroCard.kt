@@ -1,4 +1,4 @@
-package io.github.hypercar.ui.components
+﻿package io.github.hypercar.ui.components
 
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.LinearEasing
@@ -10,6 +10,9 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -72,6 +75,10 @@ fun StatusHeroCard(
     link: LinkState,
     onStartClick: () -> Unit,
     onStopClick: () -> Unit,
+    /** 右上角日志图标（原来首页底部那行「查看全部日志」文字链接）。 */
+    onOpenLogs: (() -> Unit)? = null,
+    /** 当前车机档案名（显示在标题上方，小字）。 */
+    profileLabel: String? = null,
     modifier: Modifier = Modifier,
 ) {
     val isConnected = link is LinkState.Connected
@@ -95,15 +102,31 @@ fun StatusHeroCard(
         glow = link !is LinkState.Idle,
         glowColor = accent,
     ) {
-        Column(verticalArrangement = Arrangement.spacedBy(20.dp)) {
-            Crossfade(
-                targetState = link,
-                animationSpec = tween(300),
-                label = "hero-state",
-            ) { state ->
-                HeroHeadline(link = state, nowMillis = nowMillis)
+        // 右上角日志图标：原来是首页底部一行「查看全部日志」文字链接，
+        // 挪到首卡右上角后不占版面，也符合"第一张卡就是入口"的直觉。
+        Box(modifier = Modifier.fillMaxWidth()) {
+            Column(verticalArrangement = Arrangement.spacedBy(20.dp)) {
+                Crossfade(
+                    targetState = link,
+                    animationSpec = tween(300),
+                    label = "hero-state",
+                ) { state ->
+                    HeroHeadline(link = state, nowMillis = nowMillis, profileLabel = profileLabel)
+                }
+                HeroAction(link = link, onStartClick = onStartClick, onStopClick = onStopClick)
             }
-            HeroAction(link = link, onStartClick = onStartClick, onStopClick = onStopClick)
+            if (onOpenLogs != null) {
+                Text(
+                    text = "☰",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = TextSecondary,
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable(onClick = onOpenLogs)
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                )
+            }
         }
     }
 }
@@ -111,7 +134,7 @@ fun StatusHeroCard(
 /* ---------- 头部：图形 + 文案 ---------- */
 
 @Composable
-private fun HeroHeadline(link: LinkState, nowMillis: Long) {
+private fun HeroHeadline(link: LinkState, nowMillis: Long, profileLabel: String? = null) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
@@ -134,6 +157,14 @@ private fun HeroHeadline(link: LinkState, nowMillis: Long) {
                         style = MaterialTheme.typography.bodyMedium,
                         color = TextSecondary,
                     )
+                    if (!profileLabel.isNullOrBlank()) {
+                        // 车机型号放在「自动秒连建链」下面、左对齐（与标题同一左起点）
+                        Text(
+                            text = "当前车机型号：$profileLabel",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = TextSecondary.copy(alpha = 0.8f),
+                        )
+                    }
                 }
 
                 is LinkState.Negotiating -> {
@@ -467,3 +498,7 @@ internal fun formatDuration(millis: Long): String {
     val seconds = totalSeconds % 60L
     return String.format(Locale.US, "%02d:%02d", minutes, seconds)
 }
+
+
+
+

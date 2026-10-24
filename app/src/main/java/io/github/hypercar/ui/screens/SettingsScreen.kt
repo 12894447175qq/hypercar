@@ -56,6 +56,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import android.Manifest
+import android.bluetooth.BluetoothAdapter
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
@@ -108,7 +112,7 @@ private val CarLifePackagePresets = listOf(
  *   3. **高级**（分隔线以下）：编码分辨率（现在是兜底值）、设备身份（蓝牙 MAC）、Shizuku。
  */
 @Composable
-fun SettingsScreen(modifier: Modifier = Modifier) {
+fun SettingsScreen(modifier: Modifier = Modifier, linkConnected: Boolean = false) {
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -120,7 +124,7 @@ fun SettingsScreen(modifier: Modifier = Modifier) {
         BehaviorSection()
         WakePackageSection()
         // ---- 一次性配置 ----
-        HeadUnitSection()
+        HeadUnitSection(connected = linkConnected)
         TargetCarSection()
         PermissionSettingsSection()
         // ---- 高级 ----
@@ -615,43 +619,136 @@ private fun PermissionSettingsSection() {
 
 @Composable
 private fun TargetCarSection() {
-    var targetName by rememberSaveable {
-        mutableStateOf(SettingsStore.targetCarName ?: "自动发现")
-    }
+    // 读一次变更计数器：切换车机型号会 bump，从而让本区块重新组合并显示"自动发现"
+    io.github.hypercar.settings.SettingsRevision.value
+    val targetName = SettingsStore.targetCarName ?: "自动发现"
+    var expanded by rememberSaveable { mutableStateOf(false) }
     var dialogVisible by remember { mutableStateOf(false) }
+    val context = androidx.compose.ui.platform.LocalContext.current
+    // 已配对设备（下拉候选）。BLUETOOTH_CONNECT 未授予时给空表，
+    // 只保留「自动发现」与「手动输入 MAC…」两项，不至于让下拉空着。
+    val bonded = remember(expanded) {
+        runCatching {
+            val granted = ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.BLUETOOTH_CONNECT,
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!granted) {
+                emptyList<Pair<String, String>>()
+            } else {
+                BluetoothAdapter.getDefaultAdapter()
+                    ?.bondedDevices
+                    ?.map { (it.name ?: "未命名设备") to it.address }
+                    ?.sortedBy { it.first }
+                    .orEmpty()
+            }
+        }.getOrDefault(emptyList())
+    }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionLabel(text = "目标车机")
         GlassPanel(
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
+            Box {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable { expanded = true }
+                        .padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = targetName,
+                            style = MaterialTheme.typography.titleMedium,
+                            color = if (targetName == "自动发现") TextSecondary else TextPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            text = "仅列出已配对设备 · 未配置时来者不拒",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextSecondary,
+                        )
+                    }
                     Text(
-                        text = targetName,
+                        text = "▾",
                         style = MaterialTheme.typography.titleMedium,
-                        color = if (targetName == "自动发现") TextSecondary else TextPrimary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Text(
-                        text = "仅列出已配对设备 · 未配置时来者不拒",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = TextSecondary,
+                        color = ElectricCyan,
                     )
                 }
-                Spacer(modifier = Modifier.width(12.dp))
-                CapsuleButton(
-                    text = "选择",
-                    onClick = { dialogVisible = true },
-                    modifier = Modifier.height(44.dp),
-                    filled = false,
-                    contentColor = ElectricCyan,
-                    borderColor = ElectricCyan.copy(alpha = 0.6f),
-                )
+                DropdownMenu(
+                    expanded = expanded,
+                    onDismissRequest = { expanded = false },
+                    modifier = Modifier.width(320.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    containerColor = SurfaceInset,
+                    border = androidx.compose.foundation.BorderStroke(1.dp, StrokeGlass),
+                ) {
+                    DropdownMenuItem(
+                        text = {
+                            Column {
+                                Text(
+                                    text = "自动发现",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = if (targetName == "自动发现") ElectricCyan else TextPrimary,
+                                )
+                                Text(
+                                    text = "不限制车机，谁来连都接受",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = TextSecondary,
+                                )
+                            }
+                        },
+                        onClick = {
+                            SettingsStore.targetCarMac = null
+                            SettingsStore.targetCarName = null
+                            expanded = false
+                        },
+                    )
+                    if (bonded.isNotEmpty()) {
+                        HorizontalDivider(color = StrokeGlass)
+                        bonded.forEach { (name, mac) ->
+                            DropdownMenuItem(
+                                text = {
+                                    Column {
+                                        Text(
+                                            text = name,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            color = if (targetName == name) ElectricCyan else TextPrimary,
+                                        )
+                                        Text(
+                                            text = mac,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = TextSecondary,
+                                        )
+                                    }
+                                },
+                                onClick = {
+                                    SettingsStore.targetCarMac = mac
+                                    SettingsStore.targetCarName = name
+                                    expanded = false
+                                },
+                            )
+                        }
+                    }
+                    HorizontalDivider(color = StrokeGlass)
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                text = "手动输入 MAC…",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = TextPrimary,
+                            )
+                        },
+                        onClick = {
+                            expanded = false
+                            dialogVisible = true
+                        },
+                    )
+                }
             }
         }
     }
@@ -664,13 +761,11 @@ private fun TargetCarSection() {
             onCleared = {
                 SettingsStore.targetCarMac = null
                 SettingsStore.targetCarName = null
-                targetName = "自动发现"
                 dialogVisible = false
             },
             onSaved = { mac, name ->
                 SettingsStore.targetCarMac = mac.ifBlank { null }
                 SettingsStore.targetCarName = name.ifBlank { null }
-                targetName = name.ifBlank { "自动发现" }
                 dialogVisible = false
             },
         )
@@ -850,18 +945,19 @@ private fun ResolutionSection() {
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     modifier = Modifier.weight(1f),
                 )
+                TextButton(
+                    onClick = {
+                        SettingsStore.carlifeWidth = 2560
+                        SettingsStore.carlifeHeight = 744
+                        widthText = "2560"
+                        heightText = "744"
+                    },
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                ) {
+                    Text("恢复默认", style = MaterialTheme.typography.labelMedium)
+                }
             }
             Spacer(modifier = Modifier.height(8.dp))
-            TextButton(
-                onClick = {
-                    SettingsStore.carlifeWidth = 2560
-                    SettingsStore.carlifeHeight = 744
-                    widthText = "2560"
-                    heightText = "744"
-                },
-            ) {
-                Text("恢复默认 2560×744", style = MaterialTheme.typography.labelMedium)
-            }
             Spacer(modifier = Modifier.height(16.dp))
             FpsSegment()
         }
@@ -904,7 +1000,6 @@ private fun FpsSegment() {
 private fun BehaviorSection() {
     var autoConnect by rememberSaveable { mutableStateOf(SettingsStore.autoConnect) }
     var enableAudio by rememberSaveable { mutableStateOf(SettingsStore.enableAudio) }
-    var keepAliveOnly by rememberSaveable { mutableStateOf(SettingsStore.iap2KeepAliveOnly) }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionLabel(text = "行为")
@@ -928,17 +1023,6 @@ private fun BehaviorSection() {
                 onCheckedChange = {
                     enableAudio = it
                     SettingsStore.enableAudio = it
-                },
-            )
-            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-            SwitchRow(
-                title = "联调：只保持 iAP2 链路",
-                subtitle = "不启 AirPlay 引擎。接收端（WinPlay）要求蓝牙链路常开、" +
-                    "而 AirPlay 由 PC 侧 hypercar-hub 推送时用这个",
-                checked = keepAliveOnly,
-                onCheckedChange = {
-                    keepAliveOnly = it
-                    SettingsStore.iap2KeepAliveOnly = it
                 },
             )
         }
@@ -1130,48 +1214,46 @@ private fun WakePackageSection() {
  * 新增品牌不需要改这里，只在 [io.github.hypercar.headunit.HeadUnitProfiles.all] 注册。
  */
 @Composable
-private fun HeadUnitSection() {
+private fun HeadUnitSection(connected: Boolean = false) {
     var selectedId by rememberSaveable { mutableStateOf(SettingsStore.headUnitProfileId) }
+    var expanded by rememberSaveable { mutableStateOf(false) }
     val profiles = io.github.hypercar.headunit.HeadUnitProfiles.all
+    val current = io.github.hypercar.headunit.HeadUnitProfiles.byId(selectedId)
+
+    // 选中即生效的副作用统一走这里（含「联调/只保 iAP2」的联动，见 profile.keepIap2AliveOnly）
+    fun applyProfile(profile: io.github.hypercar.headunit.HeadUnitProfile) {
+        SettingsStore.headUnitProfileId = profile.id
+        // 原来设置里有个独立的「联调：只保持 iAP2 链路」开关，现在由档案联动：
+        // 选 WinPlay 自动打开（AirPlay 由 PC 侧 hub 推），选真车自动关闭。
+        SettingsStore.iap2KeepAliveOnly = profile.keepIap2AliveOnly
+        // 换车机型号时把「目标车机」重置为自动发现：上一台的名字/MAC 留着，
+        // 新车型会因「目标对不上」直接失败，而用户常常忘了改（现场反馈）。
+        SettingsStore.targetCarMac = null
+        SettingsStore.targetCarName = null
+        io.github.hypercar.settings.SettingsRevision.bump()
+        selectedId = profile.id
+    }
+
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionLabel(text = "车机型号")
         GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp)) {
-            Text(
-                text = "决定这套协议按哪台车机的习惯跑（iAP2 支持哪些消息、AirPlay 端口怎么找、" +
-                    "触摸坐标按谁的空间算）。选错的典型表现是「能连上但点不准」或「车机上没有 CarPlay 图标」。",
-                style = MaterialTheme.typography.bodySmall,
-                color = TextSecondary,
-            )
-            Spacer(modifier = Modifier.height(10.dp))
-            profiles.forEach { profile ->
-                val selected = profile.id == selectedId
+            Box {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(12.dp))
-                        .clickable {
-                            selectedId = profile.id
-                            SettingsStore.headUnitProfileId = profile.id
-                        }
-                        .padding(vertical = 10.dp, horizontal = 8.dp),
+                        .clickable(enabled = !connected) { expanded = true }
+                        .padding(vertical = 12.dp, horizontal = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    RadioButton(
-                        selected = selected,
-                        onClick = {
-                            selectedId = profile.id
-                            SettingsStore.headUnitProfileId = profile.id
-                        },
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
                     Column(modifier = Modifier.weight(1f)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(
-                                text = "${profile.label} · ${profile.model}",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = if (selected) ElectricCyan else TextPrimary,
+                                text = "${current.label} · ${current.model}",
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = if (connected) TextSecondary else ElectricCyan,
                             )
-                            if (!profile.verified) {
+                            if (!current.verified) {
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text(
                                     text = "未实测",
@@ -1185,15 +1267,85 @@ private fun HeadUnitSection() {
                             }
                         }
                         Text(
-                            text = profile.notes,
+                            text = current.notes,
                             style = MaterialTheme.typography.labelSmall,
                             color = TextSecondary,
                             maxLines = 3,
                             overflow = TextOverflow.Ellipsis,
                         )
                     }
+                    Text(
+                        text = "▾",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = if (connected) TextSecondary.copy(alpha = 0.4f) else ElectricCyan,
+                    )
+                }
+                DropdownMenu(
+                    expanded = expanded && !connected,
+                    onDismissRequest = { expanded = false },
+                    // 列表加外框 + 实底：默认菜单与背景几乎同色，条目之间分不清边界（现场反馈）
+                    modifier = Modifier.width(320.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    containerColor = SurfaceInset,
+                    border = androidx.compose.foundation.BorderStroke(1.dp, StrokeGlass),
+                ) {
+                    profiles.forEachIndexed { index, profile ->
+                        // 车型之间加分隔线：原来几条连成一片，分不清边界
+                        if (index > 0) HorizontalDivider(color = StrokeGlass)
+                        DropdownMenuItem(
+                            text = {
+                                Column {
+                                    Text(
+                                        text = "${profile.label} · ${profile.model}" +
+                                            if (profile.verified) "" else "（未实测）",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = if (profile.id == selectedId) ElectricCyan else TextPrimary,
+                                    )
+                                    Text(
+                                        text = profile.notes,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = TextSecondary,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                    if (profile.keepIap2AliveOnly) {
+                                        // 原来这句放在列表下方的页脚，容易看漏；
+                                        // 挪进 WinPlay 这一条里，选中前就能看到后果
+                                        Text(
+                                            text = "选它会进入「只保 iAP2 链路」模式：AirPlay 由 PC 侧 hub 推送",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = AmberWarning,
+                                            maxLines = 2,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                    }
+                                }
+                            },
+                            onClick = {
+                                applyProfile(profile)
+                                expanded = false
+                            },
+                        )
+                    }
                 }
             }
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = if (connected) {
+                    "连接中不可切换：先点「断开连接」再改（iAP2 握手已按当前档案走完）。"
+                } else {
+                    "切换后「下次连接」生效。"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = AmberWarning.copy(alpha = 0.85f),
+            )
         }
     }
 }
+
+
+
+
+
+
+

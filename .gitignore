@@ -1,4 +1,4 @@
-# Android
+﻿# Android
 /local.properties
 /.idea/
 /.gradle/
@@ -29,3 +29,11 @@ keystore.properties
 
 # 图标生成脚本的预览输出（tools/icon/out/，脚本本身入库）
 /tools/icon/out/
+
+# ---- 运行时产物（务必留在用户目录，别提交）----
+# AirPlay 长期身份 / 缓存 / GUI 配置：默认写到 %LOCALAPPDATA%\hypercar-hub\
+controller_identity*.txt
+identity-cache.txt
+gui.ini
+*.identity
+tools/*.identity

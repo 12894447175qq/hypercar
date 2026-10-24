@@ -1,6 +1,10 @@
 ﻿package io.github.hypercar.ui.screens
 
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -31,7 +35,7 @@ import io.github.hypercar.perm.PermissionSummary
 import io.github.hypercar.ui.components.DegradedGuidanceCard
 import io.github.hypercar.ui.components.GlassPanel
 import io.github.hypercar.ui.components.PermissionChecklistCard
-import io.github.hypercar.ui.components.StatChips
+import io.github.hypercar.ui.components.StatGrid
 import io.github.hypercar.ui.components.StatusHeroCard
 import io.github.hypercar.ui.theme.MintGreen
 import io.github.hypercar.ui.theme.MonoLogLine
@@ -82,70 +86,109 @@ fun HomeScreen(
                 horizontalArrangement = Arrangement.spacedBy(16.dp),
             ) {
                 Column(
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
                     StatusHeroCard(
                         link = snapshot.link,
                         onStartClick = onStart,
                         onStopClick = onStop,
+                        onOpenLogs = onOpenDiagnostics,
+                        profileLabel = io.github.hypercar.headunit.HeadUnitProfiles.current().label,
                     )
-                    Checklist()
-                    DegradedGuidanceCard(
-                        permissionGranted = snapshot.degradedPermissionGranted,
-                        locationOn = snapshot.degradedLocationOn,
-                        firstConnectDone = snapshot.degradedFirstConnectDone,
-                        onRequestPermission = onRequestDegradedPermission,
-                        onTestConnect = onStart,
-                    )
-                    FirstConnectGuideCard()
-                    StatChips(
+                    StatGrid(
                         snapshot = snapshot,
+                        externalMode = io.github.hypercar.settings.SettingsStore.iap2KeepAliveOnly,
                         onOpenShizuku = onOpenShizukuSettings,
+                        degradedHint = degradedChipHint(snapshot),
                     )
                 }
-                LogPreviewCard(
-                    logs = snapshot.recentLogs,
-                    onOpenDiagnostics = onOpenDiagnostics,
+                Column(
                     modifier = Modifier
                         .weight(1f)
-                        .fillMaxHeight(),
-                )
+                        .fillMaxHeight()
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    Checklist()
+                    FirstConnectGuideCard()
+
+                }
             }
         } else {
             Column(
                 modifier = Modifier
                     .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
                     .padding(horizontal = 16.dp, vertical = 16.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
+                // 第一张卡：实时步骤（Negotiating 时显示 link.step）
                 StatusHeroCard(
                     link = snapshot.link,
                     onStartClick = onStart,
                     onStopClick = onStop,
+                    onOpenLogs = onOpenDiagnostics,
+                        profileLabel = io.github.hypercar.headunit.HeadUnitProfiles.current().label,
+                )
+                // 四枚状态芯片改成 2×2：原来单行横滑，Shizuku 在窄屏上被挤出屏幕
+                StatGrid(
+                    snapshot = snapshot,
+                    externalMode = io.github.hypercar.settings.SettingsStore.iap2KeepAliveOnly,
+                    onOpenShizuku = onOpenShizukuSettings,
+                    degradedHint = degradedChipHint(snapshot),
                 )
                 Checklist()
-                DegradedGuidanceCard(
-                    permissionGranted = snapshot.degradedPermissionGranted,
-                    locationOn = snapshot.degradedLocationOn,
-                    firstConnectDone = snapshot.degradedFirstConnectDone,
-                    onRequestPermission = onRequestDegradedPermission,
-                    onTestConnect = onStart,
-                )
                 FirstConnectGuideCard()
-                StatChips(
-                    snapshot = snapshot,
-                    onOpenShizuku = onOpenShizukuSettings,
-                )
-                LogPreviewCard(
-                    logs = snapshot.recentLogs,
-                    onOpenDiagnostics = onOpenDiagnostics,
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth(),
-                )
+
+                Spacer(modifier = Modifier.height(8.dp))
             }
         }
+    }
+}
+
+/**
+ * 「查看全部日志」入口：首页原来的小日志卡占满底部且无法上滑（现场反馈），
+ * 改成一行可点文字，日志本身去「诊断」页看。
+ */
+/**
+ * Shizuku 芯片上的降级模式提示（原首页下方那张大卡的内容）。
+ *
+ * 只留一句最要紧的：还差什么动作。null = 不需要提示（Shizuku 已启用）。
+ */
+private fun degradedChipHint(snapshot: SessionSnapshot): String? = when {
+    snapshot.shizukuReady -> null
+    !snapshot.degradedPermissionGranted -> "降级模式 · 点此授权"
+    !snapshot.degradedLocationOn -> "降级模式 · 点此开定位"
+    !snapshot.degradedFirstConnectDone -> "降级模式 · 点此首连"
+    else -> "降级模式 · 点此设置"
+}
+
+
+@Composable
+private fun DiagnosticsLink(onOpenDiagnostics: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onOpenDiagnostics)
+            .padding(horizontal = 4.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "查看全部日志 / 诊断",
+            style = MaterialTheme.typography.labelMedium,
+            color = TextSecondary,
+        )
+        Spacer(modifier = Modifier.weight(1f))
+        Text(
+            text = "→",
+            style = MaterialTheme.typography.labelMedium,
+            color = TextSecondary,
+        )
     }
 }
 
@@ -312,3 +355,8 @@ internal fun FirstConnectGuideCard(modifier: Modifier = Modifier) {
         )
     }
 }
+
+
+
+
+
