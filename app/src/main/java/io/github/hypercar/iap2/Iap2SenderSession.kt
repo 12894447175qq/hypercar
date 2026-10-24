@@ -251,18 +251,29 @@ class Iap2SenderSession(
         // ---- StartHID（0x6800 → 0x6801）：真 iPhone 会应答，漏了车机可能判定设备未就绪 ----
         awaitOptionalHid(deadline)
 
-        // ---- WiFi 配置交换（按能力清单分派两代协议）----
-        // 旧协议（0x5702 → 0x5703）：手机请求，车机回 AP 明文——BMW 档案 B/Audi 走这条。
-        // 新协议（0x4300 → 0x4301）：**AP 信息由 0x4301 自带**——不声明 0x57xx 的车机走这条。
+        // ---- WiFi 配置交换（按「车机画像 wifiGen」分派，不按清单硬拦）----
+        // 旧协议（0x5702 → 0x5703）：手机请求，车机回 AP 明文。
+        // 新协议（0x4300 → 0x4301）：AP 信息由 0x4301 自带（BMW iD9 走这条）。
+        //
+        // **不要用「清单里有没有 0x5702」当硬门禁**（cardeck 0.1.14 奥迪 3315 定谳）：
+        // 清单只能证明「有」，不能证明「没有」。奥迪 3315 的可收清单只有 5 项、不含
+        // 0x5702，但它完整支持 0x5702→0x5703，而且**要靠收到 0x5702 才把 AirPlay 服务
+        // 拉起来**——按清单跳过的那一版：0 次 0x5702 → 端口 7000 全程 ECONNREFUSED。
+        // 只有「两清单合计 ≥10 项仍无 0x57xx」（BMW iD9 形态）才判 NEW、跳过 0x5702。
+        val wifiGen = ReceiverProfile.classifyWifiGen(ident.sendIds, ident.receiveIds)
+        log("iap2 车机画像 wifiGen=${ReceiverProfile.describe(wifiGen)}")
         val declaresReceiveWifi = ident.declaresReceive(Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION)
         val declaresSendWifi = ident.declaresSend(Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION)
-        val legacyWifiExchange = declaresReceiveWifi != false && declaresSendWifi != false
+        val legacyWifiExchange = wifiGen != ReceiverProfile.WifiGen.NEW
+        if (legacyWifiExchange && (declaresReceiveWifi == false || declaresSendWifi == false)) {
+            log(
+                "iap2 清单未声明 0x5702/0x5703（收=${declaresReceiveWifi ?: "未知"} " +
+                    "发=${declaresSendWifi ?: "未知"}）但画像判 ${wifiGen}——仍发 0x5702" +
+                    "（清单不完整不能反证「不支持」；车机对未声明消息通常照常处理）",
+            )
+        }
         val wifiFromExchange: Iap2Messages.WifiConfiguration? =
             if (!legacyWifiExchange) {
-                log(
-                    "iap2 车机未声明支持 0x5702/0x5703（收=${declaresReceiveWifi ?: "未知"} " +
-                        "发=${declaresSendWifi ?: "未知"}）——跳过旧协议，AP 信息由 0x4301 提供",
-                )
                 null
             } else {
                 send(Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION)
@@ -354,10 +365,11 @@ class Iap2SenderSession(
         // 真机顺序：0x4301（或只有 0x5703 时也算 Phase 1 末）之后回 0x4E0E，把本机蓝牙
         // 传输标识告诉车机（车机按它把 iAP2 设备与 RFCOMM 对端关联起来）。
         // Audi 实测车机「接受但从不 ACK」→ 必须发后不管，否则重传看门狗在 +20s 杀链路。
-        if (ident.declaresReceive(Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER) != false) {
-            sendFireAndForget(Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER, Iap2Csm.string(0, bluetoothMac))
-            log("iap2 tx=0x4e0e 设备传输标识（mac=$bluetoothMac）")
-        }
+        //
+        // **不能按清单声明拦**（cardeck 2026-10-22 定谳：清单只能证明「有」）：
+        // 同日日志里 0x4E0D/0x4E0B/0x4E0E 三条不在清单里，车机逐条 ACK 到位。
+        sendFireAndForget(Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER, Iap2Csm.string(0, bluetoothMac))
+        log("iap2 tx=0x4e0e 设备传输标识（mac=$bluetoothMac）")
         log(
             if (endpoint.ssid.isNullOrEmpty() && endpoint.ipAddresses.isEmpty()) {
                 "iap2 Phase 1 完成：尚无热点凭据/AirPlay 端点——进入保活等待车机下发"
@@ -744,7 +756,8 @@ class Iap2SenderSession(
                 if (frame == null) {
                     if (!channel.isAlive) {
                         log("iap2 MFi 挑战期间链路断开（${size}B，对端不接受该长度）——记入该车机被拒档位")
-                        MfiLengthMemory.recordRejected(context, receiverKey, size)
+                        // 硬拒绝：链路级证据，推翻「该长度=上次成功」的记忆（防迟到应答误记锁死）
+                        MfiLengthMemory.recordHardRejected(context, receiverKey, size)
                         return
                     }
                     continue

@@ -96,8 +96,11 @@ class CarPlayCtrlAdvertiser(
             return true
         }
         if (registered) {
-            log("$TAG: 重新注册 mDNS 广播（${registeredSsid ?: "?"} → $ssid）")
-            stop()
+            log("$TAG: 重新注册 mDNS 广播（${registeredSsid ?: "?"} → $ssid，端口 ${port} 不变）")
+            // **只换 mDNS 注册，不换 socket/端口**（cardeck 2026-10-22 实测）：
+            // 旧实现每次重注册都新建 ServerSocket（端口 43857→33383→…），中间还有最长
+            // 1.2s 的「服务空窗」——车机正好在这时按旧端口连进来就会失败。
+            unregisterMdns()
         }
         registeredSsid = ssid
         registeredNetwork = effectiveNetwork
@@ -116,9 +119,26 @@ class CarPlayCtrlAdvertiser(
     @Synchronized
     fun start(): Boolean {
         if (registered) return true
+        // socket 与 accept 线程**只在第一次创建**，之后重注册一直复用（端口稳定）
+        val socket =
+            serverSocket
+                ?: try {
+                    ServerSocket(0).also {
+                        serverSocket = it
+                    }
+                } catch (error: Exception) {
+                    log("$TAG: 监听端口创建失败 - ${error.message}")
+                    return false
+                }
+        // accept 线程若意外退出（socket 异常/被系统回收）要补起来，否则邀请永远没人接
+        if (acceptThread?.isAlive != true) {
+            acceptThread =
+                Thread({ acceptLoop(socket) }, "carplay-ctrl-accept").apply {
+                    isDaemon = true
+                    start()
+                }
+        }
         return try {
-            val socket = ServerSocket(0)
-            serverSocket = socket
             val mac = bluetoothMacProvider()
             val info =
                 NsdServiceInfo().apply {
@@ -162,11 +182,6 @@ class CarPlayCtrlAdvertiser(
                     "name=$SERVICE_NAME id=$mac srcvers=$SRCVERS" +
                     if (mac == PLACEHOLDER_MAC) "（⚠ 占位 MAC：车机不会邀请）" else "",
             )
-            acceptThread =
-                Thread({ acceptLoop(socket) }, "carplay-ctrl-accept").apply {
-                    isDaemon = true
-                    start()
-                }
             true
         } catch (error: Exception) {
             log("$TAG: 启动失败 - ${error.message}")
@@ -174,8 +189,19 @@ class CarPlayCtrlAdvertiser(
         }
     }
 
+    /** 只注销 mDNS 注册（保留 socket 与 accept 线程，端口不变）。 */
+    @Synchronized
+    private fun unregisterMdns() {
+        registered = false
+        registrationListener?.let { runCatching { nsdManager.unregisterService(it) } }
+        registrationListener = null
+        registeredMac = null
+    }
+
     private fun acceptLoop(socket: ServerSocket) {
-        while (registered) {
+        // 循环条件不能绑 `registered`：重注册期间 registered 会短暂为 false，
+        // 旧实现会让 accept 线程退出、之后再也没人接车机的 ctrl 邀请
+        while (!socket.isClosed) {
             val client =
                 try {
                     socket.accept()
@@ -274,12 +300,9 @@ class CarPlayCtrlAdvertiser(
 
     @Synchronized
     fun stop() {
-        registered = false
+        unregisterMdns()
         registeredSsid = null
         registeredNetwork = null
-        registeredMac = null
-        registrationListener?.let { runCatching { nsdManager.unregisterService(it) } }
-        registrationListener = null
         runCatching { serverSocket?.close() }
         serverSocket = null
         acceptThread?.interrupt()

@@ -485,6 +485,14 @@ object HyperCarRepo {
             log("WIFI: 本轮已加入热点 $ssid——复用网络，不重复连接")
             return joinedNetwork
         }
+        // 静默网关试探已经把进程绑到该 WiFi 了（无密码、只知道网关）——别再用
+        // 「当前默认网络」把它顶掉（热点无外网时默认网络常常是蜂窝）
+        if (!ssid.isNullOrBlank() && psk.isNullOrBlank() && boundNetwork != null && endpoint.gateway != null) {
+            log("WIFI: 已由静默试探绑定 \"$ssid\" 的网络——复用，不重新选网")
+            joinedSsid = ssid
+            joinedNetwork = boundNetwork
+            return boundNetwork
+        }
         val joiner = WifiJoiner(context) {
             // 车机熄火热点消失：结束会话，回到待机
             log("WIFI: 车机热点消失（熄火/离开）");
@@ -574,6 +582,88 @@ object HyperCarRepo {
                 .mapNotNull { it.hostAddress }
                 .firstOrNull { it.contains('.') && !it.contains(':') }
         }.getOrNull()
+    }
+
+    /**
+     * 当前连接的 Wi-Fi SSID。
+     *
+     * 先读 `WifiManager.connectionInfo.ssid`（零成本，5s 一次的轮询不能每次都起 shell 进程）；
+     * 缺定位权限时它会返回 `<unknown ssid>`（HyperOS 常见），此时退回 Shizuku 的
+     * `cmd wifi status`（与 WifiJoiner 同源的解析，一直可读）。
+     */
+    private suspend fun currentWifiSsid(context: Context): String? {
+        val fromApi =
+            runCatching {
+                (context.getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager)
+                    ?.connectionInfo
+                    ?.ssid
+                    ?.trim('"')
+                    ?.takeIf { it.isNotBlank() && !it.contains("unknown", ignoreCase = true) }
+            }.getOrNull()
+        if (fromApi != null) return fromApi
+        if (!ShizukuTools.isReady) return null
+        val out = runCatching { ShizukuTools.exec("cmd wifi status", 3_000) }.getOrNull()?.out
+        val match = out?.let { Regex("connected\\s+to\\s+\"([^\"]*)\"").find(it) }
+        return match?.groupValues?.get(1)?.ifBlank { null }
+    }
+
+    /**
+     * **静默网关试探**：把当前 Wi-Fi 的默认网关当成车机热点，试一次 `网关:7000`（AirPlay 控制面）。
+     *
+     * 为什么需要（用户 2026-10-24 要求；cardeck PR #19 在凯迪拉克 CT5 上的同款兜底）：
+     * 新协议车机（GM/Cinemo、BMW iD9 同族）声明会发 0x4301，但可能晚发或等前置条件，
+     * 车主手动把手机连上「全新CT5」后其实就能直连——cardeck 那边是弹窗确认，本仓按
+     * 「直接静默试一次」处理：成功即当端点继续，失败就继续等 0x4301（不影响保活）。
+     *
+     * 只在「等待期间出现新 SSID」或「该 SSID 正是 iAP2 给的车机热点」时各试一次：
+     * 手机上原本就有的 WiFi（家里/公司，可能有 Apple TV 占着 7000）不会被误当车机。
+     *
+     * @return 试探成功时的合成端点（`airPlayPort=7000`、ip=网关）；失败返回 null
+     */
+    private fun probeGatewayAsCarHotspot(
+        context: Context,
+        ssid: String,
+    ): CarPlayEndpoint? {
+        val cm = context.getSystemService(ConnectivityManager::class.java) ?: return null
+        val previous = boundNetwork
+        for (network in wifiNetworks(context)) {
+            val gateway =
+                cm.getLinkProperties(network)
+                    ?.routes
+                    ?.firstOrNull { it.isDefaultRoute }
+                    ?.gateway
+                    ?.hostAddress
+                    ?: continue
+            if (!gateway.contains('.') || gateway.contains(':')) continue
+            val reachable =
+                runCatching {
+                    cm.bindProcessToNetwork(network)
+                    java.net.Socket().use { socket ->
+                        socket.connect(
+                            java.net.InetSocketAddress(gateway, GATEWAY_FALLBACK_PORT),
+                            GATEWAY_PROBE_TIMEOUT_MILLIS.toInt(),
+                        )
+                    }
+                }.isSuccess
+            if (reachable) {
+                boundNetwork = network
+                log("WIFI: ✓ \"$ssid\" 的网关 $gateway:$GATEWAY_FALLBACK_PORT 可连——直接当车机热点继续（不等 0x4301）")
+                return CarPlayEndpoint(
+                    ssid = ssid,
+                    passphrase = null,
+                    airPlayPort = GATEWAY_FALLBACK_PORT,
+                    deviceIdentifier = null,
+                    publicKeyHex = null,
+                    sourceVersion = null,
+                    ipAddresses = listOf(gateway),
+                    gateway = gateway,
+                )
+            }
+            log("WIFI: \"$ssid\" 的网关 $gateway:$GATEWAY_FALLBACK_PORT 无响应——继续等车机 0x4301")
+        }
+        // 全部失败：把进程网络恢复原状（别一直绑在一块无外网的 WiFi 上）
+        runCatching { cm.bindProcessToNetwork(previous) }
+        return null
     }
 
     /**
@@ -852,21 +942,45 @@ object HyperCarRepo {
             var ticks = 0
             var partialKey: String? = null
             var wifiJoined = false
+            // 静默网关试探：只在「等待期间出现新 WiFi」或「当前 WiFi 正是 iAP2 给的车机热点」
+            // 时各试一次（每个 SSID 一次），避免对家里已有的 WiFi（可能有 Apple TV 占着 7000）误连。
+            var observedSsid: String? = null
+            val probedSsid = HashSet<String>()
             while (usable == null) {
-                val next = withTimeoutOrNull(ENDPOINT_PROGRESS_MILLIS) { callbacks.receive() }
+                val next = withTimeoutOrNull(ENDPOINT_TICK_MILLIS) { callbacks.receive() }
                 if (next == null) {
                     ticks++
-                    val seen = lastSeen.get()
-                    val waited = ticks * ENDPOINT_PROGRESS_MILLIS / 1000
-                    log(
-                        if (seen == null) {
-                            "SESSION: 仍在等车机端点（还没收到 0x5703/0x4301，已等 ${waited}s）" +
-                                "——链路保持中，请在车机上点一次「Apple CarPlay/手机」"
-                        } else {
-                            "SESSION: 仍在等车机地址（ssid=${seen.ssid ?: "-"} port=${seen.airPlayPort} " +
-                                "ips=${seen.ipAddresses}，已等 ${waited}s）"
-                        },
-                    )
+                    // ① 静默网关试探：手机刚连上（或本来就该连）车机热点时，不用等 0x4301——
+                    //    车机的 AirPlay 控制面通常就在热点网关的 7000 端口。
+                    val ssid = currentWifiSsid(context)
+                    if (!ssid.isNullOrBlank() && ssid !in probedSsid) {
+                        val changed = observedSsid != null && observedSsid != ssid
+                        val isCarHotspot = ssid == lastSeen.get()?.ssid
+                        if (changed || isCarHotspot) {
+                            probedSsid.add(ssid)
+                            log("WIFI: 检测到 Wi-Fi \"$ssid\"——静默试一次「把网关当车机热点」（:7000）")
+                            val probed = probeGatewayAsCarHotspot(context, ssid)
+                            if (probed != null) {
+                                usable = probed
+                                continue
+                            }
+                        }
+                    }
+                    if (ssid != null) observedSsid = ssid
+                    // ② 每 15s 报一次进度（tick 是 5s，探测要跟得上换网速度）
+                    if (ticks % TICKS_PER_PROGRESS == 0) {
+                        val seen = lastSeen.get()
+                        val waited = ticks * ENDPOINT_TICK_MILLIS / 1000
+                        log(
+                            if (seen == null) {
+                                "SESSION: 仍在等车机端点（还没收到 0x5703/0x4301，已等 ${waited}s）" +
+                                    "——链路保持中，请在车机上点一次「Apple CarPlay/手机」"
+                            } else {
+                                "SESSION: 仍在等车机地址（ssid=${seen.ssid ?: "-"} port=${seen.airPlayPort} " +
+                                    "ips=${seen.ipAddresses}，已等 ${waited}s）"
+                            },
+                        )
+                    }
                     continue
                 }
                 val merged = mergeEndpoint(lastSeen.get(), next)
@@ -1259,14 +1373,32 @@ object HyperCarRepo {
     // 注意：本类是 standalone object，**不能**用 companion object（Kotlin 不允许
     // 「companion 声明在 object 里」），常量直接作为 object 成员即可。
 
-    /** 等车机 iAP2 端点的上限：超时失败而不是无限挂着（挂着会让后续自动连接全被挡）。 */
-    private const val ENDPOINT_TIMEOUT_MILLIS = 180_000L
+    /**
+     * 等车机 iAP2 端点的上限。
+     *
+     * **5 分钟**（cardeck 0.1.14 / PR #19 定谳）：0x4301 是「活事件」，新协议车机
+     * （GM/Cinemo、BMW iD9 同族）声明会发但可能**晚发或等前置条件**——
+     * 奥迪 MMI 9310 实测晚 2 分 35 秒、凯迪拉克 CT5 更久；旧实现 8s 拆链时这两类车
+     * 永远等不到（拆链还会把车机侧的等待计时反复清零）。窗口内链路保持、每 15s 报进度。
+     */
+    private const val ENDPOINT_TIMEOUT_MILLIS = 300_000L
 
     /** 同一次 ACL 事件会被 receiver 与 service 各转交一次：这段时间内只记一行。 */
     private const val ACL_EVENT_LOG_DEDUPE_MILLIS = 1_500L
 
-    /** 等端点期间的进度日志间隔（车机不开 iAP2 窗口时不至于静默 3 分钟）。 */
+    /** 等端点期间的进度日志间隔（车机不开 iAP2 窗口时不至于静默 5 分钟）。 */
     private const val ENDPOINT_PROGRESS_MILLIS = 15_000L
+
+    /**
+     * 等端点时的轮询粒度（比进度日志细）：静默网关试探要跟得上「用户手动连车机热点」
+     * 的换网速度，5s 一次 / 进度日志每 3 个 tick（15s）报一次。
+     */
+    private const val ENDPOINT_TICK_MILLIS = 5_000L
+    private const val TICKS_PER_PROGRESS = (ENDPOINT_PROGRESS_MILLIS / ENDPOINT_TICK_MILLIS).toInt()
+
+    /** 网关兜底端口（AirPlay 控制面惯例值）与静默试探的单次连接超时。 */
+    private const val GATEWAY_FALLBACK_PORT = 7000
+    private const val GATEWAY_PROBE_TIMEOUT_MILLIS = 1_200L
 
     /** 停止时等在途连接协程退出的上限（超过就先拆，连接侧另有 sessionLive 兜底）。 */
     private const val JOIN_TIMEOUT_MILLIS = 5_000L
