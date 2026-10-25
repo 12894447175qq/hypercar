@@ -23,6 +23,7 @@ app/src/main/java/io/github/hypercar/headunit/HeadUnitProfile.kt   ← 档案定
 | `sendTransportIdentifier` | 是否发 `0x4E0E` 传输标识 | 同上，宝马 `true`（与 0x4300 携带同一个传输标识） |
 | `replyPowerUpdates` | 车机发 `0xAE00` 时是否回 `0xAE01` | 真 iPhone **必回**（3 条）；默认 `true` |
 | `dropProfilesBeforeIap2` | 发 iAP2 前是否主动断开该车机的 HFP/A2DP（「只配对、不连接」） | 奥迪那种「已连接就不开 iAP2 窗口」的车机要 `true`；**宝马要 `false`**——它的 HFP/A2DP 在线时本来就会主动连入 iAP2，主动断开反而把 ACL 一起拽掉，车机反而不发起 CarPlay |
+| `abortWhenCarPlayWindowClosed` | 0x1D01 判为「档案 A」（车机没开无线 CarPlay 窗口）时是否主动结束会话 | **一律 `false`**：2026-10-25 现场 A/B——0.27 保持链路时车机显示 CarPlay 图标，0.28 加了「档案 A 立即结束」后图标消失、车机不再发起 iAP2（拆链会让车机收起图标）。空转轮次改由「车机新连入顶替」处理，不靠拆链 |
 | `preferMdnsAirplay` | 端口策略：`true` = 先查 mDNS `_airplay._tcp` | 车机广播该服务（抓包/Bonjour 浏览可见）→ `true`；普通接收端（WinPlay）→ `false` |
 | `fallbackAirplayPorts` | mDNS 拿不到时的试连顺序 | AirPlay 惯例 `7000`，其次 `7001` / `7100` |
 | `touchDisplay` | 接收端 HID 像素空间（`"WxH"`） | 车机 `/info` 报 `0x0` 而坐标总是偏 → 填接收端真实像素 |
@@ -134,7 +135,8 @@ HeadUnitProfiles.all = 内置 ∪ 远程（同 id 覆盖，远程独有追加）
 
 ```json
 {
-  "version": 1,
+  "version": 2,
+  "_schema": 2,
   "updated": "2026-10-25",
   "profiles": [
     {
@@ -144,7 +146,12 @@ HeadUnitProfiles.all = 内置 ∪ 远程（同 id 覆盖，远程独有追加）
       "notes": "真车实测：车机从不发 0x4301、从不回 0xEA03…",
       "verified": true,
       "validatesDeviceId": false,
+      "sendCarPlayAvailability": true,
+      "openEaSessions": true,
+      "sendTransportIdentifier": true,
       "replyPowerUpdates": true,
+      "dropProfilesBeforeIap2": false,
+      "abortWhenCarPlayWindowClosed": false,
       "preferMdnsAirplay": true,
       "fallbackAirplayPorts": [7000, 7001, 7100],
       "pairingHint": "首次要在 iDrive 里把这个设备选成 CarPlay 手机"
@@ -153,15 +160,20 @@ HeadUnitProfiles.all = 内置 ∪ 远程（同 id 覆盖，远程独有追加）
 }
 ```
 
-字段与 §1 的表格一一对应，**除 `id`、`label` 外都可省略**——省略就取默认值
-（默认值即「真 iPhone 实测行为」）。省略 `verified` 视为 `false`（会显示「未实测」角标），
+字段与 §1 的表格一一对应，**除 `id`、`label` 外都可省略**——省略就取**同 id 内置档案**的值
+（新车型没有内置条目时才取宝马档案的默认值）。省略 `verified` 视为 `false`（会显示「未实测」角标），
 这样远程新增的车型不会被误当成已验证。
+
+> 顶层请带 `"_schema": 2`（当前 `RemoteProfiles.SCHEMA`）。**`_schema` 低于 App 端常量的远程条目
+> 只能新增车型、不能覆盖内置档案**——这是 2026-10-25 踩过的坑：内置已把宝马的
+> `sendCarPlayAvailability` 等三项改回 `true`（CarPlay 图标修复），但设备上缓存的 v1 JSON
+> 仍是 `false`，覆盖后图标继续消失。要修内置档案，必须显式升 `_schema`。
 
 ### 5.2 三条覆盖规则
 
 | 情况 | 行为 |
 |---|---|
-| 远程 id 与内置相同 | **远程覆盖内置**（修内置的错不用发版，用户点一下就好） |
+| 远程 id 与内置相同 | **`_schema` ≥ 2 时远程覆盖内置**（修内置的错不用发版，用户点一下就好）；`_schema` 更旧则忽略覆盖，只保留内置值 |
 | 远程 id 是新的 | 追加到列表末尾，条目上标「（远程）」 |
 | 远程配置拉取失败 / 解析失败 | 保持上次缓存；从没拉过就等于只有内置档案 |
 
@@ -169,6 +181,8 @@ HeadUnitProfiles.all = 内置 ∪ 远程（同 id 覆盖，远程独有追加）
 
 1. 按 §2 的四步在 `HeadUnitProfile.kt` 里加档案（本地先调通）。
 2. 把同样的字段补进 `profiles/headunits.json` 的 `profiles` 数组（`verified` 先给 `false`）。
+   **改数据类字段时三处必须同步**：`HeadUnitProfile` 定义、`RemoteProfiles.readProfile`（含默认值取
+   同 id 内置档案）、`RemoteProfiles.encode`——漏一处就会「内置改好、远程一同步又变回去」。
 3. push（纯数据改动，可带 `[skip ci]` 跳过构建）。
 4. 用户在手机「车机型号 → 从 GitHub 更新车型列表」点一下，车型就出现了。
 

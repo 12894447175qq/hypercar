@@ -348,6 +348,17 @@ object HyperCarRepo {
 
             // ---- iAP2 协商（蓝牙侧）----
             push(link = LinkState.Negotiating("等待车机蓝牙 iAP2 协商"))
+            // 档案自述：现场日志第一眼就能看出「用的是哪份车机档案、几个关键开关是什么」，
+            // 省得再靠日志反推（2026-10-25 图标回归就是被档案里三个布尔左右的）。
+            run {
+                val p = headUnitProfile
+                log(
+                    "PROFILE: ${p.id}（${p.label}）0x4300=${p.sendCarPlayAvailability} " +
+                        "EA=${p.openEaSessions} 0x4E0E=${p.sendTransportIdentifier} " +
+                        "断HFP/A2DP=${p.dropProfilesBeforeIap2} 档案A退场=${p.abortWhenCarPlayWindowClosed} " +
+                        "保iAP2=${p.keepIap2AliveOnly}",
+                )
+            }
             val coordinator = Iap2Coordinator(
                 context,
                 // 目标优先级：设置里显式指定 > 本轮 ACL 连上的车机 > 自动（全部已配对）。
@@ -413,7 +424,11 @@ object HyperCarRepo {
             // 而 CarLife MD 只在车机侧（PC）才连得上。于是让手机只当 iAP2 保活端，
             // AirPlay 由 PC 侧 hypercar-hub 去推，两边就不会抢同一条 AirPlay 会话。
             // 现场 2026-10-23 22:37：手机引擎与 PC hub 同时连 17000，WinPlay 画面被后者顶掉。
-            if (SettingsStore.iap2KeepAliveOnly) {
+            //
+            // 读**档案**而不是 SettingsStore 的派生开关：那个值只是「选档案时的副作用」，
+            // 旧版本/手动改过设置的情况下会和当前档案不一致（真车档案却停在联调模式，
+            // 表现为「一直连不上 AirPlay」）。档案是唯一事实源。
+            if (headUnitProfile.keepIap2AliveOnly) {
                 log("联调: 只保持 iAP2 链路（不启动 AirPlay 引擎）——端点 ips=${endpoint.ipAddresses} port=${endpoint.airPlayPort}")
                 // 不 fail、不 return 前关闭协调器：iAP2 链路由 coordinator 自己的保活定时器维持，
                 // 这样接收端（WinPlay）的 BT 桥接不会因链路关闭而退出。

@@ -26,6 +26,17 @@ import java.net.URL
  */
 object RemoteProfiles {
 
+    /**
+     * 本 App 理解的配置 schema 版本。
+     *
+     * 为什么需要：远程同 id 会覆盖内置，而**旧缓存**里可能写着已经验证是错的字段值
+     * （2026-10-25 就踩了这个：内置已把宝马的 `sendCarPlayAvailability` 等改回 `true`，
+     * 但设备上缓存的 v1 JSON 仍是 `false`，覆盖后 CarPlay 图标继续不出现）。
+     * 规则：**`_schema` 低于本常量的远程条目，只能新增车型，不能覆盖内置档案**
+     * ——这样"修内置档案"必须显式升 schema 才会生效，旧缓存不会把修复顶回去。
+     */
+    const val SCHEMA = 2
+
     /** 档案列表地址（raw.githubusercontent.com，改 `main` 为其它分支即可灰度）。 */
     const val DEFAULT_URL =
         "https://raw.githubusercontent.com/fw867/hypercar/main/profiles/headunits.json"
@@ -40,16 +51,33 @@ object RemoteProfiles {
      */
     private var memoRaw: String? = null
     private var memoList: List<HeadUnitProfile> = emptyList()
+    private var memoSchema: Int = 0
 
     /** 上次拉取到的远程档案（解析失败时返回空表，不抛异常）。 */
     fun cached(): List<HeadUnitProfile> {
+        ensureParsed()
+        return memoList
+    }
+
+    /** 上次拉取到的远程配置的 `_schema`（0 = 旧格式/未声明）。 */
+    fun cachedSchema(): Int {
+        ensureParsed()
+        return memoSchema
+    }
+
+    private fun ensureParsed() {
         val raw = SettingsStore.remoteHeadUnitProfilesJson
-        if (raw.isBlank()) return emptyList()
-        if (raw == memoRaw) return memoList
-        val parsed = runCatching { parse(raw) }.getOrDefault(emptyList())
+        if (raw.isBlank()) {
+            memoRaw = raw
+            memoList = emptyList()
+            memoSchema = 0
+            return
+        }
+        if (raw == memoRaw) return
+        val parsed = runCatching { parseRaw(raw) }.getOrDefault(Parsed(0, emptyList()))
         memoRaw = raw
-        memoList = parsed
-        return parsed
+        memoList = parsed.profiles
+        memoSchema = parsed.schema
     }
 
     /** 远程档案里是否有这个 id（用于 UI 打「远程」角标）。 */
@@ -57,11 +85,22 @@ object RemoteProfiles {
 
     /**
      * 把内置表与远程表合并：内置保持原顺序（远程可覆盖同 id），远程独有项追加。
+     *
+     * @param remoteSchema 远程配置声明的 `_schema`。**低于 [SCHEMA] 时不允许覆盖内置**
+     *    （旧缓存会把已经修好的内置值顶回去，2026-10-25 现场教训），只能新增车型。
      */
-    fun merge(builtin: List<HeadUnitProfile>, remote: List<HeadUnitProfile>): List<HeadUnitProfile> {
+    fun merge(
+        builtin: List<HeadUnitProfile>,
+        remote: List<HeadUnitProfile>,
+        remoteSchema: Int = SCHEMA,
+    ): List<HeadUnitProfile> {
         if (remote.isEmpty()) return builtin
         val remoteById = remote.associateBy { it.id }
-        val merged = builtin.map { remoteById[it.id] ?: it }
+        val merged =
+            builtin.map { base ->
+                val fromRemote = remoteById[base.id]
+                if (fromRemote != null && remoteSchema >= SCHEMA) fromRemote else base
+            }
         val builtinIds = builtin.map { it.id }.toSet()
         return merged + remote.filter { it.id !in builtinIds }
     }
@@ -70,12 +109,12 @@ object RemoteProfiles {
     suspend fun refresh(): Int = withContext(Dispatchers.IO) {
         val body = httpGet(url())
         // 先解析再落盘：解析不了就保持旧缓存，避免把设置页搞成空列表
-        val list = parse(body)
-        require(list.isNotEmpty()) { "配置里没有任何档案" }
+        val parsed = parseRaw(body)
+        require(parsed.profiles.isNotEmpty()) { "配置里没有任何档案" }
         SettingsStore.remoteHeadUnitProfilesJson = body
         SettingsStore.remoteProfilesFetchedAt = System.currentTimeMillis()
         memoRaw = null // 让 cached() 重新解析
-        list.size
+        parsed.profiles.size
     }
 
     private fun httpGet(url: String): String {
@@ -99,29 +138,41 @@ object RemoteProfiles {
 
     /**
      * 兼容两种顶层形态：`[ {...}, {...} ]` 或 `{ "profiles": [ ... ] }`
-     * （带 `version`/`updated` 之类元信息时用后者更自然）。
+     * （带 `version`/`_schema` 之类元信息时用后者更自然）。
      */
-    fun parse(raw: String): List<HeadUnitProfile> {
+    fun parse(raw: String): List<HeadUnitProfile> = parseRaw(raw).profiles
+
+    /** 解析结果（含顶层 `_schema`；旧格式没写就按 0 处理）。 */
+    data class Parsed(
+        val schema: Int,
+        val profiles: List<HeadUnitProfile>,
+    )
+
+    private fun parseRaw(raw: String): Parsed {
         val trimmed = raw.trim()
-        val array = when {
-            trimmed.startsWith("[") -> JSONArray(trimmed)
-            else -> JSONObject(trimmed).optJSONArray("profiles") ?: JSONArray()
+        if (trimmed.startsWith("[")) {
+            val array = JSONArray(trimmed)
+            return Parsed(0, (0 until array.length()).mapNotNull { i -> array.optJSONObject(i)?.let(::readProfile) })
         }
-        return (0 until array.length()).mapNotNull { i ->
-            array.optJSONObject(i)?.let { readProfile(it) }
-        }
+        val root = JSONObject(trimmed)
+        val schema = if (root.has("_schema")) root.optInt("_schema", 0) else root.optInt("schema", 0)
+        val array = root.optJSONArray("profiles") ?: JSONArray()
+        return Parsed(schema, (0 until array.length()).mapNotNull { i -> array.optJSONObject(i)?.let(::readProfile) })
     }
 
     private fun readProfile(o: JSONObject): HeadUnitProfile? {
         val id = o.optString("id").trim()
         if (id.isEmpty()) return null
-        val defaults = HeadUnitProfiles.BMW_ID85 // 只借默认值，不借身份
+        // 默认值取**同 id 的内置档案**（不是一律取宝马）：远程只覆盖它显式写出的字段，
+        // 没写的沿用内置值——否则新增的字段（如 dropProfilesBeforeIap2）会被数据类默认值
+        // 悄悄覆盖，出现「内置已修好、远程一更新又变回去」的冲突。
+        val defaults = HeadUnitProfiles.builtin.firstOrNull { it.id == id } ?: HeadUnitProfiles.BMW_ID85
         return HeadUnitProfile(
             id = id,
-            label = o.optString("label").ifBlank { id },
-            model = o.optString("model", ""),
-            notes = o.optString("notes", ""),
-            verified = o.optBoolean("verified", false),
+            label = o.optString("label").ifBlank { defaults.label },
+            model = o.optString("model", defaults.model),
+            notes = o.optString("notes", defaults.notes),
+            verified = o.optBoolean("verified", defaults.verified),
             validatesDeviceId = o.optBoolean("validatesDeviceId", defaults.validatesDeviceId),
             sendCarPlayAvailability =
                 o.optBoolean("sendCarPlayAvailability", defaults.sendCarPlayAvailability),
@@ -129,6 +180,10 @@ object RemoteProfiles {
             sendTransportIdentifier =
                 o.optBoolean("sendTransportIdentifier", defaults.sendTransportIdentifier),
             replyPowerUpdates = o.optBoolean("replyPowerUpdates", defaults.replyPowerUpdates),
+            dropProfilesBeforeIap2 =
+                o.optBoolean("dropProfilesBeforeIap2", defaults.dropProfilesBeforeIap2),
+            abortWhenCarPlayWindowClosed =
+                o.optBoolean("abortWhenCarPlayWindowClosed", defaults.abortWhenCarPlayWindowClosed),
             preferMdnsAirplay = o.optBoolean("preferMdnsAirplay", defaults.preferMdnsAirplay),
             fallbackAirplayPorts = readPorts(o, defaults.fallbackAirplayPorts),
             touchDisplay = o.optString("touchDisplay", "").ifBlank { defaults.touchDisplay },
@@ -159,6 +214,8 @@ object RemoteProfiles {
                     put("openEaSessions", p.openEaSessions)
                     put("sendTransportIdentifier", p.sendTransportIdentifier)
                     put("replyPowerUpdates", p.replyPowerUpdates)
+                    put("dropProfilesBeforeIap2", p.dropProfilesBeforeIap2)
+                    put("abortWhenCarPlayWindowClosed", p.abortWhenCarPlayWindowClosed)
                     put("preferMdnsAirplay", p.preferMdnsAirplay)
                     put("fallbackAirplayPorts", JSONArray(p.fallbackAirplayPorts))
                     p.touchDisplay?.let { put("touchDisplay", it) }

@@ -176,7 +176,7 @@ object HeadUnitProfiles {
      * 没拉过/拉失败就是纯 [builtin]，行为与以前完全一致。
      */
     val all: List<HeadUnitProfile>
-        get() = RemoteProfiles.merge(builtin, RemoteProfiles.cached())
+        get() = RemoteProfiles.merge(builtin, RemoteProfiles.cached(), RemoteProfiles.cachedSchema())
 
     /** 按 id 取档案；未知/空值回落到宝马（默认车型）。 */
     fun byId(id: String?): HeadUnitProfile =

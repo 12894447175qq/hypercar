@@ -412,6 +412,15 @@ StartHID(0x6800)            = 会发
   手机一致，伪 MAC 会让车机对不上任何设备；伪 MAC 时打显式警报。
 - iAP2 目标锁定为本轮 ACL 连上的车机，不再去拨 HI-BOX 旧 dongle；`sessionStartCount`
   为 0 时日志直接指出"车机没发起 iAP2（车机侧状态）"。
+- **与车机档案配置的冲突（同步修掉）**：`profiles/headunits.json` 里宝马条目原本写着
+  `sendCarPlayAvailability/openEaSessions/sendTransportIdentifier = false`，而
+  `RemoteProfiles.merge` 是"远程同 id 覆盖内置"——**设备上缓存的旧 JSON 会把上面的修复
+  原样顶回去**，图标继续不出现。另外新加的两个档案字段没进 `readProfile/encode`，
+  远程条目会拿到数据类默认值（`dropProfilesBeforeIap2=true`，正好是宝马的反例）。
+  三处一起收口：① JSON 升 `_schema: 2` 并改回正确值；② 解析默认值改为「同 id 内置档案」；
+  ③ `_schema < RemoteProfiles.SCHEMA(2)` 的远程条目**只能新增车型、不能覆盖内置**
+  （要修内置必须显式升 `_schema`）。运行期还会打一行 `PROFILE: <id>（<label>）…` 自述
+  当前档案与关键开关，避免再靠日志反推。
 
 ### 11.3 恢复步骤（必须做，代码只能保证不再丢）
 
