@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.iap2
+package io.github.hypercar.iap2
 
 import android.Manifest
 import android.annotation.SuppressLint
@@ -51,6 +51,13 @@ class Iap2Bluetooth(
     private val targetProvider: () -> String?,
     /** 本机真实蓝牙 MAC（会话里 0x4300/0x4E0C/0x4E0E 用）。 */
     private val bluetoothMacProvider: () -> String,
+    /**
+     * 发 iAP2 前是否主动断开该车机的 HFP/A2DP（车机档案 `dropProfilesBeforeIap2`）。
+     *
+     * 奥迪需要；**宝马不能断**（2026-10-25 现场：断了会把 ACL 一起拽掉，车机反复重连，
+     * 反而不再发起 CarPlay）。
+     */
+    private val dropProfilesBeforeIap2: Boolean = true,
     private val log: (String) -> Unit,
     /** 每次拿到/更新端点即回调（0x5703 凭据与 0x4301 端点都会触发，可能多次）。 */
     private val onEndpoint: (CarPlayEndpoint) -> Unit,
@@ -117,6 +124,18 @@ class Iap2Bluetooth(
     @Volatile
     private var lastFailureLogAt = 0L
 
+    /** 「档案不要求断配置文件」只打一行日志。 */
+    @Volatile
+    private var profileDropSkippedLogged = false
+
+    /**
+     * 本轮会话是否已拿到「可用凭据/端点」。false = 还在等 0x5703/0x4301 的空转轮次，
+     * 这种轮次**允许被车机的新连入顶替**（见 acceptLoop），这样既不用主动拆链
+     * （拆链会让车机收起 CarPlay 图标），也不会把车机的下一轮挡在门外。
+     */
+    @Volatile
+    private var sessionProductive = false
+
     /** 「是否提供 iAP2 服务」结论缓存（地址→结论）：SDP 查询不便宜，勿每 3s 重查。 */
     private val iap2ServiceCache = ConcurrentHashMap<String, Boolean>()
 
@@ -127,6 +146,11 @@ class Iap2Bluetooth(
 
     /** 当前是否有会话在跑（上层诊断用）。 */
     val isSessionActive: Boolean get() = sessionActive.get()
+
+    /** 本次 start() 以来成功建过几轮 iAP2 会话（0 = 车机从未连入/从未连上，诊断用）。 */
+    val sessionStartCount: Int get() = sessionStarts.get()
+
+    private val sessionStarts = java.util.concurrent.atomic.AtomicInteger(0)
 
     fun hasPermission(): Boolean =
         appContext.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) ==
@@ -231,9 +255,23 @@ class Iap2Bluetooth(
                 continue
             }
             if (sessionActive.get()) {
-                log("BT-S: 已有 iAP2 会话在跑，忽略新的连入 addr=${peerAddress ?: "?"}")
-                runCatching { socket.close() }
-                continue
+                // **本轮已拿到凭据（端点）**才拒绝新连入；还在等凭据的「空转轮次」必须让位：
+                // 车机只有在**新一轮** iAP2 里才会给档案 B 的能力清单，而我们又不肯为了
+                // 换轮去主动拆链（拆链会让车机收起 CarPlay 图标，2026-10-25 现场定谳）。
+                // 所以由车机发起的新连接来顶替旧会话——既不拆链，也不挡路。
+                if (sessionProductive) {
+                    log("BT-S: 已有 iAP2 会话在跑且已拿到凭据，忽略新的连入 addr=${peerAddress ?: "?"}")
+                    runCatching { socket.close() }
+                    continue
+                }
+                log("BT-S: 车机重新连入（上一轮仍在等凭据）——结束旧会话让位给新一轮 addr=${peerAddress ?: "?"}")
+                dropCurrentSession()
+                sleepQuietly(500)
+                if (sessionActive.get()) {
+                    log("BT-S: 旧会话未在 500ms 内退出，忽略本次连入 addr=${peerAddress ?: "?"}")
+                    runCatching { socket.close() }
+                    continue
+                }
             }
             val peerName = safeName(socket.remoteDevice) ?: peerAddress ?: "unknown"
             log("BT-S: 车机已连入 name=$peerName，开始 iAP2 发送端会话")
@@ -256,9 +294,10 @@ class Iap2Bluetooth(
                 sleepQuietly(2_000)
                 continue
             }
-            // 首轮先给车机 8s 主动连入的机会（BMW/MGU 是车机拨我们）。等到了就完全不碰
-            // 它的 HFP/A2DP——否则「只配对、不连接」会把 ACL 也搞断，形成连-断自激。
-            if (!inboundGraceDone) {
+            // 首轮先给车机主动连入的机会——但只对「会因此断配置文件」的档案有意义：
+            // 宝马档案压根不断 HFP/A2DP（车机自己会在 ACL 连上后 ~4s 连入 iAP2），
+            // 等这 8s 只会白白推迟出站探测。
+            if (dropProfilesBeforeIap2 && !inboundGraceDone) {
                 inboundGraceDone = true
                 val deadline = SystemClock.uptimeMillis() + INBOUND_GRACE_MILLIS
                 while (running && generation.get() == myGeneration &&
@@ -289,8 +328,9 @@ class Iap2Bluetooth(
                 runCatching { adapter.cancelDiscovery() }
                 // 「只配对、不连接」：断开该车机的 HFP/A2DP/LeAudio——车机在音频配置
                 // 文件在线时不开放 iAP2 服务窗口（奥迪 MIB3 实测每 3s 连接失败）。
-                // 只对过了「声明 iAP2 服务/用户选定」闸门的设备做，别误伤耳机。
-                run {
+                // **宝马档案不做这一步**：它的 HFP/A2DP 在线时照样主动连入 iAP2，而断开
+                // 会连带把 ACL 拽掉（车机反复重连），反而再也不发起 CarPlay。
+                if (dropProfilesBeforeIap2) {
                     // 注意：BtProfiles.disconnect 内部会打「自己断开」归因标记——断开
                     // 配置文件（个别 ROM 退到设备级断开）会让系统广播 ACL 断开，接收器
                     // 靠那个标记认出「这是我们干的」，不按「下车」拆会话。
@@ -306,6 +346,9 @@ class Iap2Bluetooth(
                             )
                         }
                     }
+                } else if (!profileDropSkippedLogged) {
+                    profileDropSkippedLogged = true
+                    log("BT-C: 车机档案要求保留 HFP/A2DP（不断配置文件，等车机自己连入 iAP2）")
                 }
                 val socket = tryConnect(device)
                 if (socket != null) {
@@ -454,6 +497,8 @@ class Iap2Bluetooth(
             runCatching { socket.close() }
             return
         }
+        sessionStarts.incrementAndGet()
+        sessionProductive = false
         currentSocket.set(socket)
         val channel = RfcommLinkChannel(socket, log)
         activeChannel.set(channel)
@@ -463,7 +508,14 @@ class Iap2Bluetooth(
                 log = log,
                 bluetoothMac = bluetoothMacProvider(),
                 deviceName = "iPhone",
-                onEndpoint = onEndpoint,
+                // 端点回调顺手标记「本轮已拿到凭据」：acceptLoop 用它决定是否允许
+                // 车机的新连入顶替本轮（空转轮次可顶替，有凭据的不许抢）
+                onEndpoint = { endpoint ->
+                    if (!endpoint.ssid.isNullOrBlank() || endpoint.ipAddresses.isNotEmpty()) {
+                        sessionProductive = true
+                    }
+                    onEndpoint(endpoint)
+                },
                 context = appContext,
             )
         try {
@@ -472,8 +524,8 @@ class Iap2Bluetooth(
             session.pumpIncomingForever()
             onSessionEnded("链路断开")
         } catch (profileA: NoCarPlayWindowException) {
-            // 档案 A 不是「失败」而是「这一轮车机没给机会」：不拆上层会话、不记为错误，
-            // 立刻放掉这条 RFCOMM，让车机下一次连入能被 accept 接住（下一轮很可能就是档案 B）。
+            // 档案 A（仅在 profile.abortWhenCarPlayWindowClosed=true 时抛出）：这一轮车机
+            // 没给机会，放掉 RFCOMM 让车机下次连入被 accept 接住。默认档案不会走这里。
             log("$tag ${profileA.message}——结束本轮，等车机下一次连入")
             onSessionEnded(profileA.message ?: "档案 A")
         } catch (error: IOException) {

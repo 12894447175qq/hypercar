@@ -46,6 +46,8 @@ class Iap2Coordinator(
     private val targetMac: () -> String?,
     /** 本机真实蓝牙 MAC（Shizuku 解析，由上层注入；0x4300/0x4E0C/0x4E0E 用）。 */
     private val deviceMacProvider: suspend () -> String,
+    /** 车机档案：发 iAP2 前是否主动断开该车机的 HFP/A2DP（宝马=false，奥迪=true）。 */
+    private val dropProfilesBeforeIap2: Boolean = true,
     private val log: (String) -> Unit,
 ) {
     companion object {
@@ -65,6 +67,9 @@ class Iap2Coordinator(
     private var resolvedMac: String? = null
 
     val isRunning: Boolean get() = bluetooth?.isRunning == true
+
+    /** 本次启动以来成功建过几轮 iAP2 会话（0 = 车机一次都没连进来）。 */
+    val sessionStartCount: Int get() = bluetooth?.sessionStartCount ?: 0
 
     /**
      * 开始监听/出站；拿到或更新端点即回调（可能多次：0x5703 凭据一次、
@@ -92,6 +97,7 @@ class Iap2Coordinator(
                     context = appContext,
                     targetProvider = targetMac,
                     bluetoothMacProvider = ::currentBluetoothMac,
+                    dropProfilesBeforeIap2 = dropProfilesBeforeIap2,
                     log = log,
                     onEndpoint = { endpoint -> endpointCallback?.invoke(endpoint) },
                     onSessionEnded = { reason -> log("IAP2: 会话结束（$reason），继续监听/出站等待重连") },
@@ -141,22 +147,41 @@ class Iap2Coordinator(
                 ?.takeIf { it.isNotEmpty() }
         if (mac != null) {
             resolvedMac = mac
-            log("IAP2: 本机蓝牙标识=$mac")
+            if (mac == io.github.hypercar.settings.SettingsStore.stableDeviceId) {
+                log(
+                    "IAP2: ⚠ 本轮用的是**稳定伪 MAC** $mac（真 MAC 未解析到）——车机若按设备身份认 CarPlay，" +
+                        "伪 ID 会被当成另一台设备；请确认 Shizuku 已授权或到设置里手动填真实蓝牙 MAC",
+                )
+            } else {
+                log("IAP2: 本机蓝牙标识=$mac")
+            }
             return mac
         }
         log("IAP2: ⚠ deviceMacProvider 未返回值，本轮用稳定伪 MAC 兜底")
         return PLACEHOLDER_MAC
     }
 
+    /**
+     * 预解析真实 MAC。
+     *
+     * **必须 force**：`BluetoothMac.resolve()` 解析失败后有 10s 静默窗，而上下层在
+     * 差不多同一毫秒都会发起解析——非 force 调用会正好落在「另一次解析正在进行」的窗口里
+     * 返回 null → 退回稳定伪 MAC（2026-10-25 现场日志：`BT: 使用真实蓝牙 MAC 84:AE:…`
+     * 但 `IAP2: 本机蓝牙标识预解析成功=B6:65:…`，同一轮出现两个身份）。
+     */
     private fun prefetchDeviceMac() {
         if (resolvedMac != null) return
-        runCatching { runBlocking { deviceMacProvider() } }
-            .getOrNull()
-            ?.trim()
-            ?.takeIf { it.isNotEmpty() }
-            ?.let { mac ->
-                resolvedMac = mac
-                log("IAP2: 本机蓝牙标识预解析成功=$mac")
-            }
+        val mac =
+            runCatching { runBlocking { io.github.hypercar.net.BluetoothMac.resolveOrStable(force = true) } }
+                .getOrNull()
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?: return
+        resolvedMac = mac
+        if (mac == io.github.hypercar.settings.SettingsStore.stableDeviceId) {
+            log("IAP2: ⚠ 预解析到的是**稳定伪 MAC** $mac（真 MAC 不可用）——车机可能不认这台设备")
+        } else {
+            log("IAP2: 本机蓝牙标识预解析成功=$mac")
+        }
     }
 }

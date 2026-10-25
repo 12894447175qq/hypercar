@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.session
+package io.github.hypercar.session
 
 import android.bluetooth.BluetoothDevice
 import android.content.Context
@@ -171,6 +171,13 @@ object HyperCarRepo {
     private var connectJob: Job? = null
 
     /**
+     * 本轮 ACL 连上的车机地址。传给 iAP2 作出站目标/入站白名单：
+     * 只拨这台车、只收它的连入，避免把时间花在 HI-BOX 等旧 dongle 上。
+     */
+    @Volatile
+    private var aclCarMac: String? = null
+
+    /**
      * 会话资源是否还活着（蓝牙协商/WiFi 绑定/Rust 引擎）。拆除用它做幂等闸门：
      * 重复的 ACL 断开广播、service 二次转交都只会真正拆一次。
      */
@@ -203,6 +210,15 @@ object HyperCarRepo {
             AutoStart.handler = { ctx, device, connected ->
                 val app = ctx.applicationContext
                 if (connected) {
+                    // 记住刚连上 ACL 的车机：本轮 iAP2 只拨/只收这台，别再去碰
+                    // HI-BOX 之类已配对的旧 dongle（每次 RFCOMM 失败都白占栈、添噪音，
+                    // 2026-10-25 现场日志里 10 分钟里一半是它们的连接失败）
+                    runCatching { device.address }.getOrNull()?.let { address ->
+                        if (address != aclCarMac) {
+                            aclCarMac = address
+                            log("AUTO: 本轮 iAP2 目标锁定为 ACL 车机 $address（${runCatching { device.name }.getOrNull() ?: "?"}）")
+                        }
+                    }
                     if (!HyperCarService.isRunning) {
                         runCatching {
                             app.startForegroundService(HyperCarService.startIntent(app, device))
@@ -223,6 +239,9 @@ object HyperCarRepo {
                     // 且车机不在场也照刷（进程自己把自己钉在前台）。
                     if (HyperCarService.isRunning) {
                         runCatching { app.startService(HyperCarService.stopIntent(app, device)) }
+                    }
+                    runCatching { device.address }.getOrNull()?.let { address ->
+                        if (address == aclCarMac) aclCarMac = null
                     }
                     disconnect()
                 }
@@ -314,8 +333,8 @@ object HyperCarRepo {
             // WinPlay 就是拿它和「目标蓝牙设备」（Windows 里配对的经典蓝牙地址）比，
             // 不一致直接对会话级 SETUP 回 403（cpStack.ts 的 deviceFilter）。
             // 所以这里明确区分「真实 MAC」和「伪 MAC」，伪 MAC 时把后果写进日志。
-            val realMac = BluetoothMac.resolve()
-            val deviceMac = realMac ?: BluetoothMac.resolveOrStable()
+            val realMac = BluetoothMac.resolve(force = true)
+            val deviceMac = realMac ?: BluetoothMac.resolveOrStable(force = true)
             sessionDeviceMac = deviceMac
             if (realMac == null) {
                 log(
@@ -331,8 +350,14 @@ object HyperCarRepo {
             push(link = LinkState.Negotiating("等待车机蓝牙 iAP2 协商"))
             val coordinator = Iap2Coordinator(
                 context,
-                targetMac = { SettingsStore.targetCarMac },
-                deviceMacProvider = { BluetoothMac.resolveOrStable() },
+                // 目标优先级：设置里显式指定 > 本轮 ACL 连上的车机 > 自动（全部已配对）。
+                // 带上 ACL 车机可以避免每轮去拨 HI-BOX 之类旧 dongle（10 分钟日志里一半是
+                // 它们的连接失败），也让入站只收这台车。
+                targetMac = { SettingsStore.targetCarMac ?: aclCarMac },
+                // force=true：resolve() 有 10s 静默窗，上下层几乎同时解析时非 force 调用
+                // 会返回 null → 退回稳定伪 MAC（2026-10-25 现场：同一轮出现两个身份）。
+                deviceMacProvider = { BluetoothMac.resolveOrStable(force = true) },
+                dropProfilesBeforeIap2 = headUnitProfile.dropProfilesBeforeIap2,
                 log = ::log,
             )
             iap2 = coordinator
@@ -350,23 +375,37 @@ object HyperCarRepo {
             val advertiser = CarPlayCtrlAdvertiser(context, { deviceMac }, ::log)
             ctrlAdvertiser = advertiser
             val lastSeen = AtomicReference<CarPlayEndpoint?>(null)
-            val endpoint =
-                awaitUsableEndpoint(context, coordinator, lastSeen, advertiser)
-                    ?: gatewayFallbackEndpoint(context, lastSeen.get())
-            if (endpoint == null) {
-                val seen = lastSeen.get()
-                fail(
-                    if (seen == null) {
-                        "等车机无线 CarPlay 端点超时（${ENDPOINT_TIMEOUT_MILLIS / 1000}s）——" +
-                            "车机没下发 0x5703/0x4301。请在车机上进入「移动设备 → 本机 → Apple CarPlay」" +
-                            "点一次（车机只在打开 CarPlay 窗口后才下发热点凭据与 AirPlay 端点）；" +
-                            "若已知车机热点密码，也可先把手机手动连上该热点，本机会用网关 7000 端口兜底"
-                    } else {
-                        "车机未给出可用 IP（ssid=${seen.ssid ?: "-"} port=${seen.airPlayPort} " +
-                            "ips=${seen.ipAddresses}）——检查车机热点是否开启"
-                    },
-                )
-                return
+            // **等端点超时也不拆 iAP2**（2026-10-24 iPhone HCI 对照 / 2026-10-25 现场）：
+            // 真 iPhone 在拿到 0x5703 后 ≥34s 不发任何 iAP2 报文、也从不主动拆链；
+            // 而「拆除会让车机收起 CarPlay 图标」——一旦车机把本机从 CarPlay 设备里摘掉，
+            // 它连 iAP2 都不再发起（10-25 日志：10 分钟里 0 次连入）。所以这里改成
+            // 「超时只提示、不拆链，继续下一轮等」，直到用户断开 / ACL 断开 / 拿到端点。
+            var endpoint: CarPlayEndpoint? = null
+            var waitRounds = 0
+            while (endpoint == null) {
+                endpoint =
+                    awaitUsableEndpoint(context, coordinator, lastSeen, advertiser)
+                        ?: gatewayFallbackEndpoint(context, lastSeen.get())
+                if (endpoint == null) {
+                    waitRounds++
+                    val seen = lastSeen.get()
+                    val reason =
+                        if (seen == null) {
+                            if (coordinator.sessionStartCount == 0) {
+                                "车机未发起 iAP2（ACL 已连但收不到 …cafe 连入）——" +
+                                    "请在 iDrive 里删除本机重新配对 / 确认 Apple CarPlay 已启用"
+                            } else {
+                                "车机连入了 iAP2 但没给 0x5703/0x4301——请在车机上点一次 Apple CarPlay"
+                            }
+                        } else {
+                            "车机未给出可用 AirPlay 地址（ssid=${seen.ssid ?: "-"} ips=${seen.ipAddresses}）"
+                        }
+                    log(
+                        "SESSION: 第 ${waitRounds} 轮等待结束（${reason}）——" +
+                            "**保持 iAP2 链路不拆**，继续等（拆链会让车机收起 CarPlay 图标）",
+                    )
+                    push(link = LinkState.Negotiating("等车机 CarPlay（保持 iAP2，不拆链）"))
+                }
             }
 
             // ---- 联调开关：只保 iAP2 链路，不起 AirPlay ----
@@ -1180,15 +1219,25 @@ object HyperCarRepo {
                     if (ticks % TICKS_PER_PROGRESS == 0) {
                         val seen = lastSeen.get()
                         val waited = ticks * ENDPOINT_TICK_MILLIS / 1000
-                        log(
-                            if (seen == null) {
-                                "SESSION: 仍在等车机端点（还没收到 0x5703/0x4301，已等 ${waited}s）" +
-                                    "——链路保持中，请在车机上点一次「Apple CarPlay/手机」"
-                            } else {
-                                "SESSION: 仍在等车机地址（ssid=${seen.ssid ?: "-"} port=${seen.airPlayPort} " +
-                                    "ips=${seen.ipAddresses}，已等 ${waited}s）"
-                            },
-                        )
+                        // 区分「车机根本没连进来」与「连进来了但没给凭据」——前者是车机
+                        // 侧的问题（iDrive 里没把本机当 CarPlay 手机），后者才是协议问题。
+                        if (seen == null && coordinator.sessionStartCount == 0) {
+                            log(
+                                "SESSION: ${waited}s 内车机一次都没发起 iAP2（ACL 已连但收不到 …cafe 连入）——" +
+                                    "这是车机侧状态：请在 iDrive「移动设备」里删除本机后重新配对，" +
+                                    "或确认「Apple CarPlay」已为该设备启用（设置里可手动指定目标车机）",
+                            )
+                        } else {
+                            log(
+                                if (seen == null) {
+                                    "SESSION: 仍在等车机端点（还没收到 0x5703/0x4301，已等 ${waited}s）" +
+                                        "——链路保持中，请在车机上点一次「Apple CarPlay/手机」"
+                                } else {
+                                    "SESSION: 仍在等车机地址（ssid=${seen.ssid ?: "-"} port=${seen.airPlayPort} " +
+                                        "ips=${seen.ipAddresses}，已等 ${waited}s）"
+                                },
+                            )
+                        }
                     }
                     continue
                 }

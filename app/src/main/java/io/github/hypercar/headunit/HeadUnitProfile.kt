@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.headunit
+package io.github.hypercar.headunit
 
 import io.github.hypercar.settings.SettingsStore
 
@@ -47,6 +47,28 @@ data class HeadUnitProfile(
     /** 车机发 0xAE00 StartPowerUpdates 时回 0xAE01（真 iPhone 必回 3 条）。 */
     val replyPowerUpdates: Boolean = true,
 
+    /**
+     * 发 iAP2 之前是否主动断开该车机的 HFP/A2DP（cardeck 的「只配对、不连接」）。
+     *
+     * - **奥迪 MIB3 需要**：手机与车机处于已连接状态时车机不开放 iAP2 服务窗口。
+     * - **宝马不需要，而且有害**（2026-10-25 现场）：车机在 HFP/A2DP 在线时照样会在
+     *   ACL 连上后 ~4s 主动连入手机 iAP2；我们主动断开会把整条 ACL 一起拽掉
+     *   （车机侧看到设备断开 → 重连 → 我们再断），形成 15~60s 一轮的「连上→断」循环，
+     *   车机始终等不到稳定的 iAP2 建链，表现就是「不把手机当 CarPlay 设备」。
+     */
+    val dropProfilesBeforeIap2: Boolean = true,
+
+    /**
+     * 0x1D01 判为「档案 A」（车机没开无线 CarPlay 窗口）时是否**主动结束会话**。
+     *
+     * **必须 false**（2026-10-25 现场 A/B 定谳）：0.27（保持链路）时车机显示 CarPlay
+     * 图标；0.28 起加了「档案 A 立即结束会话」后，车机把本机降级成普通蓝牙设备、
+     * 图标消失，之后连 iAP2 都不再发起——与 docs/NEGOTIATION-GAPS.md §10.5 的结论
+     * 「拆除会让车机收起 CarPlay 图标」一致。档案 A/B 的切换由车机决定，靠拆链去
+     * 「换一轮」代价是把 CarPlay 设备身份丢掉，不划算。
+     */
+    val abortWhenCarPlayWindowClosed: Boolean = false,
+
     /** 端点端口策略：true = 先查 mDNS `_airplay._tcp`，false = 直接用 [fallbackAirplayPorts]。 */
     val preferMdnsAirplay: Boolean = true,
 
@@ -79,12 +101,16 @@ object HeadUnitProfiles {
         id = "bmw_id85",
         label = "BMW iD8.5",
         model = "MGU-86 / MGU-55",
-        notes = "真车实测：车机从不发 0x4301、从不回 0xEA03；端点靠 ctrl 邀请 + mDNS，失败要保活 iAP2。",
+        notes = "真车实测：车机永不发 0x4301、不回报 0xEA03；0x4300 / 0xEA00 / 0x4E0E 必须发" +
+            "（0.27 图标出现、0.29 停发后图标消失的现场 A/B），且绝不能主动拆 iAP2 链路。",
         validatesDeviceId = false,
-        sendCarPlayAvailability = false,
-        openEaSessions = false,
-        sendTransportIdentifier = false,
+        // ↓ 这三项 2026-10-25 现场 A/B 恢复为 0.27 值：0.27 有 CarPlay 图标，停发后图标消失
+        sendCarPlayAvailability = true,
+        openEaSessions = true,
+        sendTransportIdentifier = true,
         replyPowerUpdates = true,
+        dropProfilesBeforeIap2 = false,
+        abortWhenCarPlayWindowClosed = false,
         preferMdnsAirplay = true,
         fallbackAirplayPorts = listOf(7000, 7001, 7100),
         touchDisplay = null,
@@ -104,6 +130,7 @@ object HeadUnitProfiles {
         replyPowerUpdates = true,
         preferMdnsAirplay = false,
         fallbackAirplayPorts = listOf(7000),
+        dropProfilesBeforeIap2 = false,
         keepIap2AliveOnly = true,
         // WinPlay 的 /info 固定报 0x0，HID 坐标按它自己的窗口像素算（实测值）
         touchDisplay = "2732x794",

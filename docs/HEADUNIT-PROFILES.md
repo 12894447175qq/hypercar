@@ -1,4 +1,4 @@
-﻿# 车机档案（HeadUnitProfile）：新增品牌怎么做
+# 车机档案（HeadUnitProfile）：新增品牌怎么做
 
 这套协议在不同车机上的差异**不小**，而且大多是实测出来的（宝马从不发 0x4301、WinPlay 校验
 deviceID……）。为了让"加一个品牌"不去动主流程，所有差异都收敛在一处：
@@ -18,10 +18,11 @@ app/src/main/java/io/github/hypercar/headunit/HeadUnitProfile.kt   ← 档案定
 | `notes` | 设置页里这个档案的一句话说明 | 写"凭什么这么配"（实测结论） |
 | `verified` | 是否经过**实车首手验证**；`false` 会在设置页打「未实测」角标 | 自己没上过实车就别写 `true` |
 | `validatesDeviceId` | 接收端会逐字符比对 AirPlay `SETUP` 的 `deviceID` 与本机蓝牙 MAC | 连不上且日志出现 `403`/`deviceID` 相关拒绝 → `true` |
-| `sendCarPlayAvailability` | 是否发 `0x4300` CarPlayAvailability | 真 iPhone **从不发**；只有车机在 `0x1D01` 里声明可收 `0x4300` 且实测需要时才开 |
-| `openEaSessions` | 是否开 `0xEA00` EA 会话 | 真 iPhone 一个都不发；车机若不回 `0xEA03`，保持 `false` |
-| `sendTransportIdentifier` | 是否发 `0x4E0E` 传输标识 | 真 iPhone 不发；默认 `false` |
+| `sendCarPlayAvailability` | 是否发 `0x4300` CarPlayAvailability（带本机蓝牙传输标识） | **宝马车机必须 `true`**：2026-10-25 现场 A/B——0.27 发它时车机显示 CarPlay 图标；0.29 起按"真 iPhone 不发"关掉后，车机把手机降级成"只有电话/语音的普通蓝牙设备"，图标消失且不再发起 iAP2 |
+| `openEaSessions` | 是否开 `0xEA00` EA 会话 | 宝马车机 `true`（0.27 行为）；真 iPhone 一个都不发，但停发与图标消失同时发生，暂按现场 A/B 保留 |
+| `sendTransportIdentifier` | 是否发 `0x4E0E` 传输标识 | 同上，宝马 `true`（与 0x4300 携带同一个传输标识） |
 | `replyPowerUpdates` | 车机发 `0xAE00` 时是否回 `0xAE01` | 真 iPhone **必回**（3 条）；默认 `true` |
+| `dropProfilesBeforeIap2` | 发 iAP2 前是否主动断开该车机的 HFP/A2DP（「只配对、不连接」） | 奥迪那种「已连接就不开 iAP2 窗口」的车机要 `true`；**宝马要 `false`**——它的 HFP/A2DP 在线时本来就会主动连入 iAP2，主动断开反而把 ACL 一起拽掉，车机反而不发起 CarPlay |
 | `preferMdnsAirplay` | 端口策略：`true` = 先查 mDNS `_airplay._tcp` | 车机广播该服务（抓包/Bonjour 浏览可见）→ `true`；普通接收端（WinPlay）→ `false` |
 | `fallbackAirplayPorts` | mDNS 拿不到时的试连顺序 | AirPlay 惯例 `7000`，其次 `7001` / `7100` |
 | `touchDisplay` | 接收端 HID 像素空间（`"WxH"`） | 车机 `/info` 报 `0x0` 而坐标总是偏 → 填接收端真实像素 |
@@ -95,7 +96,8 @@ val all: List<HeadUnitProfile> = listOf(BMW_ID85, WINPLAY, AUDI_MIB3)
 
 | 现象 | 先查 |
 |---|---|
-| 车机上**没有 CarPlay 图标** | 不是档案问题：先确认 AirPlay 失败后我们没拆 iAP2（看 `保留 iAP2 链路` 日志） |
+| 车机上**CarPlay 图标消失**、手机只剩"电话/语音" | ① `sendCarPlayAvailability` 必须 `true`（`0x4300` 带传输标识，车机靠它把设备认成 CarPlay）；② `abortWhenCarPlayWindowClosed` 必须 `false`（拆链会让车机收起图标）；③ `dropProfilesBeforeIap2` 必须 `false`（断了 HFP/A2DP 会把 ACL 一起拽掉）；④ `0x4301` 等不到**不等于**设备身份有问题——先按上面三条恢复，再让车机重新配对一次 |
+| 车机**根本不发起 iAP2**（日志 `XXXs 内车机一次都没发起 iAP2`） | 就是上一行的①②③之一造成的车机侧降级；代码修复后需要**在 iDrive 里删掉本机重新配对**才会重新认可 |
 | 能连上但**触摸点不准** | `touchDisplay`（接收端 `_info` 报 0×0 时必须给） |
 | 连不上且日志提示 `403` | `validatesDeviceId` + 设置里手动填真实蓝牙 MAC |
 | 车机从不发 `0x4301`、一直等端点 | `preferMdnsAirplay=true`（用 ctrl 邀请 / mDNS 找端点） |

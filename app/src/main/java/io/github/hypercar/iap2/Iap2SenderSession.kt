@@ -264,16 +264,22 @@ class Iap2SenderSession(
         }
 
         // ---- 档案 A（BMW 常见）：车机本次没开无线 CarPlay 窗口 ----
-        // 车机单方面决定 A/B（cardeck 2026-10-21 日志：同一台车每轮 A/B 交替），
-        // 发什么都改不了；而握着这条会话会挡掉车机下一次连入（sessionActive 门闸），
-        // 所以这里**主动结束**，让车机重开——下一轮很可能就是档案 B。
-        // 只对能确认是 BMW 形态（身份含 BMW，或 EA 里有 de.bmw.*）的车机做，
-        // 其它车机（清单稀疏/只走 mDNS 的老接收端）保持原来的等待行为。
+        // 车机单方面决定 A/B（cardeck 2026-10-21 日志：同一台车每轮 A/B 交替）。
+        // **默认不结束会话**（档案字段 abortWhenCarPlayWindowClosed，宝马/奥迪都为 false）：
+        // 2026-10-25 现场 A/B 证明「档案 A 立即拆链」会让车机把本机降级成普通蓝牙设备、
+        // CarPlay 图标消失，之后连 iAP2 都不再发起——图标比「换一轮」值钱得多。
+        // 只保留一个开关：确有车机需要「快点换轮」时才在档案里打开。
         val looksLikeBmw =
             identityText.contains("bmw") ||
                 ident.eaProtocols.any { it.name.startsWith("de.bmw.", ignoreCase = true) }
-        if (looksLikeBmw && !isCarPlayProfileB(ident)) {
+        if (profile.abortWhenCarPlayWindowClosed && looksLikeBmw && !isCarPlayProfileB(ident)) {
             throw NoCarPlayWindowException("车机本次为档案 A（无 0x5703/0x4301、EA 无 com.bmw.carplay）")
+        }
+        if (looksLikeBmw && !isCarPlayProfileB(ident)) {
+            log(
+                "iap2 档案 A：车机本次没开无线 CarPlay 窗口（无 0x5703/0x4301）——" +
+                    "保持链路不拆（拆了车机会收起 CarPlay 图标），保活期等车机重发 0x1D01/0x5703",
+            )
         }
 
         // ---- StartHID（0x6800 → 0x6801）：真 iPhone 会应答，漏了车机可能判定设备未就绪 ----
@@ -339,25 +345,22 @@ class Iap2SenderSession(
         // 0x4300 发后不管：Audi 实测车机曾对它停止 ACK（其余包毫秒级 ACK），
         // 计入重传清单会让看门狗在 +20s 杀掉整条蓝牙链路。
         //
-        // **只在车机声明可收时才发**（2026-10-24 iPhone HCI 对照）：
-        // 真 iPhone 从不发 0x4300；BMW MGU-55 的接收清单里也没有它
-        // （0x4c01 0x4c04 0x4e09 0x4e0a 0x4e0b 0x4e0c 0x4e0d 0x5001 0x5702 0x6801 0xae01 0xea00 0xea01）。
-        // 对没有该能力的车机硬发，可能把它推进「会话已请求」的状态——之后 AirPlay 侧
-        // `GET /info` 就回 `455 Method Not Valid In This State`（真车 2026-10-24 实测）。
-        if (profile.sendCarPlayAvailability &&
-            ident.declaresReceive(Iap2MessageIds.CARPLAY_AVAILABILITY) != false
-        ) {
+        // **改由车机档案决定**（2026-10-25 现场 A/B，本文件最重要的一条回归结论）：
+        //   - 0.27（发 0x4300）：车机显示 CarPlay 图标，手机被识别成 CarPlay 设备；
+        //   - 0.29 起（按「真 iPhone 不发 0x4300」的 HCI 对照改成不发）：**图标消失**，
+        //     车机把手机降级成「只有电话/语音的普通蓝牙设备」，之后连 iAP2 都不再发起。
+        // 所以宝马车机档案恢复 0.27 行为（sendCarPlayAvailability=true），并且
+        // **不再看可收清单**——清单只能证明「有」，不能证明「没有」（cardeck 0.1.14 定谳）。
+        // 0x4300 里带的是本机蓝牙传输标识：车机靠它把 CarPlay 设备与已配对手机对上，
+        // 这也是必须用真实 MAC 的原因（伪 MAC 会对不上任何已配对设备）。
+        if (profile.sendCarPlayAvailability) {
+            if (ident.declaresReceive(Iap2MessageIds.CARPLAY_AVAILABILITY) == false) {
+                log("iap2 车机清单未声明可收 0x4300，但档案 ${profile.id} 要求发——照发（清单可能不完整）")
+            }
             sendFireAndForget(Iap2MessageIds.CARPLAY_AVAILABILITY, Iap2Messages.carPlayAvailability(bluetoothMac))
-            log("iap2 tx=0x4300 CarPlayAvailability（档案 ${profile.id} 要求且车机可收）")
+            log("iap2 tx=0x4300 CarPlayAvailability（档案 ${profile.id}；mac=$bluetoothMac）")
         } else {
-            log(
-                "iap2 跳过 0x4300（CarPlayAvailability）——" +
-                    if (!profile.sendCarPlayAvailability) {
-                        "档案 ${profile.id} 不要求（对齐真 iPhone：iPhone 从不发）"
-                    } else {
-                        "车机未声明可收"
-                    },
-            )
+            log("iap2 跳过 0x4300（CarPlayAvailability）——档案 ${profile.id} 不要求")
         }
         val declaresStartSession = ident.declaresSend(Iap2MessageIds.CARPLAY_START_SESSION)
         // 没拿到 0x5703（新协议车机）时 0x4301 是**唯一** AP 来源——窗口给足；
