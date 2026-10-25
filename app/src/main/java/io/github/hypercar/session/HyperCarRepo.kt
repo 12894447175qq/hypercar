@@ -148,6 +148,11 @@ object HyperCarRepo {
      */
     @Volatile
     private var airplayHost: String? = null
+    /** 晚到 0x4301 给出的地址/端口（端口循环里会立刻改用，不再陪跑候选端口）。 */
+    @Volatile
+    private var lateAirplayHost: String? = null
+    @Volatile
+    private var lateAirplayPort: Int = 0
 
     @Volatile
     private var airplayPort: Int = 0
@@ -531,22 +536,49 @@ object HyperCarRepo {
             push(link = LinkState.Negotiating("连接车机 AirPlay 端口"))
             var port = 0
             var controlFd: Int? = null
-            for (candidate in candidatePorts) {
-                val fd = openControlFd(context, apHost, candidate)
-                if (fd != null && fd >= 0) {
-                    port = candidate
-                    controlFd = fd
+            // 晚到的 0x4301 会给出**真实端口与地址**（WinPlay：17000 + IPv6 link-local）。
+            // 以前它只更新一行日志，我们还在用猜的 [7000,7001,7100] 死连到超时
+            // （2026-10-25 21:48 现场：0x4301 早给了 airPlayPort=17000，我们 14s 后还在试 7100）。
+            // 现在每轮先看它一眼：给了就**立刻改用**，不再陪跑候选端口。
+            var hostNow = apHost
+            var portsNow: List<Int> = candidatePorts
+            for (round in 0..1) {
+                for (candidate in portsNow) {
+                    val fd = openControlFd(context, hostNow, candidate)
+                    if (fd != null && fd >= 0) {
+                        port = candidate
+                        controlFd = fd
+                        break
+                    }
+                }
+                if (controlFd != null) break
+                val latePort = lateAirplayPort
+                val lateHostRaw = lateAirplayHost
+                if (round == 0 && latePort > 0) {
+                    // 只在晚到地址是 **IPv4** 时改 host：fe80:: link-local 不带 scope 连不上
+                    // （EINVAL，2026-10-25 两轮现场如此）。这种情况只借它的端口，host 保持原样。
+                    val lateHost = lateHostRaw?.takeIf { it.contains('.') && !it.contains(':') }
+                    if (lateHost != null) {
+                        log("SESSION: ✓ 晚到的 0x4301 给出端点 ${lateHost}:${latePort}——改用它重连")
+                        hostNow = lateHost
+                        airplayHost = lateHost
+                    } else {
+                        log("SESSION: 晚到的 0x4301 端口=${latePort}（地址 ${lateHostRaw ?: "-"} 不是 IPv4）——沿用 $hostNow，只换端口")
+                    }
+                    portsNow = listOf(latePort)
+                } else {
                     break
                 }
             }
+            val apHostFinal = hostNow
             if (controlFd == null || controlFd < 0 || port == 0) {
-                fail("AirPlay 控制端口连接失败 $apHost（试过 $candidatePorts）")
+                fail("AirPlay 控制端口连接失败 $apHostFinal（试过 $candidatePorts；晚到的 0x4301 也没给出可用端点）")
                 return
             }
             airplayPort = port
             // 记住这次成功的端点：下次同一热点直接试它（盒子就是这么稳的）
             runCatching {
-                SettingsStore.lastAirplayEndpoint = "$apHost:$port|${currentWifiSsid(context).orEmpty()}"
+                SettingsStore.lastAirplayEndpoint = "$apHostFinal:$port|${currentWifiSsid(context).orEmpty()}"
             }
 
             // ---- 启动 Rust 引擎（协商在 Rust 内继续）----
@@ -1490,7 +1522,12 @@ object HyperCarRepo {
                     // 看不到这台车了，连下一步都点不下去（现场反馈 2026-10-25）。
                     // 这里只把回调丢掉：端点已定，0x5703/0x4301 来了也不需要。
                     coordinator.start { ep ->
-                        log("IAP2: 后台会话端点回调（忽略，端点已定）ips=${ep.ipAddresses}")
+                        log("IAP2: 后台会话端点回调（端点已定，仅记录）ips=${ep.ipAddresses}")
+                        val ip = ep.ipAddresses.firstOrNull { it.contains('.') && !it.contains(':') }
+                            ?: ep.ipAddresses.firstOrNull()
+                        if (ip != null && ep.airPlayPort > 0) {
+                            lateAirplayHost = ip; lateAirplayPort = ep.airPlayPort
+                        }
                     }
                     return@withTimeoutOrNull CarPlayEndpoint(
                         ssid = currentSsid,
@@ -1509,7 +1546,20 @@ object HyperCarRepo {
         }
 
         val callbacks = Channel<CarPlayEndpoint>(Channel.UNLIMITED)
-        coordinator.start { endpoint -> callbacks.trySend(endpoint) }
+        coordinator.start { endpoint ->
+            callbacks.trySend(endpoint)
+            // 端口阶段（awaitUsableEndpoint 已返回）再来的 0x4301：记下来供端口循环热切换
+            if (sessionLive.get() && airplayHost != null && endpoint.airPlayPort > 0) {
+                // 优先 IPv4：0x4301 往往同时给 IPv4 和 fe80:: link-local，
+                // 后者不带 scope 直接 connect 会 EINVAL（2026-10-25 21:55 现场）。
+                val ip = endpoint.ipAddresses.firstOrNull { it.contains('.') && !it.contains(':') }
+                    ?: endpoint.ipAddresses.firstOrNull()
+                if (ip != null) {
+                    lateAirplayHost = ip
+                    lateAirplayPort = endpoint.airPlayPort
+                }
+            }
+        }
         try {
             var usable: CarPlayEndpoint? = null
             var ticks = 0
@@ -2080,6 +2130,10 @@ object HyperCarRepo {
     /** 重启时从落盘日志带回环形缓冲的行数（够覆盖崩溃前的一段现场）。 */
     private const val DISK_LOG_TAIL_LINES = 120
 }
+
+
+
+
 
 
 

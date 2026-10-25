@@ -73,7 +73,7 @@ data class HeadUnitProfile(
     val preferMdnsAirplay: Boolean = true,
 
     /** mDNS 拿不到（或不用 mDNS）时的兜底端口，按顺序试连。 */
-    val fallbackAirplayPorts: List<Int> = listOf(7000, 7001, 7100),
+    val fallbackAirplayPorts: List<Int> = listOf(7000, 7001, 7100, 17000),
 
     /** 接收端 HID 像素空间（"WxH"）；null = 用 /info 回报或协商尺寸。 */
     val touchDisplay: String? = null,
@@ -112,7 +112,7 @@ object HeadUnitProfiles {
         dropProfilesBeforeIap2 = true,
         abortWhenCarPlayWindowClosed = false,
         preferMdnsAirplay = true,
-        fallbackAirplayPorts = listOf(7000, 7001, 7100),
+        fallbackAirplayPorts = listOf(7000, 7001, 7100, 17000),
         touchDisplay = null,
         pairingHint = "首次要在 iDrive 里把这个设备选成 CarPlay 手机（车机会弹确认）",
     )
@@ -200,7 +200,7 @@ object HeadUnitProfiles {
         sendTransportIdentifier = false,
         replyPowerUpdates = true,
         preferMdnsAirplay = true,
-        fallbackAirplayPorts = listOf(7000, 7001, 7100),
+        fallbackAirplayPorts = listOf(7000, 7001, 7100, 17000),
         touchDisplay = null,
         pairingHint = "首次要在 MMI 里选「Apple CarPlay」并确认这台手机（车机会弹提示）",
     )
@@ -223,6 +223,7 @@ object HeadUnitProfiles {
     /** 当前设置里选中的档案。 */
     fun current(): HeadUnitProfile = byId(SettingsStore.headUnitProfileId)
 }
+
 
 
 

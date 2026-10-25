@@ -262,10 +262,53 @@ object Iap2Messages {
         val params = Iap2Csm.parseParams(body).associateBy { it.id }
         val wireless = params[START_SESSION_WIRELESS_GROUP]?.let { Iap2Csm.parseParams(it.value) }.orEmpty()
         // 地址字段：定长 NUL 填充，必须 rstrip 全部尾部 0x00（见 Iap2Csm.asStringOrNull 注释）
-        val addresses =
-            wireless
-                .filter { it.id == 3 }
-                .mapNotNull { it.asStringOrNull()?.takeIf { addr -> addr.isNotEmpty() } }
+        //
+        // 2026-10-25 WinPlay 现场：0x4301 原始体里**同时**有 IPv4（"192.168.137.1"）和
+        // IPv6 link-local（fe80::…），但 IPv4 不在无线组的 id==3 上——只按 id==3 取会只剩
+        // fe80，而 fe80 在 Android 上不带 scope 直接 connect 必然 EINVAL，表现为
+        // 「地址拿到了却连不上」（连续两版日志都是这个死法）。
+        // 改成：**内外层都扫**，只认"长得像地址"的字符串，并把 IPv4 排到最前。
+        // MAC 形如 "C2:BF:BE:E1:85:C0" 也会满足「冒号 >= 2」，必须排除（deviceIdentifier 就是它）
+        val macRe = Regex("^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+        val ipv4Re = Regex("^\\d{1,3}(\\.\\d{1,3}){3}$")
+        // 只认**私有网段 / 链路本地**地址：车机热点必然是这两类；
+        // 这条过滤能挡掉参数里长得像 IP 的版本号（如 "1.0.0.0"）和公网地址。
+        fun isPrivateIpv4(s: String): Boolean {
+            val p = s.split('.').mapNotNull { it.toIntOrNull() }
+            if (p.size != 4 || p.any { it !in 0..255 }) return false
+            return p[0] == 10 ||
+                (p[0] == 172 && p[1] in 16..31) ||
+                (p[0] == 192 && p[1] == 168) ||
+                (p[0] == 169 && p[1] == 254)
+        }
+        fun isLocalIpv6(s: String): Boolean {
+            val l = s.lowercase()
+            // fe80::/10 链路本地、fc00::/7 唯一本地（ULA）
+            return l.startsWith("fe8") || l.startsWith("fe9") || l.startsWith("fea") ||
+                l.startsWith("feb") || l.startsWith("fc") || l.startsWith("fd")
+        }
+        val raw =
+            (wireless.mapNotNull { it.asStringOrNull() } + params.values.mapNotNull { it.asStringOrNull() })
+                .map { it.trim() }
+                .filter { s ->
+                    (ipv4Re.matches(s) && isPrivateIpv4(s)) ||
+                        (s.count { it == ':' } >= 2 && s.length <= 45 && !macRe.matches(s) && isLocalIpv6(s))
+                }
+                .distinct()
+                .sortedBy { s -> if (ipv4Re.matches(s)) 0 else 1 }
+        // 过滤后为空就退回"只是排除 MAC"的宽口径：宁可多一个候选，也不要一个地址都没有
+        val addresses = if (raw.isNotEmpty()) {
+            raw
+        } else {
+            (wireless.mapNotNull { it.asStringOrNull() } + params.values.mapNotNull { it.asStringOrNull() })
+                .map { it.trim() }
+                .filter { s ->
+                    ipv4Re.matches(s) ||
+                        (s.count { it == ':' } >= 2 && s.length <= 45 && !macRe.matches(s))
+                }
+                .distinct()
+                .sortedBy { s -> if (ipv4Re.matches(s)) 0 else 1 }
+        }
         return StartSession(
             airPlayPort = params[START_SESSION_AIRPLAY_PORT]?.asU32() ?: 0,
             deviceIdentifier = params[START_SESSION_DEVICE_IDENTIFIER]?.asStringOrNull(),
@@ -337,5 +380,6 @@ object Iap2Messages {
         Iap2Csm.u64(0, epochSeconds) +
             Iap2Csm.s16(1, timezoneOffsetMinutes) +
             Iap2Csm.u8(2, daylightSaving)
-}
 
+
+}
