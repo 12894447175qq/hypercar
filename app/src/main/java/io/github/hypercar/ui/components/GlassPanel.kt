@@ -148,6 +148,11 @@ fun CapsuleButton(
     contentColor: Color = Color.Unspecified,
     borderColor: Color = ElectricCyan,
     leadingIcon: ImageVector? = null,
+    /**
+     * 左右内边距。默认 20dp；**四等分一行的窄按钮要传小值**
+     * （20dp × 2 + 图标 + 两个汉字会超宽，系统把最后一个字吞掉，2026-10-25 诊断页截图）。
+     */
+    horizontalPadding: Dp = 20.dp,
 ) {
     val shape = CircleShape
     val resolvedContent = if (contentColor == Color.Unspecified) {
@@ -183,7 +188,7 @@ fun CapsuleButton(
                 shape = shape,
             )
             .clickable(enabled = enabled, onClick = onClick)
-            .padding(horizontal = 20.dp),
+            .padding(horizontal = horizontalPadding),
         horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically,
     ) {

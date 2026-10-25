@@ -312,6 +312,14 @@ object HyperCarRepo {
 
     fun clearLogs() {
         _snapshots.value = _snapshots.value.copy(recentLogs = emptyList())
+        // **清空后立刻补回环境自述**：否则用户点一下"清空"，后面的日志就再也没有
+        // 设备/系统/SDK/App 版本了（反馈出去的日志无法定位版本，2026-10-25 实测踩到）。
+        // 不走 log()：它在「记录已暂停」时会直接丢弃，而这一行恰恰是最该保留的。
+        val ctx = appCtx ?: return
+        val stamp = logTimeFormat.get().format(java.util.Date())
+        val env = "$stamp  ENV: ${DeviceInfo.fullSummary(ctx)}"
+        appendDiskLog(env)
+        _snapshots.update { it.copy(recentLogs = it.recentLogs + env) }
     }
 
     // ---------------------------------------------------------------- 连接主流程

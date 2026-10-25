@@ -1,4 +1,4 @@
-package io.github.hypercar.ui.screens
+﻿package io.github.hypercar.ui.screens
 
 import android.os.Build
 import androidx.compose.animation.AnimatedVisibility
@@ -174,6 +174,8 @@ private fun Header(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
+            // 四个按钮平分一行：**不放图标**——图标 + 两个汉字在 4 等分宽度里放不下，
+            // 系统会把最后一个字吞掉（2026-10-25 截图："复制"只显示"复"）。
             CapsuleButton(
                 text = "复制",
                 onClick = {
@@ -187,7 +189,7 @@ private fun Header(
                     .height(44.dp),
                 filled = false,
                 contentColor = TextPrimary,
-                leadingIcon = Icons.Rounded.ContentCopy,
+                horizontalPadding = 8.dp,
             )
             CapsuleButton(
                 text = "导出",
@@ -198,7 +200,7 @@ private fun Header(
                 filled = false,
                 contentColor = ElectricCyan,
                 borderColor = ElectricCyan.copy(alpha = 0.5f),
-                leadingIcon = Icons.Rounded.FileDownload,
+                horizontalPadding = 8.dp,
             )
             CapsuleButton(
                 text = "清空",
@@ -209,7 +211,7 @@ private fun Header(
                 filled = false,
                 contentColor = CoralError,
                 borderColor = CoralError.copy(alpha = 0.5f),
-                leadingIcon = Icons.Rounded.DeleteOutline,
+                horizontalPadding = 8.dp,
             )
             // 一键反馈：预填 GitHub Issue（标题/环境/日志尾部）+ 完整日志进剪贴板。
             // 不做"静默创建"：GitHub 写 Issue 需要 token，APK 里放 token 等于公开泄露；
@@ -241,6 +243,7 @@ private fun Header(
                 containerColor = ElectricCyan,
                 contentColor = io.github.hypercar.ui.theme.DeepSpace,
                 borderColor = ElectricCyan,
+                horizontalPadding = 8.dp,
             )
         }
     }
