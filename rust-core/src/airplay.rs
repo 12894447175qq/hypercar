@@ -1,4 +1,4 @@
-//! AirPlay 发送端会话（协商整体下沉 Rust —— 与参考文档的关键差异，见 docs/NEGOTIATION-GAPS.md）。
+﻿//! AirPlay 发送端会话（协商整体下沉 Rust —— 与参考文档的关键差异，见 docs/NEGOTIATION-GAPS.md）。
 //!
 //! 流程（cardeck 真车验证的顺序，Audi MIB3 / BMW iD8.5 通用骨架）：
 //!  1. `GET /info`（带空 bplist 体 + plist Content-Type，老固件对缺体的 /info 回 400/455）
@@ -457,6 +457,42 @@ async fn fetch_info(channel: &Arc<RtspChannel>) -> Result<Value, String> {
         }
         return bplist::parse(&resp.body).map_err(|e| format!("/info 解析失败: {e}"));
     }
+    // ---- 侦察：这台车机到底认什么 ----
+    // 455 只说明「这个状态下不接受 /info」，但没告诉我们它接受什么。
+    // 依次试 AirPlay 1 的经典入口，把每次的状态行原样记进日志——下一次上车就能定位。
+    // 只做记录，不改变后续流程（后面照样按失败返回）。
+    let probes: [(&str, &str); 4] = [
+        ("OPTIONS", "*"),
+        ("GET", "/server-info"),
+        ("POST", "/pair-setup"),
+        ("POST", "/pair-verify"),
+    ];
+    let mut recon = Vec::new();
+    for (method, path) in probes {
+        let body = if method == "POST" { bplist::encode(&Value::dict(vec![])) } else { Vec::new() };
+        let probe_extra: Vec<(&str, String)> = vec![
+            ("X-Apple-ProtocolVersion", "1".to_string()),
+            ("X-Apple-Device-ID", "0x0".to_string()),
+        ];
+        match channel
+            .request(method, path, &body, "application/x-apple-binary-plist", &probe_extra, Duration::from_secs(5))
+            .await
+        {
+            Ok(r) => {
+                let mut head: Vec<String> = r.headers.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                head.sort();
+                let note = format!("{method} {path} → [{}] 头部[{}]", r.first_line, if head.is_empty() { "无".to_string() } else { head.join(", ") });
+                emit_log(&format!("AIRPLAY 侦察: {note}"));
+                recon.push(note);
+            }
+            Err(e) => {
+                let note = format!("{method} {path} → 传输错误: {e}");
+                emit_log(&format!("AIRPLAY 侦察: {note}"));
+                recon.push(note);
+            }
+        }
+    }
+    emit_log(&format!("AIRPLAY 侦察结论: {}", recon.join(" | ")));
     Err(format!("/info 三次尝试都被拒：{}", failures.join("；")))
 }
 
