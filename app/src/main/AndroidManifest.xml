@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
@@ -56,6 +56,17 @@
     <!-- Android 11+ 包可见性：探测 Shizuku 服务端 -->
     <queries>
         <package android:name="moe.shizuku.privileged.api" />
+        <!-- CarLife 系 app：Android 11+ 的包可见性限制会让 getPackageInfo 误报「未安装」
+             （2026-10-26 00:34 现场：com.baidu.carlife.xiaomi 明明在 pm list 里，
+             我们却判成未安装，唤醒一路退回 com.miui.carlink）。 -->
+        <package android:name="com.baidu.carlife" />
+        <package android:name="com.baidu.carlife.xiaomi" />
+        <package android:name="com.miui.carlink" />
+        <package android:name="com.xiaomi.carlink" />
+        <package android:name="com.hihonor.carwith" />
+        <intent>
+            <action android:name="com.baidu.carlife.Action.StartWireless" />
+        </intent>
     </queries>
 
     <application

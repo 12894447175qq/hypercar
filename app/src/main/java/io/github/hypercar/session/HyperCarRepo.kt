@@ -591,9 +591,18 @@ object HyperCarRepo {
                 return
             }
             airplayPort = port
-            // 记住这次成功的端点：下次同一热点直接试它（盒子就是这么稳的）
-            runCatching {
-                SettingsStore.lastAirplayEndpoint = "$apHostFinal:$port|${currentWifiSsid(context).orEmpty()}"
+            // 记住这次成功的端点：下次同一热点直接试它（盒子就是这么稳的）。
+            //
+            // **只记 IPv4**：fe80:: 链路本地地址不带 scope 连不上（EINVAL），一旦被记下来，
+            // 之后每次都会先试它、每次都秒失败——2026-10-25 23:53 现场就是这样
+            // 「成功过一次以后再也连不上」，记忆里存的是 fe80::db93:…。
+            val savedHost = apHostFinal.takeIf { it.contains('.') && !it.contains(':') }
+            if (savedHost != null) {
+                runCatching {
+                    SettingsStore.lastAirplayEndpoint = "$savedHost:$port|${currentWifiSsid(context).orEmpty()}"
+                }
+            } else {
+                log("SESSION: 端点 $apHostFinal 不是 IPv4——不写入记忆（避免下次先试死地址）")
             }
 
             // ---- 启动 Rust 引擎（协商在 Rust 内继续）----
@@ -601,17 +610,40 @@ object HyperCarRepo {
             // 探测优先：CarLife 若已经在 7240 上监听，就把引擎切成「主动拨号」，
             // 绝不能再让它去 bind（否则它永远抢不到端口）。探测窗口 ~2.5s（刚被唤醒时
             // 需要一点启动时间；客户端型 CarLife 不监听，最多白等这一小段）。
-            val mdHost = probeLocalCarLifeMd()
-            carLifeDialMode = mdHost != null
-            sessionMdHost = mdHost
-            if (mdHost != null) {
+            // 探测窗口 2.5s → **30s**：CarLife（com.baidu.carlife.xiaomi）被唤醒后启动较慢，
+            // 日志实测从广播到开始监听 7240 常要十几秒（2026-10-26 00:24 现场）。
+            // 窗口短了就会误判「无人监听」，转去 HU 监听模式——那样我们占住 7240，
+            // 反而把慢启动的 CarLife 挡在门外。等待期间每 4s 补发一次唤醒广播。
+            val mdHost = probeLocalCarLifeMd(timeoutMillis = 30_000L) { attempt ->
+                if (attempt % 8 == 0) {   // 8 × 200ms ≈ 1.6s → 每 ~1.6s 之后 4s 补一次
+                    log("CARLIFE: 仍在等 CarLife 监听 7240（第 ${attempt * 200 / 1000}s），补发唤醒广播")
+                    wakeLocalCarLife()
+                }
+            }
+            // 只有 7240 在监听还不够：CarLife 被系统/后台拉起、服务还没起全时，
+            // 7240 能连、8240/9240 却一律 refused，于是拨号模式连了个"空壳"，
+            // 之后一直 `连 MD … Connection refused` 死循环（2026-10-26 01:11 现场）。
+            // 再验一条媒体端口，不全就退回 HU 监听模式（自己占住 7240 等真 HU 连进来）。
+            val mediaOk = mdHost == null || runCatching {
+                java.net.Socket().use { s ->
+                    s.connect(java.net.InetSocketAddress("127.0.0.1", CARLIFE_VIDEO_PORT), 400)
+                }
+                true
+            }.getOrDefault(false)
+            if (mdHost != null && !mediaOk) {
+                log("CARLIFE: 7240 在监听但 $CARLIFE_VIDEO_PORT 连不上——CarLife 是空壳，改走 HU 监听模式")
+            }
+            val effectiveMdHost = if (mediaOk) mdHost else null
+            carLifeDialMode = effectiveMdHost != null
+            sessionMdHost = effectiveMdHost
+            if (effectiveMdHost != null) {
                 log("CARLIFE: ✓ 探测到本机 CarLife 正在监听 127.0.0.1:7240 → 引擎走「主动拨号」模式")
             } else {
-                log("CARLIFE: 7240 无人监听 → 由 HU 监听（客户端型 CarLife 会连进来）")
+                log("CARLIFE: 7240 无人监听（或端口不全）→ 由 HU 监听（客户端型 CarLife/盒子会连进来）")
             }
-            val identityPath = context.filesDir.resolve("controller_identity.txt").absolutePath
-            val json = SettingsStore.engineConfigJson(apHost, port, deviceMac, identityPath, mdHost)
             // 下发配置原样打一行（不含密钥）：分辨率/帧率/md_host/voice 一目了然，
+            val identityPath = context.filesDir.resolve("controller_identity.txt").absolutePath
+            val json = SettingsStore.engineConfigJson(apHost, port, deviceMac, identityPath, effectiveMdHost)
             // 免得再靠猜「这次到底请求了多大尺寸、是监听还是拨号」
             log("CORE +${stageMs()}ms 引擎配置：$json")
             // 前后各记一行：原生崩溃（Rust panic 越过 JNI → SIGABRT）会直接把进程带走，
@@ -1195,7 +1227,7 @@ object HyperCarRepo {
             val fd = runCatching {
                 val socket = Socket()
                 socket.tcpNoDelay = true
-                socket.connect(InetSocketAddress(host, port), CONTROL_CONNECT_TIMEOUT_MILLIS.toInt())
+                socket.connect(resolveEndpoint(host, port), CONTROL_CONNECT_TIMEOUT_MILLIS.toInt())
                 keepAliveForRust(socket)
                 ParcelFileDescriptor.fromSocket(socket).detachFd()
             }.onFailure { lastError = it.javaClass.simpleName + ": " + it.message }.getOrNull()
@@ -1276,18 +1308,49 @@ object HyperCarRepo {
         socketKeepAlive.add(owner)
     }
 
+    /**
+     * 解析 AirPlay 端点地址：**链路本地 IPv6（fe80::）必须带 scope** 才能连。
+     *
+     * 不带 scope 时 Android 直接回 `EINVAL`——连接包根本发不出去（2026-10-25 23:58 现场：
+     * DiPlay 的 0x4301 只给 fe80::db93:…，控制端口每个尝试都是 2ms 内 EINVAL）。
+     * 补 `%wlan0` 后控制通道能通，但**事件通道/数据通道**同样走这里，所以必须集中在一处。
+     * 依次尝试 %wlan0 / %wlan1 / %ap0 / %wlan2，再枚举本机所有非回环网卡名。
+     */
+    private fun resolveEndpoint(host: String, port: Int): java.net.InetSocketAddress {
+        val raw = host.trim()
+        val linkLocal = raw.contains(':') && raw.substringBefore('%').lowercase().let {
+            it.startsWith("fe80") || it.startsWith("fe90") || it.startsWith("fea0") || it.startsWith("feb0")
+        }
+        if (!linkLocal || raw.contains('%')) {
+            return java.net.InetSocketAddress(raw, port)
+        }
+        val names = buildList {
+            add("wlan0"); add("wlan1"); add("ap0"); add("wlan2")
+            runCatching {
+                java.net.NetworkInterface.getNetworkInterfaces()?.toList()
+                    ?.filter { it.isUp && !it.isLoopback }
+                    ?.forEach { add(it.name) }
+            }
+        }.distinct()
+        for (name in names) {
+            val addr = runCatching { java.net.InetAddress.getByName("$raw%$name") }.getOrNull()
+            if (addr != null) return java.net.InetSocketAddress(addr, port)
+        }
+        return java.net.InetSocketAddress(raw, port)
+    }
+
     private val socketProvider = object : RustCoreBridge.SocketProvider {
         override fun openTcpFd(host: String, port: Int, timeoutMs: Int): Int = runCatching {
             val socket = Socket()
             socket.tcpNoDelay = true
-            socket.connect(InetSocketAddress(host, port), timeoutMs.coerceAtLeast(1_000))
+            socket.connect(resolveEndpoint(host, port), timeoutMs.coerceAtLeast(1_000))
             keepAliveForRust(socket)
             ParcelFileDescriptor.fromSocket(socket).detachFd()
         }.getOrElse { -1 }
 
         override fun openUdpFd(host: String, port: Int): Int = runCatching {
             val udp = DatagramSocket()
-            udp.connect(InetSocketAddress(host, port))
+            udp.connect(resolveEndpoint(host, port))
             keepAliveForRust(udp)
             ParcelFileDescriptor.fromDatagramSocket(udp).detachFd()
         }.getOrElse { -1 }
@@ -1323,7 +1386,22 @@ object HyperCarRepo {
                 }
                 "carlife_waiting" -> push(carLife = CarLifeState.Waiting())
                 // Rust 侧 CarLife 14 步握手完成（VIDEO_ENCODER_START 已发）
-                "carlife_active" -> push(carLife = CarLifeState.Active())
+                "carlife_active" -> {
+                    push(carLife = CarLifeState.Active())
+                    // CarLife 有 ~35 秒的空闲看门狗：Activity 一旦不在前台，它自己的
+                    // `ProcessUtil.killAllProcess` 就把整进程干掉（2026-10-26 00:45/00:48 两次
+                    // 现场都是"握手成功后第 34~35 秒进程自杀"，紧接着 CarWith 又 force-stop 重启）。
+                    // 所以握手一成，立刻把 CarLife 重新推到前台，让我们的界面退到后台。
+                    scope.launch {
+                        val r = runCatching {
+                            ShizukuTools.exec(
+                                "am start -n com.baidu.carlife.xiaomi/com.baidu.carlife.CarlifeActivity",
+                                8_000,
+                            )
+                        }.getOrNull()
+                        log("CARLIFE: 已把 CarLife 推回前台（防 35s 空闲自杀） exit=${r?.code}")
+                    }
+                }
                 "failed" -> retryAirplayOrFail(detail)
                 "ended" -> {
                     scope.launch { runDisconnect(detail) }
@@ -1365,6 +1443,15 @@ object HyperCarRepo {
         val configured = SettingsStore.carlifePackage
         val ctx = appContext() ?: return configured
         fun installed(p: String) = runCatching { ctx.packageManager.getPackageInfo(p, 0) }.isSuccess
+        // 小米这套的角色分工（2026-10-26 00:36 实测）：
+        //   com.miui.carlink（CarWith）  = 有界面、能拉起，负责"CarLife 连接"入口；
+        //   com.baidu.carlife.xiaomi     = 真正的 CarLife 引擎，**没有 Launcher 界面**，
+        //                                  `monkey -p` 拉它什么都不会发生。
+        // 所以即使设置里填的是引擎包，只要同时装了 CarWith，就优先用 CarWith。
+        if (installed("com.miui.carlink") && configured != "com.miui.carlink") {
+            log("WAKE: 配置的是 $configured（引擎包，无界面），改用它上层的 CarWith（com.miui.carlink）来拉起")
+            return "com.miui.carlink"
+        }
         if (installed(configured)) return configured
         val fallback = carLifePackageCandidates.firstOrNull { it != configured && installed(it) }
         if (fallback != null) {
@@ -1385,12 +1472,26 @@ object HyperCarRepo {
      *
      * 窗口默认 2.5s：刚被广播唤醒的 CarLife 需要一点启动时间；客户端型 CarLife 不监听，
      * 最多白等这一小段（与 AirPlay 握手相比可接受）。
+     *
+     * [onAttempt] 用于等待期间补发唤醒广播（CarLife 启动慢，单次广播容易错过）。
      */
-    private fun probeLocalCarLifeMd(timeoutMillis: Long = CARLIFE_PROBE_TIMEOUT_MILLIS): String? {
+    /** 单次探测 127.0.0.1:7240 是否在监听（唤醒流程里用，不要阻塞）。 */
+    private fun probeCarLifeOnce(): Boolean = runCatching {
+        java.net.Socket().use { s ->
+            s.connect(java.net.InetSocketAddress("127.0.0.1", CARLIFE_CMD_PORT), 300)
+        }
+        true
+    }.getOrDefault(false)
+
+    private fun probeLocalCarLifeMd(
+        timeoutMillis: Long = CARLIFE_PROBE_TIMEOUT_MILLIS,
+        onAttempt: ((Int) -> Unit)? = null,
+    ): String? {
         val deadline = SystemClock.uptimeMillis() + timeoutMillis
         var attempts = 0
         while (SystemClock.uptimeMillis() < deadline) {
             attempts++
+            onAttempt?.invoke(attempts)
             val listening =
                 runCatching {
                     java.net.Socket().use { socket ->
@@ -1424,6 +1525,43 @@ object HyperCarRepo {
     private fun wakeLocalCarLife() {
         val pkg = resolveCarLifePackage()
         _snapshots.value = _snapshots.value.copy(carLife = CarLifeState.Waiting())
+
+        // 小米这套有两个进程会互相打架：CarWith（com.miui.carlink）收到唤醒广播后会自己
+        // 启动一份 CarLife，而 CarLife 有"单实例"逻辑（ProcessUtil.killAllProcess）。
+        // 2026-10-26 00:45 现场：我们用 `am start` 拉起的那份已经握手到 Phase 7，
+        // 35 秒后 CarWith 又起了一份，直接把**我们正连着的那份杀掉**
+        // （ActivityManager: Process com.baidu.carlife.xiaomi … has died: fg）——
+        // 于是"握手成功但一会儿就断、视频一帧都收不到"。
+        //
+        // 结论：**只走一条路**。能直接拉起引擎页（实测有效）就不要再发唤醒广播，
+        // 否则等于自己制造双实例。
+        val directLaunch = "com.baidu.carlife.xiaomi/com.baidu.carlife.CarlifeActivity"
+        if (ShizukuTools.isReady && pkg == "com.miui.carlink") {
+            scope.launch {
+                // **Activity 优先**：实测只有走 Activity 这条路，CarLife 才会完整回 Phase 1~7
+                // （10098~100100 现场）；只拉 `CarlifeConnectService` 时它虽然一直监听 7240、
+                // 编码器也在跑，但**不给 HU 回 Phase 1**，握手永远停在"等版本匹配"
+                // （100101 现场）。所以先拉引擎页，3 秒内 7240 没起来才退回无界面服务。
+                val started = runCatching {
+                    ShizukuTools.exec("am start -n $directLaunch", 8_000)
+                }.getOrNull()
+                log("WAKE: 拉起 CarLife 引擎页 exit=${started?.code} " +
+                    started?.out?.lineSequence()?.firstOrNull().orEmpty().take(120))
+                kotlinx.coroutines.delay(3_000)
+                if (!probeCarLifeOnce()) {
+                    val svc = runCatching {
+                        ShizukuTools.exec(
+                            "am start-foreground-service -n com.baidu.carlife.xiaomi/" +
+                                "com.baidu.carlife.service.CarlifeConnectService",
+                            8_000,
+                        )
+                    }.getOrNull()
+                    log("WAKE: 引擎页没让 7240 起来——退回无界面服务 exit=${svc?.code}")
+                }
+            }
+            return
+        }
+
         runCatching {
             val intent = android.content.Intent("com.baidu.carlife.Action.StartWireless").apply {
                 setPackage(pkg)
@@ -1466,11 +1604,24 @@ object HyperCarRepo {
             }.getOrNull()
             log("WAKE: ② shell 广播 exit=${bcast?.code} ${bcast?.out?.replace("\n", " ")?.take(160).orEmpty()}")
 
-            // ③ 直接拉起 app（很多人肉点的那一步）
-            val launch = runCatching {
-                ShizukuTools.exec("monkey -p $pkg -c android.intent.category.LAUNCHER 1", 8_000)
+            // ③ 直接拉起 CarLife：**实测有效的组件是引擎包的 CarlifeActivity**
+            //    （2026-10-26 00:41 adb 实测：`am start -n com.baidu.carlife.xiaomi/
+            //     com.baidu.carlife.CarlifeActivity` 之后 6 秒内 7240/8240/9240/9241/9242/9340
+            //     全部开始 LISTEN）。
+            //    对比：CarWith 的 `CarlifeDialogActivity` **未导出**（SecurityException），
+            //    `monkey -p com.miui.carlink` 只会停在首页、不启动 CarLife 引擎。
+            val deepLink = "com.baidu.carlife.xiaomi/com.baidu.carlife.CarlifeActivity"
+            val launched = runCatching {
+                ShizukuTools.exec("am start -n $deepLink", 8_000)
             }.getOrNull()
-            log("WAKE: ③ 拉起 $pkg exit=${launch?.code} ${launch?.out?.lineSequence()?.firstOrNull().orEmpty().take(160)}")
+            log("WAKE: ③ 拉起 CarLife 引擎页 $deepLink exit=${launched?.code} " +
+                launched?.out?.lineSequence()?.firstOrNull().orEmpty().take(120))
+            if (launched == null || launched.code != 0) {
+                val launch = runCatching {
+                    ShizukuTools.exec("monkey -p $pkg -c android.intent.category.LAUNCHER 1", 8_000)
+                }.getOrNull()
+                log("WAKE: ③ 退回拉起 $pkg exit=${launch?.code} ${launch?.out?.lineSequence()?.firstOrNull().orEmpty().take(160)}")
+            }
         }
     }
 
@@ -1518,8 +1669,16 @@ object HyperCarRepo {
         val remembered = SettingsStore.lastAirplayEndpoint
         if (remembered.contains('|')) {
             val (endpointPart, ssidPart) = remembered.split('|', limit = 2)
+            // 只认 IPv4 的端点：老版本可能把 fe80:: 写进来（那种地址不带 scope 必然 EINVAL），
+            // 读到就丢弃，走正常发现流程。
+            val hostCandidate = endpointPart.substringBefore(':').trim()
+            val hostUsable = hostCandidate.contains('.') && !hostCandidate.contains(':')
+            if (!hostUsable && hostCandidate.isNotEmpty()) {
+                log("SESSION: 记忆里的端点 $hostCandidate 不是 IPv4——忽略它，走正常发现")
+                runCatching { SettingsStore.lastAirplayEndpoint = "" }
+            }
             val parts = endpointPart.split(':')
-            val host = parts.getOrNull(0)?.trim().orEmpty()
+            val host = if (hostUsable) hostCandidate else ""
             val port = parts.getOrNull(1)?.trim()?.toIntOrNull() ?: 0
             val currentSsid = currentWifiSsid(context)
             val ssidMatches = ssidPart.isBlank() || (currentSsid != null && currentSsid == ssidPart)
@@ -2122,6 +2281,7 @@ object HyperCarRepo {
     /** CarLife CMD 端口（MD 监听时我们改拨它）与探测窗口。 */
     private const val CARLIFE_CMD_PORT = 7240
     private const val CARLIFE_PROBE_TIMEOUT_MILLIS = 2_500L
+    private const val CARLIFE_VIDEO_PORT = 8240
 
     /** 单个候选网络上连 AirPlay 控制端口的超时（多网络轮试，单次不能给太久）。 */
     private const val CONTROL_CONNECT_TIMEOUT_MILLIS = 2_500L
@@ -2145,6 +2305,8 @@ object HyperCarRepo {
     /** 重启时从落盘日志带回环形缓冲的行数（够覆盖崩溃前的一段现场）。 */
     private const val DISK_LOG_TAIL_LINES = 120
 }
+
+
 
 
 

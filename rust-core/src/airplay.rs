@@ -122,8 +122,31 @@ pub async fn negotiate(
 
     let mut shared_secret: Option<[u8; 32]> = None;
 
-    // 2a. 快路径：已配对设备直接 verify
-    {
+    // 与**这个接收端**是否配对过：pair-verify 只能验证"已存在的配对"。
+    // 对 WinPlay/DiPlay 这类全新接收端，我们此前直接跳过快路径 verify，对方根本没有我们的
+    // 配对记录，于是 verify 表面走完、派生的密钥却对不上，之后每个加密请求都被静默丢弃
+    // （2026-10-25 23:19 DiPlay 现场：POST /command 与 SETUP /setup 一律无响应）。
+    //
+    // 标记的键 = **接收端的公钥指纹**（/info.pk 前 4 字节），拿不到才退回 IP：
+    //   同一台手机可以连多台接收端，IP 常常一样（192.168.1.35 / 172.16.222.97），
+    //   用 IP 当键会把"另一台没配过的接收端"误判成已配对；公钥指纹则是每台接收端唯一且稳定。
+    // 标记文件与身份文件同目录（每台手机各自一份），不会跨设备互相覆盖。
+    let receiver_tag = match receiver_pk {
+        Some(pk) => format!("{:02x}{:02x}{:02x}{:02x}", pk[0], pk[1], pk[2], pk[3]),
+        None => p.car_ip.replace('.', "_"),
+    };
+    let paired_marker = format!("{}.paired-{}", p.identity_path, receiver_tag);
+    let paired_before = std::path::Path::new(&paired_marker).exists();
+    emit_log(&format!(
+        "PAIR: 身份 {}… / 接收端 {}（{}）——{}",
+        format!("{:02x}{:02x}", identity.public_key[0], identity.public_key[1]),
+        receiver_tag,
+        p.car_ip,
+        if paired_before { "已配对，走 verify 快路径" } else { "未配对，先 pair-setup" }
+    ));
+
+    // 2a. 快路径：只在本机与这个接收端配对过时才直接 verify
+    if paired_before {
         let mut transport = RtspTransport { channel: &channel };
         match PairVerifyClient::run(&identity, &mut transport, receiver_pk.as_ref(), &pair_log) {
             Ok(keys) => {
@@ -156,7 +179,10 @@ pub async fn negotiate(
         {
             let mut transport = RtspTransport { channel: &channel };
             match PairSetupClient::run(&identity, &mut transport, &pair_log) {
-                Ok(_) => emit_log("PAIR: ✓ pair-setup 完成（长期公钥已交换）"),
+                Ok(_) => {
+                    emit_log("PAIR: ✓ pair-setup 完成（长期公钥已交换）");
+                    let _ = std::fs::write(&paired_marker, b"1");
+                }
                 Err(e) => {
                     let lower = e.to_ascii_lowercase();
                     if lower.contains("403") {
@@ -194,6 +220,7 @@ pub async fn negotiate(
                 Ok(keys) => {
                     channel.set_cipher(ControlCipher::new(keys.read_key, keys.write_key));
                     emit_log("AIRPLAY: ✓ pair-verify 完成，控制通道已加密");
+                    let _ = std::fs::write(&paired_marker, b"1");
                     shared_secret = Some(keys.shared_secret);
                 }
                 Err(e) => {

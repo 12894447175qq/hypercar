@@ -585,3 +585,60 @@ WIFI: ✓ 网段扫描命中车机 AirPlay 端点 172.16.x.x:7000（420ms）
 SESSION: ✓ 上次成功的端点 172.16.x.x:7000 仍然可连——直接用（跳过发现）
 SESSION: 上次的端点 172.16.x.x:7000 连不上（换了网段/车机换了地址）——回退到发现流程
 ```
+
+## 15. CarLife（com.baidu.carlife.xiaomi）实测拓扑与卡点（2026-10-26）
+
+### 15.1 谁监听、谁连接——**CarLife 是服务端，车机/盒子是客户端**
+
+盒子正常出画面时的实测（`ss -lntu` / `ss -ntu`，手机 10.242.24.159，盒子 10.242.24.214）：
+
+```
+LISTEN  *:7240  *:8240  *:9240  *:9241  *:9340          ← CarLife 在监听
+ESTAB   10.242.24.159:7240 ← 10.242.24.214:56734        ← 盒子连进来
+ESTAB   10.242.24.159:8240 ← 10.242.24.214:38280
+ESTAB   10.242.24.159:9240 ← 10.242.24.214:36434
+ESTAB   10.242.24.159:9340 ← 10.242.24.214:36386
+```
+
+所以 `CarLifeHub::connect(md_host)`（我们当 HU 去连 CarLife）方向是对的，
+`CARLIFE_BIND` 的 HU 监听模式只适用于"CarLife 反过来连我们"的实现，不是小米这套的形态。
+
+### 15.2 CarWith 在**副屏**上跑
+
+```
+input_focus: [displayId :10, Focus receive :… com.miui.carlink/com.carwith.launcher.home.HomeActivity]
+```
+
+车机画面来自一块**虚拟显示器**（display 10），不是手机主屏。这解释了"为什么必须让
+CarLife 处于它自己的工作状态"：只有 CarWith 的会话真正建立后，那块虚拟显示器才存在、
+才有内容可编码。
+
+### 15.3 两种拉起方式的行为差异
+
+| 拉起方式 | 7240 | Phase 1~7 | 存活 | 8240 视频帧 |
+|---|---|---|---|---|
+| `am start -n com.baidu.carlife.xiaomi/com.baidu.carlife.CarlifeActivity` | ✅ | ✅ 全过 | ❌ 第 34~35 秒 `ProcessUtil.killAllProcess` 自杀 | ❌ 一帧都没有 |
+| `am start-foreground-service -n …/com.baidu.carlife.service.CarlifeConnectService` | ✅ | ❌ 卡在 Phase 1（不回版本匹配） | ✅ 45 秒+ | ❌ 一帧都没有 |
+
+自杀现场（两次间隔都是 34~35 秒，非常稳定）：
+
+```
+Process(12204): at com.baidu.carlife.core.utils.ProcessUtil.killAllProcess(SearchBox:105)
+ActivityManager: Process com.baidu.carlife.xiaomi (pid 12204) has died: fg
+ActivityManager: Force stopping com.baidu.carlife.xiaomi … from process:com.miui.carlink
+```
+
+`CARLIFE: VIDEO 通道断开，1s 后重连` 说明**我们连上 8240 后立刻被对端关闭**，
+这是"收不到视频"的直接原因；而 CarLife 的编码器（`MediaCodec [video-debug-enc] … STARTED`）
+在同一时期确实在跑，说明编码在发生、但帧没发给我们这条连接。
+
+### 15.4 待验证的两个假设
+
+1. **会话状态假设**：CarLife 只有在自己判定"已连接车机"（CarWith 状态机）后才把虚拟显示器
+   的画面编码并发给 HU。我们只做了 TCP 层的 Phase 1~7，没触发它的会话状态。
+2. **握手内容假设**：盒子的 `HU_FEATURE_CONFIG_RESPONSE` 里带了视频相关字段
+   （码率/GOP/分辨率/编码类型），我们发的不全 → CarLife 认为 HU 不需要视频。
+
+判定方法：抓一次盒子与手机之间的 7240/8240 报文（盒子为客户端，手机为服务端）。
+非 root 可在手机上用 VpnService 抓本地回环不成立（流量走 WiFi），
+可行路径是让盒子的流量经过一台可控的中间设备，或拿盒子的调试口。

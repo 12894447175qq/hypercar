@@ -243,6 +243,16 @@ impl CarLifeHub {
             let stop_c = stop.clone();
             let host = md_host.clone();
             tokio::spawn(async move {
+                // VIDEO 通道要**晚一点再连**：实测握手阶段一上来连 8240 会被 CarLife 立刻关闭
+                // （日志里 `VIDEO 通道断开，1s 后重连` 连刷，而 MEDIA/TTS 不断）——
+                // 说明它只在真正开始推流后才接受视频连接。这里先等 2.5s（覆盖 Phase 1~7），
+                // 之后每次重连也留 1.5s 间隔，避免把它惹烦。
+                if matches!(kind, Some(MediaKind::Video)) {
+                    tokio::select! {
+                        _ = stop_c.notified() => return,
+                        _ = tokio::time::sleep(Duration::from_millis(2_500)) => {}
+                    }
+                }
                 let mut throttle = DialLogThrottle::new();
                 loop {
                     let stream = tokio::select! {
@@ -263,10 +273,10 @@ impl CarLifeHub {
                         Some(k) => handle_media_client(stream, events.clone(), k).await,
                         None => drain_stream(stream).await,
                     }
-                    emit_log(&format!("CARLIFE: {name} 通道断开，1s 后重连"));
+                    let retry_ms = if matches!(kind, Some(MediaKind::Video)) { 1_500 } else { 1_000 };
+                    emit_log(&format!("CARLIFE: {name} 通道断开，{retry_ms}ms 后重连"));
                     tokio::select! {
-                        _ = stop_c.notified() => return,
-                        _ = tokio::time::sleep(Duration::from_millis(1000)) => {}
+                        _ = tokio::time::sleep(Duration::from_millis(retry_ms as u64)) => {}
                     }
                 }
             });
@@ -814,8 +824,16 @@ async fn handle_cmd_client(
                     return;
                 }
                 other => {
+                    // **捕获模式诊断**：真 HU（盒子）连进来时，它发的消息我们这套 MD 侧代码
+                    // 大多不认识——把类型 + 前 48 字节打出来，就能逐字节对照真 HU 发了什么。
+                    let hex: String = payload
+                        .iter()
+                        .take(48)
+                        .map(|b| format!("{b:02X}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
                     emit_log(&format!(
-                        "CARLIFE: CMD 未处理消息 0x{other:08x}（{}B）",
+                        "CARLIFE: [捕获] CMD 0x{other:08x}（{}B）：{hex}",
                         payload.len()
                     ));
                 }
@@ -957,6 +975,10 @@ async fn handle_media_client(
     let mut chunk = [0u8; 65536];
     let mut rate: u32 = 48_000;
     let mut channels: u8 = 2;
+    // 视频通道诊断：CarLife 握手全过、音频 136/s 正常，但车机上一直是待机卡片
+    // （2026-10-26 00:24 现场：没有任何 VideoFrame 产出）。这里把前几次读到的东西打出来，
+    // 一眼就能分清「8240 上一个字节都没有」还是「有数据但帧头解析不出来」。
+    let mut diag_reads: u32 = 0;
 
     loop {
         match stream.read(&mut chunk).await {
@@ -966,7 +988,20 @@ async fn handle_media_client(
                 });
                 return;
             }
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Ok(n) => {
+                if matches!(kind, MediaKind::Video) && diag_reads < 5 {
+                    diag_reads += 1;
+                    let hex: String = chunk[..n.min(24)]
+                        .iter()
+                        .map(|b| format!("{b:02X}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    emit_log(&format!(
+                        "CARLIFE: VIDEO 读到 {n}B（首次 {diag_reads} 次之一）：{hex}"
+                    ));
+                }
+                buf.extend_from_slice(&chunk[..n])
+            }
             Err(_) => return,
         }
         if buf.len() > 8 * 1024 * 1024 {
@@ -1291,8 +1326,12 @@ async fn ctrl_write_loop(
 fn spawn_discovery_beacon(stop: Arc<Notify>) {
     tokio::spawn(async move {
         const DISCOVERY_PORT: u16 = 7999;
+        // 广播里必须放**局域网 IP**，不能放 127.0.0.1：com.miui.carlink 拿到 127.0.0.1
+        // 会认为主机就是自己、直接忽略（2026-10-26 00:04 现场：它只在 UDP 7999 反复问，
+        // 永不连本机网关）。取法是典型的「UDP connect 选路」：不真正发包，只让内核告诉我们
+        // 出网用的是哪块网卡的地址。
         let payload = {
-            let mut v = format!("127.0.0.1:{PORT_CMD}").into_bytes();
+            let mut v = format!("{}:{PORT_CMD}", lan_ipv4_hint()).into_bytes();
             v.push(0);
             v
         };
@@ -1320,12 +1359,14 @@ fn spawn_discovery_beacon(stop: Arc<Notify>) {
             }
         };
         emit_log(&format!(
-            "CARLIFE: 已启动 UDP {DISCOVERY_PORT} 发现广播（payload=127.0.0.1:{PORT_CMD}）"
+            "CARLIFE: 已启动 UDP {DISCOVERY_PORT} 发现广播（payload={}，并会应答 MD 的发现包）",
+            String::from_utf8_lossy(&payload)
         ));
 
         let mut buf = [0u8; 2048];
         let mut sent: u32 = 0;
         let mut received_logged: u32 = 0;
+        let mut replied: u32 = 0;
         let mut next = tokio::time::Instant::now();
         loop {
             let gap = if sent < 12 {
@@ -1360,6 +1401,39 @@ fn spawn_discovery_beacon(stop: Arc<Notify>) {
                                 "CARLIFE: UDP {DISCOVERY_PORT} 收到 {n}B ← {from}：{hex}"
                             ));
                         }
+                        // **关键**：CarLife 的无线发现是「MD 广播问、HU 单播答」。
+                        // 以前我们只广播不应答，com.miui.carlink 就一直在问、永远拿不到主机地址
+                        // （2026-10-26 00:04 现场：每 2s 收到一次 "CarLifeHost" 11B，之后再无动作）。
+                        //
+                        // 应答必须**从 7999 端口发出**：第一版用了一个随机端口的 socket 回，
+                        // 手机端显然只认"来自 7999 的应答"，于是依旧每 2s 重问
+                        // （2026-10-26 00:09 现场：我们回了 4 次，对方毫无反应）。
+                        // 这里改用绑在 7999 的 recv_sock 回，并同时试两种 payload：
+                        //   ① "<lan_ip>:7240\0"（主机地址）
+                        //   ② 把收到的报文原样回显（有些实现是"问什么答什么"）
+                        if !own {
+                            let reply_sock = recv_sock.as_ref().unwrap_or(&send_sock);
+                            match reply_sock.send_to(&payload, from).await {
+                                Ok(_) => {
+                                    replied = replied.saturating_add(1);
+                                    if replied <= 3 {
+                                        emit_log(&format!(
+                                            "CARLIFE: 已应答发现包（源端口 7999）→ {from}（payload={}）",
+                                            String::from_utf8_lossy(&payload).trim_end_matches('\u{0}')
+                                        ));
+                                    }
+                                }
+                                Err(e) => {
+                                    if replied == 0 {
+                                        emit_log(&format!("CARLIFE: 应答发现包给 {from} 失败（{e}）"));
+                                    }
+                                }
+                            }
+                            // 变体②：不带结尾 NUL 的 "<lan_ip>:7240"（有的实现按字符串精确比对）
+                            let _ = reply_sock.send_to(&payload[..payload.len() - 1], from).await;
+                            // 变体③：把询问原样回显（"问什么答什么"型实现）
+                            let _ = reply_sock.send_to(&buf[..n], from).await;
+                        }
                     }
                 }
             }
@@ -1378,12 +1452,28 @@ async fn recv_from_opt(
     }
 }
 
+/// 本机出网用的 IPv4（「UDP connect 选路」：不真正发包，只让内核回填 source 地址）。
+/// 取不到就退回 127.0.0.1（PC 单机联调那种场景）。
+fn lan_ipv4_hint() -> String {
+    if let Ok(probe) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        // 目标不重要，只要有一条默认路由；不会真的发出报文
+        if probe.connect(("8.8.8.8", 53)).is_ok() {
+            if let Ok(local) = probe.local_addr() {
+                let ip = local.ip();
+                if !ip.is_loopback() && !ip.is_unspecified() {
+                    return ip.to_string();
+                }
+            }
+        }
+    }
+    "127.0.0.1".to_string()
+}
+
 fn bind_tcp(port: u16) -> Result<TcpListener, std::io::Error> {
-    // 绑定地址：默认 127.0.0.1——Android 上 HU 与 MD（CarLife）在同一台设备，
-    // 只走回环，既不暴露端口也符合"本机零转码"的设计。
-    // PC 侧联调（rust-core/hub）时手机是**独立设备**，必须局域网可达：
-    // 由 hypercar-hub 在启动前设 CARLIFE_BIND=0.0.0.0 覆盖。
-    let host = std::env::var("CARLIFE_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+    // 绑定地址：**0.0.0.0**——手机上 CarLife（com.miui.carlink）是以"找主机"的方式工作，
+    // 它会按 UDP 7999 的应答去连 `<局域网IP>:7240`，而不是 127.0.0.1；只绑回环它就连不进来
+    // （2026-10-26 00:04 现场）。PC 侧联调（rust-core/hub）行为不变，仍可用 CARLIFE_BIND 覆盖。
+    let host = std::env::var("CARLIFE_BIND").unwrap_or_else(|_| "0.0.0.0".to_string());
     // 重绑竞争：上一会话刚停时端口可能还在旧任务手里，短重试几次
     let mut last_err = None;
     for _ in 0..15 {
