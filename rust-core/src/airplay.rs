@@ -402,6 +402,32 @@ pub async fn negotiate(
     emit_log(&format!(
         "AIRPLAY: ✓ 主屏流就绪 dataPort={data_port} connId={conn_id_screen} {enc_w}x{enc_h}"
     ));
+    // 屏幕流一建好就发**待机卡片**（真有画面，车机不再黑屏），避免车机 1.5s 收不到数据就拆通道。
+    // 素材是母版分辨率（1280x372 宽屏 / 1280x720 16:9），VideoConfig 按母版尺寸下发，车机放大到全屏。
+    let mut screen = screen;
+    match standby_for_aspect(enc_w, enc_h) {
+        Some(set) => {
+            screen.set_size(set.width, set.height);
+            if let Some(first) = set.frames.first() {
+                let nals = crate::screen::annexb_nals(first);
+                let sps = nals.iter().find(|n| crate::screen::nal_type(n) == 7).copied();
+                let pps = nals.iter().find(|n| crate::screen::nal_type(n) == 8).copied();
+                if let (Some(sps), Some(pps)) = (sps, pps) {
+                    let avcc = crate::screen::build_avcc(sps, pps);
+                    let cfg_ok = screen.send_config(&avcc).await.is_ok();
+                    let frame_ok = screen.send_video_annexb(first, 0).await.is_ok();
+                    emit_log(&format!(
+                        "AIRPLAY: 已发送待机卡片母版 {}x{}（config={cfg_ok} idr={frame_ok}，{} 帧素材）——车机不再黑屏",
+                        set.width, set.height, set.frames.len()
+                    ));
+                } else {
+                    emit_log("AIRPLAY: ⚠ 待机素材缺少 SPS/PPS——跳过卡片");
+                }
+            }
+        }
+        None => emit_log("AIRPLAY: 没有匹配宽高比的待机素材——跳过卡片"),
+    }
+
 
     // ---- 7. （音频挪到 RECORD 之后，见第 8 步）----
     // 宝马这台（AirTunes/450.14）在屏幕流 SETUP 后约 1.5s 就关控制通道；
@@ -1090,6 +1116,82 @@ fn random_uuid_upper() -> String {
     uuid::Uuid::new_v4().simple().to_string().to_uppercase()
 }
 
+// ---------------------------------------------------------------- 待机素材
+//
+// 只保留**两套母版**（宽屏 3.44:1 与 16:9），按屏幕宽高比自动选，运行时不再按分辨率编码：
+//   宝马带鱼屏 2560x744 → 3.44:1 → 用 1280x372 母版（车机放大到全屏）
+//   1920x720 / 1280x720 → 16:9 → 用 1280x720 母版
+// 每套都是 1 秒 @60fps（1 个 IDR + 59 个极小 P 帧）：既占住屏幕流，又不是黑屏。
+const STANDBY_WIDE: &[u8] = include_bytes!("../assets/standby-wide.h264");
+const STANDBY_WIDE_16X9: &[u8] = include_bytes!("../assets/standby-wide16x9.h264");
 
+/// 一套待机素材：帧序列 + 母版原始尺寸（VideoConfig 必须按母版尺寸下发）。
+pub(crate) struct StandbySet {
+    pub frames: &'static [&'static [u8]],
+    pub width: u32,
+    pub height: u32,
+}
 
+/// 按屏幕宽高比挑母版：> 2.6 用宽屏（带鱼屏），否则用 16:9。
+pub(crate) fn standby_for_aspect(width: u32, height: u32) -> Option<StandbySet> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let ratio = width as f32 / height as f32;
+    let (bytes, w, h) = if ratio > 2.6 {
+        (STANDBY_WIDE, 1280u32, 372u32)
+    } else {
+        (STANDBY_WIDE_16X9, 1280u32, 720u32)
+    };
+    let frames = frames_of(w, h, bytes)?;
+    Some(StandbySet { frames, width: w, height: h })
+}
 
+fn frames_of(w: u32, h: u32, data: &'static [u8]) -> Option<&'static [&'static [u8]]> {
+    use std::sync::OnceLock;
+    static WIDE: OnceLock<Vec<&'static [u8]>> = OnceLock::new();
+    static WIDE16: OnceLock<Vec<&'static [u8]>> = OnceLock::new();
+    if w == 1280 && h == 372 {
+        Some(WIDE.get_or_init(|| split_annexb_frames(STANDBY_WIDE)))
+    } else if w == 1280 && h == 720 {
+        Some(WIDE16.get_or_init(|| split_annexb_frames(STANDBY_WIDE_16X9)))
+    } else {
+        let _ = data;
+        None
+    }
+}
+
+/// 把 Annex B 流切成「一帧一片」：帧边界 = 每个 VCL NAL（type 1/5）的起点；
+/// **首帧从文件头开始**，这样 SPS/PPS/SEI 与第一个 IDR 落在同一帧里。
+fn split_annexb_frames(data: &'static [u8]) -> Vec<&'static [u8]> {
+    let mut starts: Vec<(usize, u8)> = Vec::new();
+    let mut i = 0usize;
+    while i + 4 < data.len() {
+        let sc3 = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1;
+        let sc4 = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1;
+        if sc3 || sc4 {
+            let hdr = if sc4 { i + 4 } else { i + 3 };
+            if hdr < data.len() {
+                starts.push((i, data[hdr] & 0x1f));
+            }
+            i = hdr + 1;
+        } else {
+            i += 1;
+        }
+    }
+    let vcl: Vec<usize> = starts
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, t))| matches!(t, 1 | 5))
+        .map(|(i, _)| i)
+        .collect();
+    let mut frames = Vec::with_capacity(vcl.len());
+    for (k, &vi) in vcl.iter().enumerate() {
+        let start = if k == 0 { 0 } else { starts[vi].0 };
+        let end = vcl.get(k + 1).map(|&n| starts[n].0).unwrap_or(data.len());
+        if end > start {
+            frames.push(&data[start..end]);
+        }
+    }
+    frames
+}

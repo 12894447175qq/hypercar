@@ -99,6 +99,21 @@ object HyperCarRepo {
      * 现在保留链路、按 2.5s 间隔重试 [AIRPLAY_MAX_ATTEMPTS] 次，仍不行才真失败。
      */
     private fun retryAirplayOrFail(detail: String) {
+        // 车机主动关掉控制通道时**不要重试同一个端点**：它紧接着会把 7000 的监听也关掉，
+        // 之后每次重试都是 ECONNREFUSED（2026-10-25 22:32 现场：6 轮 × 2.5s 全是拒连，
+        // 既没意义，还占着「等车机重新发起 iAP2」的时间窗）。
+        // 这种情况直接结束本轮：清掉记忆端点，等车机下一轮 iAP2 会话（它会自己重连蓝牙再邀请）。
+        val peerClosed = detail.contains("控制通道已关闭") ||
+            detail.contains("连接被对端关闭") ||
+            detail.contains("Broken pipe") ||
+            detail.contains("Connection reset")
+        if (peerClosed) {
+            log("SESSION: 车机主动关闭控制通道（$detail）——不再重试旧端口，等下一轮 iAP2 会话")
+            runCatching { SettingsStore.lastAirplayEndpoint = "" }
+            fail(detail)
+            return
+        }
+
         val host = airplayHost
         val port = airplayPort
         val canRetry = host != null && port > 0 && airplayAttempts < AIRPLAY_MAX_ATTEMPTS && sessionLive.get()

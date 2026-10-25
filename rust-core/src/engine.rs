@@ -1,4 +1,4 @@
-//! 网关引擎编排：CarLife 回环 ⇄ AirPlay 推流 的粘合层。
+﻿//! 网关引擎编排：CarLife 回环 ⇄ AirPlay 推流 的粘合层。
 //!
 //! 数据面（全部零转码）：
 //!  - 视频：CarLife 8240 的 H.264 Annex B 裸流 → ScreenSender（128B 头 + ChaCha20-Poly1305）
@@ -217,8 +217,12 @@ pub async fn run_engine(
             let mut pending_size: Option<(u32, u32)> = None;
             let mut ready = Some(screen_ready_rx);
             let mut video_rx = video_rx;
-            let mut tick = tokio::time::interval(Duration::from_millis(400));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // 16ms tick：CarLife 没推流时用它按 ~60fps 发待机循环帧（真帧来了就以真帧为主）
+            let mut tick = tokio::time::interval(Duration::from_millis(16));
+            // CarLife 还没开始推流时，用待机卡片按 1 帧/秒占住屏幕流（避免车机黑屏/提前关通道）
+            let mut last_real_frame: Option<std::time::Instant> = None;
+            let mut standby_idx: usize = 0;
+            let mut standby_size_sent: Option<(u32, u32)> = None;
             loop {
                 tokio::select! {
                     _ = stop_v.notified() => return,
@@ -260,6 +264,7 @@ pub async fn run_engine(
                                     emit_state("ended", "屏幕流写失败（车机侧断开）");
                                     return;
                                 }
+                                last_real_frame = Some(std::time::Instant::now());
                                 let mut st = stats.lock();
                                 st.frames += 1;
                                 st.bytes += len;
@@ -273,6 +278,43 @@ pub async fn run_engine(
                         // 屏幕流 keepAlive 帧（明文、1s 节流；缺它 Audi MMI 3315 10.2s 拆轮）
                         if let Some(s) = sender.as_mut() {
                             let _ = s.maybe_send_keep_alive().await;
+                            // CarLife 还没推流 → 按 ~60fps 播放待机循环（1 IDR + 59 个极小 P 帧）。
+                            // 真帧到达后自动停用（1s 内有过真帧就不再插卡片）。
+                            let stale = last_real_frame
+                                .map(|t| t.elapsed() >= Duration::from_millis(900))
+                                .unwrap_or(true);
+                            if stale {
+                                let (w, h) = s.size();
+                                if let Some(set) =
+                                    crate::airplay::standby_for_aspect(w, h)
+                                {
+                                    if !set.frames.is_empty() {
+                                        if standby_size_sent != Some((set.width, set.height)) {
+                                            // 切到母版尺寸并重发 VideoConfig（画面就是母版分辨率）
+                                            s.set_size(set.width, set.height);
+                                            if let Some(first) = set.frames.first() {
+                                                let nals = crate::screen::annexb_nals(first);
+                                                let sps = nals.iter().find(|n| crate::screen::nal_type(n) == 7).copied();
+                                                let pps = nals.iter().find(|n| crate::screen::nal_type(n) == 8).copied();
+                                                if let (Some(sps), Some(pps)) = (sps, pps) {
+                                                    let avcc = crate::screen::build_avcc(sps, pps);
+                                                    let _ = s.send_config(&avcc).await;
+                                                }
+                                            }
+                                            standby_size_sent = Some((set.width, set.height));
+                                            standby_idx = 0;
+                                            emit_log(&format!(
+                                                "AIRPLAY: 待机循环开始（母版 {}x{}，{} 帧 @60fps）",
+                                                set.width, set.height, set.frames.len()
+                                            ));
+                                        }
+                                        let frame = set.frames[standby_idx % set.frames.len()];
+                                        let pts = crate::timing::monotonic_nanos() / 1_000;
+                                        let _ = s.send_video_annexb(frame, pts).await;
+                                        standby_idx = standby_idx.wrapping_add(1);
+                                    }
+                                }
+                                    }
                         }
                     }
                 }
