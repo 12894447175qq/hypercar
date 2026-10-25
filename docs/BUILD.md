@@ -111,6 +111,8 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 ## 6. 排查
 
 - App 内「诊断」页有 Rust/iAP2/WiFi 全量日志（等价于 cardeck 的 main_debug.log）。
+- 「诊断」页有 **反馈到 GitHub**：预填 issues/new 标题/环境/日志尾部并打开浏览器，完整日志同时进剪贴板（不内嵌 token；用户点 Submit 才发布）。
+- 导出的日志头与启动第一行都带 **设备型号 / 系统版本（ROM 显示号 + 编译号）/ SDK / HyperCar 版本号**（ENV: 行），反馈问题请连同这几行一起贴。
 - 常见失败：
   - `Shizuku 未就绪` → 启动 Shizuku 并重新授权。
   - `0x5702 后无 0x5703` → 车机未开无线 CarPlay 窗口；在车机上点一次手机图标。

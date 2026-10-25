@@ -204,6 +204,9 @@ object HyperCarRepo {
             restoreDiskLogTail()
             installCrashHandler()
             appendDiskLog("===== HyperCar 启动 =====")
+            // 环境自述：设备/系统/SDK/App 版本一次写进日志（导出时也会再写一份到文件头）。
+            // 排查第一件事就是「哪台机、什么系统、哪个版本」，缺了它只能靠猜。
+            log("ENV: ${DeviceInfo.fullSummary(app)}")
             scope.launch { captureCrashArtifacts() }
             // ACL 广播唤醒入口（receiver → handler）：优先经 FGS 拿前台豁免与持锁，
             // 服务起来后再触发真正会话（handler 幂等，service 二次进入走直连分支）
@@ -470,9 +473,13 @@ object HyperCarRepo {
             // 车机档案决定端口策略：宝马走 mDNS（车机确实广播 _airplay._tcp），
             // WinPlay 是固定 7000 的普通接收端——先问 mDNS 只会白等 3 秒。
             val headUnit = headUnitProfile
-            val mdnsEndpoint = if (headUnit.preferMdnsAirplay) {
+            // 端点来自车机 ctrl 邀请时**跳过 mDNS**：地址与端口都是车机亲口给的
+            // （2026-10-25 车友日志：邀请后还去 browse 3s，结果 PTR/SRV/A 全 0——
+            //  这台车根本不广播 `_airplay._tcp`，而车机 20s 后就把 RFCOMM 拆了）。
+            val mdnsEndpoint = if (headUnit.preferMdnsAirplay && !endpoint.fromInvite) {
                 AirplayServiceProbe(context, ::log).browse(boundNetwork)
             } else {
+                if (endpoint.fromInvite) log("MDNS: 端点来自 ctrl 邀请（${endpoint.ipAddresses}）——跳过 mDNS 查询")
                 null
             }
             val apHost = mdnsEndpoint?.host ?: host
@@ -1210,6 +1217,7 @@ object HyperCarRepo {
                             sourceVersion = base?.sourceVersion,
                             ipAddresses = listOf(inviteIp),
                             gateway = inviteIp,
+                            fromInvite = true,
                         )
                         continue
                     }
@@ -1603,7 +1611,9 @@ object HyperCarRepo {
         val name = "hypercar-log-$stamp.txt"
         val text = buildString {
             appendLine("# HyperCar 调试日志  导出于 $stamp")
-            appendLine("# 设备 ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE}")
+            appendLine("# 应用 ${DeviceInfo.appVersion(ctx)}")
+            appendLine("# 设备 ${DeviceInfo.systemSummary()}")
+            appendLine("# 说明：以下时间戳为本机时间；日志共 ${logs.size} 行")
             appendLine()
             logs.forEach { appendLine(it) }
         }
@@ -1669,10 +1679,12 @@ object HyperCarRepo {
     private const val ENDPOINT_PROGRESS_MILLIS = 15_000L
 
     /**
-     * 等端点时的轮询粒度（比进度日志细）：静默网关试探要跟得上「用户手动连车机热点」
-     * 的换网速度，5s 一次 / 进度日志每 3 个 tick（15s）报一次。
+     * 等端点时的轮询粒度。**1s**：车机 ctrl 邀请到「车机拆 RFCOMM」只有 ~20s 窗口
+     * （2026-10-25 车友日志：邀请 10:52:55 → 链路 10:53:16 关），而邀请之前是 5s 一跳，
+     * 实测白等了 3.1s 才把邀请变成端点。1s 一跳最坏损失 1s；SSID 读取是零成本 API
+     * （不查 shell），进度日志仍按 [TICKS_PER_PROGRESS] × 1s = 15s 打一条。
      */
-    private const val ENDPOINT_TICK_MILLIS = 5_000L
+    private const val ENDPOINT_TICK_MILLIS = 1_000L
     private const val TICKS_PER_PROGRESS = (ENDPOINT_PROGRESS_MILLIS / ENDPOINT_TICK_MILLIS).toInt()
 
     /** 网关兜底端口（AirPlay 控制面惯例值）与静默试探的单次连接超时。 */

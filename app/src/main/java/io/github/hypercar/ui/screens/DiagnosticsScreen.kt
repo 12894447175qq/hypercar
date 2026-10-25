@@ -39,11 +39,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.hypercar.BuildConfig
+import io.github.hypercar.session.GitHubFeedback
+import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.ui.components.CapsuleButton
 import io.github.hypercar.ui.components.GlassPanel
 import io.github.hypercar.ui.components.SectionLabel
@@ -92,6 +95,7 @@ fun DiagnosticsScreen(
             onClearLogs = onClearLogs,
             onCopy = { toast = "已复制 ${logs.size} 行日志" },
             onExport = onExport,
+            onFeedback = { toast = it },
             logs = logs,
         )
         AnimatedVisibility(
@@ -126,6 +130,8 @@ private fun Header(
     onClearLogs: () -> Unit,
     onCopy: () -> Unit,
     onExport: () -> Unit,
+    /** 一键反馈的结果提示（成功/失败文案交给页面统一弹 toast）。 */
+    onFeedback: (String) -> Unit,
     logs: List<String>,
 ) {
     val clipboard = LocalClipboardManager.current
@@ -206,6 +212,37 @@ private fun Header(
                 leadingIcon = Icons.Rounded.DeleteOutline,
             )
         }
+        Spacer(modifier = Modifier.height(8.dp))
+        // 一键反馈：预填 GitHub Issue（标题/环境/日志尾部）+ 完整日志进剪贴板。
+        // 不做"静默创建"：GitHub 写 Issue 需要 token，APK 里放 token 等于公开泄露；
+        // 预填 URL + 浏览器打开是零配置方案，用户点一下 Submit 就成。
+        val context = LocalContext.current
+        CapsuleButton(
+            text = if (logs.isEmpty()) "反馈到 GitHub" else "反馈到 GitHub（自动带日志）",
+            onClick = {
+                // 先把文件也导出一份：Issue 里可以直接拖附件，比纯文本更好读
+                HyperCarRepo.exportLogs()
+                val prepared = GitHubFeedback.prepare(context, logs)
+                clipboard.setText(AnnotatedString(prepared.clipboard))
+                val opened = GitHubFeedback.open(context, prepared.url)
+                onFeedback(
+                    if (opened) {
+                        "已复制完整日志并打开 GitHub（需已登录）：粘贴正文、点 Submit 即可" +
+                            "（预填 ${prepared.prefilledLines} 行，附件可拖导出的 .txt）"
+                    } else {
+                        "完整日志已复制，但没有可打开链接的应用——" +
+                            "请到 github.com/${GitHubFeedback.REPO}/issues 新建后粘贴"
+                    },
+                )
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(44.dp),
+            filled = true,
+            containerColor = ElectricCyan,
+            contentColor = io.github.hypercar.ui.theme.DeepSpace,
+            borderColor = ElectricCyan,
+        )
     }
 }
 

@@ -14,6 +14,8 @@ import kotlinx.coroutines.runBlocking
  * @sourceVersion 车机 AirPlay SDK 版本（0x4301，如 "950.7.1"）
  * @ipAddresses 车机在热点网内的地址列表（0x4301 无线组；**已 rstrip 全部尾部 NUL**）
  * @gateway 网关（iAP2 消息不携带；上层入网后从 DHCP/链路信息补）
+ * @fromInvite 端点来自车机的 `GET /ctrl-int/1/connect` 邀请（取 TCP 对端地址 + 7000），
+ *   不是 0x4301 —— 地址/端口是车机亲口说的，上层不必再花 3s 查 mDNS
  */
 data class CarPlayEndpoint(
     val ssid: String?,
@@ -24,6 +26,7 @@ data class CarPlayEndpoint(
     val sourceVersion: String?,
     val ipAddresses: List<String>,
     val gateway: String?,
+    val fromInvite: Boolean = false,
 )
 
 /**

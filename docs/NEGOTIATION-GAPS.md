@@ -436,3 +436,46 @@ StartHID(0x6800)            = 会发
 
 若重新配对后仍然 0 次 iAP2：先用真 iPhone 在该车上确认车机 CarPlay 本身正常（排除
 车机侧被其它设置关掉），再导出日志看第 4 步停在哪里。
+
+## 12. 2026-10-25 车友日志：卡在 AirPlay `/info` 455（BMW 17713 / MGU-86）
+
+日志 `hypercar-log-20261025-105328.txt`（Xiaomi 23127PN0CC / Android 16，0.32 版）。
+**这次不是"图标不出现"**——整条链路都通了，只差 AirPlay 第一步：
+
+| 阶段 | 实测 | 结论 |
+|---|---|---|
+| iAP2 识别 | 16 项清单、含 `0x5703`/`0xaa06`、EA 有 `com.bmw.carplay`、有 WirelessCarPlay 组件 | **档案 B**，车机很配合 |
+| 0x5702 → 0x5703 | 600ms 内回 `DIRECT-BMW 17713` ch157 | 正常 |
+| 入网 | 342ms 静默加入（172.16.222.105/20，**gw=0.0.0.0** 的 Direct AP） | 正常（网关兜底对 Direct AP 无效，靠邀请 IP） |
+| ctrl 邀请 | 车机 172.16.222.97 `GET /ctrl-int/1/connect`（2s 后） | 正常 |
+| 端口 | 7000 开（12ms），7001/7100 关；`_airplay._tcp` PTR/SRV/A 全 0 | 车机不广播 mDNS |
+| **AirPlay `/info`** | `GET`/`POST`/`GET` 三次全 **`455 Method Not Valid In This State`**（`server=AirTunes/450.14`） | **卡点**，我们把它当致命错误退出引擎 |
+| 6 次重试 | 每轮都是同样三条 455 | 全部无效 |
+| 车机行为 | 邀请后 **21s**（10:52:55 → 10:53:16）拆 RFCOMM；重连后给**档案 A** | 窗口很短 |
+
+时间账：`0x5703`(10:52:52.8) → 拆链(10:53:16) 共 **23.3s**；我们从 0x5703 到连上 7000
+花了 **8.4s**（其中 **3.1s** 白等 5s tick 才把邀请变成端点、**3s** 白查 mDNS），
+只剩 ~15s 给 AirPlay 协商——而 `/info` 一次就 3 连败。
+
+### 12.1 修了什么
+
+1. **Rust `/info` 改 best-effort**（`airplay.rs`）：455/403 只记日志，**继续
+   pair-setup → pair-verify**，配对成功后再补查一次 `/info`；仍拿不到就用设置里的
+   分辨率与默认能力跑 SETUP。依据：cardeck 真车记录「车机对**未配对连接**上的 /info
+   应答 455」——正确顺序是先配对再查，/info 只是"增强"（拿显示尺寸/features）。
+2. **邀请不再等 5s tick**：`ENDPOINT_TICK_MILLIS` 5s → 1s（邀请→端点最坏 1s）。
+3. **邀请来的端点跳过 mDNS**：`CarPlayEndpoint.fromInvite`，地址/端口是车机亲口给的
+   （这台车不广播 `_airplay._tcp`，browse 只会白花 3s）。
+4. 档案 A 不再主动退场（本日志那一版还是旧行为：重连后 2.5s 就把会话结束）。
+
+改完「凭据 → 连上 7000」的理论耗时从 8.4s 降到 **~2s**，把 23s 窗口基本都留给 AirPlay。
+
+### 12.2 仍未验证 / 下一步
+
+- **pair-verify 能否通过**：`/info` 455 之后我们没走到过配对，下一轮日志看
+  `PAIR: pair-setup …` / `pair-verify …` 与 `SETUP` 的状态码即可定谳。
+- 若 pair-verify 也回 455/403：真机成功路径是 **IPv6 link-local:7000**（cardeck 两车
+  实录），而我们目前只连邀请里的 IPv4。下一轮可把「邀请 IPv4」与「该接口的 IPv6
+  link-local」作为双候选逐个试（`::1` 之类不能算，必须从 `boundNetwork` 的 LinkProperties 取）。
+- 这台车的 Direct AP 没有默认网关（gw=0.0.0.0），所以「网关兜底」对它天然无效——
+  端点必须来自 ctrl 邀请（或 0x4301，但该车声明不发）。

@@ -1,4 +1,4 @@
-﻿//! AirPlay 发送端会话（协商整体下沉 Rust —— 与参考文档的关键差异，见 docs/NEGOTIATION-GAPS.md）。
+//! AirPlay 发送端会话（协商整体下沉 Rust —— 与参考文档的关键差异，见 docs/NEGOTIATION-GAPS.md）。
 //!
 //! 流程（cardeck 真车验证的顺序，Audi MIB3 / BMW iD8.5 通用骨架）：
 //!  1. `GET /info`（带空 bplist 体 + plist Content-Type，老固件对缺体的 /info 回 400/455）
@@ -85,49 +85,28 @@ pub async fn negotiate(
 ) -> Result<AirplayOutcome, String> {
     let (mut channel, _control_inbound) = RtspChannel::spawn(read, write, None);
 
-    // ---- 1. /info ----
-    let info = fetch_info(&channel).await?;
-    let keep_alive_stats = p.keep_alive_stats
-        || info
-            .get("keepAliveSendStatsAsBody")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-    let display = info
-        .get("displays")
-        .and_then(Value::as_array)
-        .and_then(|a| a.first());
-    let display_uuid = display.and_then(|d| uuid_text(d.get("uuid")));
-    let (disp_w, disp_h) = display
-        .map(|d| {
-            (
-                d.get("width").and_then(Value::as_int).unwrap_or(0) as u32,
-                d.get("height").and_then(Value::as_int).unwrap_or(0) as u32,
-            )
-        })
-        .unwrap_or((0, 0));
-    // 车机能力位图：判断是否支持 HEVC 等能力，只能靠它（我们无法向 CarLife 指定 codec）
-    let car_features = info.get("features").and_then(Value::as_int).unwrap_or(0);
-    emit_log(&format!(
-        "AIRPLAY: /info displays[0].uuid={:?} {}x{} features=0x{:x}",
-        display_uuid, disp_w, disp_h, car_features
-    ));
-
-    // 车机真实显示分辨率 → CarLife 编码请求。
-    // 设置里的分辨率只是"用户以为的"，实际以 `/info` 为准：两侧不一致时
-    // 车机要把小画面拉伸整屏（发虚），所以这里直接改成车机原生尺寸。
-    if disp_w >= 320 && disp_h >= 240 {
-        let target = (even(disp_w.max(2)), even(disp_h.max(2)));
-        *p.encoder_size.lock() = target;
-        emit_log(&format!(
-            "AIRPLAY: 车机实际 {}x{} → 请求 CarLife 按 {}x{} 编码（设置值 {}x{} 仅作兜底）",
-            disp_w, disp_h, target.0, target.1, p.width, p.height
-        ));
-    } else {
-        emit_log(&format!(
-            "AIRPLAY: /info 未提供有效显示器尺寸（{disp_w}x{disp_h}），沿用设置 {}x{}",
-            p.width, p.height
-        ));
-    }
+    // ---- 1. /info（**best-effort**，不可用不致命）----
+    //
+    // 2026-10-25 车友日志（BMW 17713 / MGU-86，AirTunes/450.14）定谳：
+    // 在**未配对的连接**上 GET/POST /info 全部回 `455 Method Not Valid In This State`，
+    // 旧实现把这里当致命错误直接退出引擎（6 轮重试、每轮 3 次 /info、全部 455）。
+    // cardeck 的真车记录同样如此：「车机对未配对连接上的 /info 应答 455」，
+    // 正确顺序是 **先 pair-setup/pair-verify，再查 /info**（配对后的 /info 也常被
+    // 455/403 拒，所以它只是"增强"：拿不到显示尺寸/features 就用设置值）。
+    let mut info = match fetch_info(&channel).await {
+        Ok(v) => v,
+        Err(e) => {
+            emit_log(&format!(
+                "AIRPLAY: /info 不可用（{e}）——未配对连接上被 455 拒是已知行为，\
+                 继续走 pair-verify（显示尺寸/能力先用设置值），配对后会再试一次"
+            ));
+            Value::dict(vec![])
+        }
+    };
+    let receiver_pk = info
+        .get("pk")
+        .and_then(Value::as_bytes)
+        .and_then(|b| <[u8; 32]>::try_from(b).ok());
 
     // ---- 2. 配对：pair-setup → pair-verify（与 cardeck `runPairingLoop` 同策略）----
     //
@@ -138,10 +117,6 @@ pub async fn negotiate(
     // 此前实现跳过 pair-setup 直接 verify，对「需要真正 pair-setup 的接收端」会失败。
     let identity = ControllerIdentity::load_or_create(std::path::Path::new(&p.identity_path))
         .map_err(|e| format!("身份载入失败: {e}"))?;
-    let receiver_pk = info
-        .get("pk")
-        .and_then(Value::as_bytes)
-        .and_then(|b| <[u8; 32]>::try_from(b).ok());
     let pair_log = |s: &str| emit_log(&format!("PAIR: {s}"));
 
     let mut pairing_forbidden = false;
@@ -199,6 +174,63 @@ pub async fn negotiate(
             }
         }
     };
+
+    // ---- 2.5 /info 兜底：配对后再试一次 ----
+    // 配对前被 455 拒是常态（2026-10-25 日志：3 次尝试 455）；配对成功后车机状态机
+    // 才允许 /info 的场景存在（cardeck 记录：活跃会话内的 /info 也常被 455/403 拒，
+    // 所以这里只当"可能补全"，失败不影响后续 SETUP）。
+    if info.as_dict().map(|d| d.is_empty()).unwrap_or(true) {
+        match fetch_info(&channel).await {
+            Ok(v) if v.as_dict().map(|d| !d.is_empty()).unwrap_or(false) => {
+                info = v;
+                emit_log("AIRPLAY: 配对后 /info 成功——补全显示尺寸/能力");
+            }
+            _ => emit_log("AIRPLAY: 配对后 /info 仍不可用——沿用设置分辨率与默认能力继续"),
+        }
+    }
+
+    // ---- 2.6 用 /info 结果校准显示尺寸与能力（上面拿不到就全用兜底）----
+    let keep_alive_stats = p.keep_alive_stats
+        || info
+            .get("keepAliveSendStatsAsBody")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    let display = info
+        .get("displays")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first());
+    let display_uuid = display.and_then(|d| uuid_text(d.get("uuid")));
+    let (disp_w, disp_h) = display
+        .map(|d| {
+            (
+                d.get("width").and_then(Value::as_int).unwrap_or(0) as u32,
+                d.get("height").and_then(Value::as_int).unwrap_or(0) as u32,
+            )
+        })
+        .unwrap_or((0, 0));
+    // 车机能力位图：判断是否支持 HEVC 等能力，只能靠它（我们无法向 CarLife 指定 codec）
+    let car_features = info.get("features").and_then(Value::as_int).unwrap_or(0);
+    emit_log(&format!(
+        "AIRPLAY: /info displays[0].uuid={:?} {}x{} features=0x{:x}",
+        display_uuid, disp_w, disp_h, car_features
+    ));
+
+    // 车机真实显示分辨率 → CarLife 编码请求。
+    // 设置里的分辨率只是"用户以为的"，实际以 `/info` 为准：两侧不一致时
+    // 车机要把小画面拉伸整屏（发虚），所以这里直接改成车机原生尺寸。
+    if disp_w >= 320 && disp_h >= 240 {
+        let target = (even(disp_w.max(2)), even(disp_h.max(2)));
+        *p.encoder_size.lock() = target;
+        emit_log(&format!(
+            "AIRPLAY: 车机实际 {}x{} → 请求 CarLife 按 {}x{} 编码（设置值 {}x{} 仅作兜底）",
+            disp_w, disp_h, target.0, target.1, p.width, p.height
+        ));
+    } else {
+        emit_log(&format!(
+            "AIRPLAY: /info 未提供有效显示器尺寸（{disp_w}x{disp_h}），沿用设置 {}x{}",
+            p.width, p.height
+        ));
+    }
 
     // ---- 3. modesChanged ----
     let modes = build_modes_changed();
