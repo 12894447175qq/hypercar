@@ -1,4 +1,4 @@
-//! CarLife HU（车机）侧网关——严格按 CarLifeWirelessBox / apollo-DuerOS 的 HU 实现重构。
+﻿//! CarLife HU（车机）侧网关——严格按 CarLifeWirelessBox / apollo-DuerOS 的 HU 实现重构。
 //!
 //! 我们扮演「车机」，本机 CarLife / CarWith(CarLife 兼容) / 荣耀车联 作为「手机(MD)」连回
 //! 127.0.0.1 的一组标准端口。
@@ -233,7 +233,10 @@ impl CarLifeHub {
             });
         }
 
-        // ---- 媒体通道：VIDEO/MEDIA/TTS 连上就交给同一个 handler ----
+        // ---- 媒体通道：VIDEO/MEDIA/TTS ----
+        // 实验结果（2026-10-26 01:41）：同时开两条 8240 都被接受，但 CarLife 约 2.6s 后
+        // 关掉多余那条，且**两条都收不到任何数据**——所以不是"连错连接"，是它内部没有
+        // 把帧投递给 HU 侧的视频 socket。详见 docs/NEGOTIATION-GAPS.md §16.4。
         for (port, name, kind) in [
             (PORT_VIDEO, "VIDEO", Some(MediaKind::Video)),
             (PORT_MEDIA, "MEDIA", Some(MediaKind::Media)),
@@ -243,17 +246,12 @@ impl CarLifeHub {
             let stop_c = stop.clone();
             let host = md_host.clone();
             tokio::spawn(async move {
-                // VIDEO 通道要**晚一点再连**：实测握手阶段一上来连 8240 会被 CarLife 立刻关闭
-                // （日志里 `VIDEO 通道断开，1s 后重连` 连刷，而 MEDIA/TTS 不断）——
-                // 说明它只在真正开始推流后才接受视频连接。这里先等 2.5s（覆盖 Phase 1~7），
-                // 之后每次重连也留 1.5s 间隔，避免把它惹烦。
-                if matches!(kind, Some(MediaKind::Video)) {
-                    tokio::select! {
-                        _ = stop_c.notified() => return,
-                        _ = tokio::time::sleep(Duration::from_millis(2_500)) => {}
-                    }
-                }
+                // 官方实现（CConnectionSetupModule.cpp）是**握手前**就把 VIDEO 建好：
+                // CMD → VIDEO → MEDIA → TTS → VR → CTRL。所以这里不再延迟 VIDEO。
+                // 唯一保留的防护：连续被对端关闭时逐步退避（1.5s → 3s → 5s 封顶），
+                // 免得把 CarLife 惹烦（历史上 1s 死循环重连过）。
                 let mut throttle = DialLogThrottle::new();
+                let mut quick_closes: u32 = 0;
                 loop {
                     let stream = tokio::select! {
                         _ = stop_c.notified() => return,
@@ -270,18 +268,22 @@ impl CarLifeHub {
                     };
                     emit_log(&format!("CARLIFE: ✓ {name} 已连上 MD {host}:{port}"));
                     match kind {
-                        Some(k) => handle_media_client(stream, events.clone(), k).await,
+                        Some(k) => handle_media_client(stream, events.clone(), k, name).await,
                         None => drain_stream(stream).await,
                     }
-                    let retry_ms = if matches!(kind, Some(MediaKind::Video)) { 1_500 } else { 1_000 };
+                    let base_ms: u64 = if matches!(kind, Some(MediaKind::Video)) { 1_500 } else { 1_000 };
+                    let retry_ms: u64 = if matches!(kind, Some(MediaKind::Video)) {
+                        (base_ms * (1 + quick_closes.min(3) as u64)).min(5_000)
+                    } else { base_ms };
+                    quick_closes = quick_closes.saturating_add(1);
                     emit_log(&format!("CARLIFE: {name} 通道断开，{retry_ms}ms 后重连"));
                     tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_millis(retry_ms as u64)) => {}
+                        _ = stop_c.notified() => return,
+                        _ = tokio::time::sleep(Duration::from_millis(retry_ms)) => {}
                     }
                 }
             });
         }
-
         // ---- VR 9242：麦克风数据（HU → MD）+ 读空保活 ----
         {
             let stop_c = stop.clone();
@@ -961,7 +963,7 @@ fn spawn_media_channel(
         }
     };
     spawn_single_client_server(listener, stop, name, move |stream| {
-        handle_media_client(stream, events.clone(), kind)
+        handle_media_client(stream, events.clone(), kind, "VIDEO")
     });
 }
 
@@ -970,6 +972,7 @@ async fn handle_media_client(
     mut stream: TcpStream,
     events: mpsc::UnboundedSender<CarLifeEvent>,
     kind: MediaKind,
+    label: &'static str,
 ) {
     let mut buf: Vec<u8> = Vec::with_capacity(256 * 1024);
     let mut chunk = [0u8; 65536];
@@ -997,7 +1000,7 @@ async fn handle_media_client(
                         .collect::<Vec<_>>()
                         .join(" ");
                     emit_log(&format!(
-                        "CARLIFE: VIDEO 读到 {n}B（首次 {diag_reads} 次之一）：{hex}"
+                        "CARLIFE: {label} 读到 {n}B（首次 {diag_reads} 次之一）：{hex}"
                     ));
                 }
                 buf.extend_from_slice(&chunk[..n])

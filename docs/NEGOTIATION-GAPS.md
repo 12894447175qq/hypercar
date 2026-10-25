@@ -642,3 +642,71 @@ ActivityManager: Force stopping com.baidu.carlife.xiaomi … from process:com.mi
 判定方法：抓一次盒子与手机之间的 7240/8240 报文（盒子为客户端，手机为服务端）。
 非 root 可在手机上用 VpnService 抓本地回环不成立（流量走 WiFi），
 可行路径是让盒子的流量经过一台可控的中间设备，或拿盒子的调试口。
+
+## 16. 与官方 CarLife 车机端源码逐项对照（2026-10-26，镜像 fgrcwp/apollo-DuerOS）
+
+`ApolloAuto/apollo-DuerOS` 在 GitHub 上已下架，社区镜像 **`fgrcwp/apollo-DuerOS`** 仍在，
+里面有完整的车机端 C++ 库（`CarLife-Vehicle-Lib/LibSource`）+ protobuf 定义。逐项对照结果：
+
+| 项 | 官方实现 | 我们的实现 | 结论 |
+|---|---|---|---|
+| CMD/CTRL 帧头 | 8B：`[u16 BE len][2B 保留][u32 BE type]`（`packageHeadAnalysis`） | `read_cmd_frame` 同布局 | 一致 |
+| VIDEO/MEDIA/TTS 帧头 | **12B**：`[u32 BE len][u32 BE ts][u32 BE type]` | `read_media_frame` 同布局 | 一致 |
+| `VIDEO_ENCODER_INIT` | protobuf `CarlifeVideoEncoderInfo{1:width,2:height,3:frameRate}` | 同字段号 | 一致 |
+| 握手顺序 | Phase1 版本 → 1.5 统计 → 2 设备信息 → 3 特性配置 → 4 鉴权 → 6 编码器 INIT → **等 INIT_DONE** → 7 START | 完全一致 | 一致 |
+| FeatureConfig | `CarlifeFeatureConfigList{cnt, repeated{key,value}}`，共 9 个键：语音唤醒/麦克风/焦点 UI/媒体采样率/蓝牙自动配对/蓝牙内部 UI/音频传输模式/内容加密/引擎类型 | 未发/不全 | **与视频无关**，不影响 |
+| 连接顺序 | `connectionSetup()`：CMD → VIDEO → MEDIA → TTS → VR → CTRL，**握手之前全部建好** | 0.1.0.107 起一致 | 一致 |
+| 视频通道方向 | HU 只收（`readVideoData`），不往 VIDEO 通道发任何东西 | 一致 | 一致 |
+
+### 16.1 仍未解决的点：CarLife 编码器启动了，但 8240 上一个字节都没有
+
+0.1.0.107 实测（`hypercar-log-20261026-013703.txt` + logcat）：
+
+```
+01:36:43.212  ✓ VIDEO 已连上 MD 127.0.0.1:8240        ← 握手前建好，且不再被关
+01:36:43.364  [Phase 7] → VIDEO_ENCODER_START
+01:36:43.760  MediaCodec(6566): [video-debug-enc] setState: STARTING   ← CarLife 编码器真的启动了
+01:36:43.773  [avcE_599] KPI_L1: start: ms=12
+01:37:08.208  MediaCodec(6566): [video-debug-enc] stop                ← 约 4.4s 后停
+（期间我们侧没有任何 `VIDEO 读到`）
+```
+
+也就是说：**握手对、连接稳、编码器确实在编码，但帧没有写到我们这条 socket 上。**
+
+### 16.2 剩余假设
+
+1. **写目标不是我们的连接**：CarLife 可能把帧写到它另外持有的一条连接（例如它自己 accept 的第一个），
+   而我们的连接只是"挂着"。可试：在 START 之后**再开一条** 8240 连接，两条同时读，看哪条有数据。
+2. **需要 CarWith 的会话状态**：CarLife 用虚拟显示器（logcat 里
+   `isVirtualDisplayActive caller=com.android.shell target=com.baidu.carlife.xiaomi`）出画面，
+   可能只有 CarWith 认为"已连接车机"时才把虚拟显示器的内容送去 HU。
+3. **CTRL 通道遗漏**：`CCtrlChannelModule` 里 HU 只发触摸/硬按键，没有"开始视频"的命令；
+   但 MD→HU 方向可能有 `video focus` 之类的通知需要我们回应。
+
+### 16.3 下一步优先级
+
+1. 双连接实验（成本最低，改 10 行）：START 后再连一条 8240，两条都读并各自打日志
+2. 抓 CarLife 的 xlog（`/sdcard/Android/data/com.baidu.carlife.xiaomi/files/xLog/carlife_YYYYMMDD.xlog`）
+   —— 目前是加密的，若能在 CarLife 设置里打开明文日志，就能看到它把视频写到哪
+3. 手机 root 后 `tcpdump -i any port 8240`，直接看有没有字节从 CarLife 发出
+
+### 16.4 双连接实验结果（0.1.0.108，2026-10-26 01:41）
+
+```
+01:41:05.252  ✓ VIDEO#0 已连上 MD 127.0.0.1:8240
+01:41:05.252  ✓ VIDEO#1 已连上 MD 127.0.0.1:8240     ← 同时开两条都被接受
+01:41:05.423  [Phase 7] → VIDEO_ENCODER_START
+01:41:07.906  VIDEO#0 通道断开，1500ms 后重连          ← CarLife 约 2.6s 后关掉多余的一条
+（VIDEO#1 保持连接，但同样一个字节都没有）
+```
+
+结论：
+
+1. CarLife **允许多条 8240 连接**，但只保留一条（单消费者语义），说明"写目标"就是它保留的那条；
+2. 无论保留哪条，**都没有数据**——所以不是"连错连接"的问题；
+3. 帧在 CarLife 内部就没有被投递到 HU 侧的视频 socket。
+
+下一处可疑点：手机上有 CarWith ↔ CarLife 的本地 IPC（实测 `127.0.0.1:57999 ↔ 34562` 等多条 ESTAB）。
+CarLife 可能把画面送进"CarWith 会话"的那条通路，而不是直连 HU 的 8240。
+`/sdcard/Android/data/com.baidu.carlife.xiaomi/files/xLog/*.xlog` 是加密的，
+要看清只能 root 后 `tcpdump -i any port 8240 or port 57999`。
