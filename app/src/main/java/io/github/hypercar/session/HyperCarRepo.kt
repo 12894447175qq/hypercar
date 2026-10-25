@@ -1,4 +1,4 @@
-package io.github.hypercar.session
+﻿package io.github.hypercar.session
 
 import android.bluetooth.BluetoothDevice
 import android.content.Context
@@ -122,7 +122,7 @@ object HyperCarRepo {
                 return@launch
             }
             val identityPath = context.filesDir.resolve("controller_identity.txt").absolutePath
-            val json = SettingsStore.engineConfigJson(host, port, sessionDeviceMac, identityPath)
+            val json = SettingsStore.engineConfigJson(host, port, sessionDeviceMac, identityPath, sessionMdHost)
             log("CORE: 重试 nativeStart（$host:$port fd=$fd，第 $attempt 次）")
             val started = RustCoreBridge.nativeStart(json, fd, socketProvider)
             log("CORE: 重试 nativeStart 返回 $started")
@@ -176,6 +176,14 @@ object HyperCarRepo {
      */
     @Volatile
     private var aclCarMac: String? = null
+
+    /** 本轮是否探测到本机 CarLife 在监听 7240（true = 引擎走主动拨号 md_host）。 */
+    @Volatile
+    private var carLifeDialMode = false
+
+    /** 本轮引擎配置里的 md_host（重试 nativeStart 时复用）。 */
+    @Volatile
+    private var sessionMdHost: String? = null
 
     /**
      * 会话资源是否还活着（蓝牙协商/WiFi 绑定/Rust 引擎）。拆除用它做幂等闸门：
@@ -508,6 +516,13 @@ object HyperCarRepo {
             airplayHost = apHost
             airplayAttempts = 0
 
+            // ---- 唤醒在前 + 探测优先（CarLife 端口归属）----
+            // 小米 CarLife / CarWith 的「车辆热点 → 开始连接」模式是 **MD 自己 bind
+            // 7240~9340** 等车机连入；我们若先 bind，它必然 EADDRINUSE、界面一直 Waiting。
+            // 所以先把 CarLife 叫起来（它启动要 1~3s，正好和下面连 AirPlay 端口并行），
+            // 再探测 7240：有人监听 → 走「主动拨号」；没人监听 → 仍由 HU 监听（客户端型）。
+            wakeLocalCarLife()
+
             // ---- 连 AirPlay 控制端口并移交 FD ----
             push(link = LinkState.Negotiating("连接车机 AirPlay 端口"))
             var port = 0
@@ -528,8 +543,19 @@ object HyperCarRepo {
 
             // ---- 启动 Rust 引擎（协商在 Rust 内继续）----
             push(link = LinkState.Negotiating("Rust 核心层协商 AirPlay 会话"))
+            // 探测优先：CarLife 若已经在 7240 上监听，就把引擎切成「主动拨号」，
+            // 绝不能再让它去 bind（否则它永远抢不到端口）。探测窗口 ~2.5s（刚被唤醒时
+            // 需要一点启动时间；客户端型 CarLife 不监听，最多白等这一小段）。
+            val mdHost = probeLocalCarLifeMd()
+            carLifeDialMode = mdHost != null
+            sessionMdHost = mdHost
+            if (mdHost != null) {
+                log("CARLIFE: ✓ 探测到本机 CarLife 正在监听 127.0.0.1:7240 → 引擎走「主动拨号」模式")
+            } else {
+                log("CARLIFE: 7240 无人监听 → 由 HU 监听（客户端型 CarLife 会连进来）")
+            }
             val identityPath = context.filesDir.resolve("controller_identity.txt").absolutePath
-            val json = SettingsStore.engineConfigJson(apHost, port, deviceMac, identityPath)
+            val json = SettingsStore.engineConfigJson(apHost, port, deviceMac, identityPath, mdHost)
             // 下发配置原样打一行（不含密钥）：分辨率/帧率/md_host/voice 一目了然，
             // 免得再靠猜「这次到底请求了多大尺寸、是监听还是拨号」
             log("CORE +${stageMs()}ms 引擎配置：$json")
@@ -592,6 +618,8 @@ object HyperCarRepo {
      * 既打扰车机，也会不断制造「ACL 断开」事件。
      */
     private fun releaseSessionResources() {
+        carLifeDialMode = false
+        sessionMdHost = null
         streaming = false
         stopVoiceMic()
         runCatching { RustCoreBridge.nativeStop() }
@@ -1034,7 +1062,14 @@ object HyperCarRepo {
                         ),
                         carLife = CarLifeState.Waiting(),
                     )
-                    wakeLocalCarLife()
+                    if (carLifeDialMode) {
+                        // 已经探测到 CarLife 在监听、引擎是拨过去的——此时再发一次唤醒广播
+                        // 只会打断已建立的 CarLife 会话（它会重新走一遍连接），所以跳过。
+                        log("WAKE: 本轮走主动拨号模式，CarLife 已连上——跳过重复唤醒广播")
+                        push(carLife = CarLifeState.Waiting())
+                    } else {
+                        wakeLocalCarLife()
+                    }
                     // 语音助手要靠车机侧供麦克风；CarLife 连上后再开采集，
                     // 避免没会话时空录（也会占着麦克风影响其他应用）
                     startVoiceMic()
@@ -1091,6 +1126,41 @@ object HyperCarRepo {
         }
         log("WAKE: ⚠ 设备上没有 CarLife 系 app（候选：${carLifePackageCandidates.joinToString(", ")}）")
         return configured
+    }
+
+    /**
+     * 探测本机 CarLife（MD）是否在 `127.0.0.1:7240` 监听。
+     *
+     * 小米 CarLife / CarWith 的「车辆热点」模式是 **MD 自己 bind 7240..9340** 等车机连入；
+     * 我们若先去 bind，它必然 `EADDRINUSE`、界面永远 Waiting。所以唤醒后先探一下：
+     *  - 命中 → 把 `md_host=127.0.0.1` 传给引擎，走「主动拨号」（我们当车机）；
+     *  - 未命中 → 引擎照旧自己监听（客户端型 CarLife 会连进来）。
+     *
+     * 窗口默认 2.5s：刚被广播唤醒的 CarLife 需要一点启动时间；客户端型 CarLife 不监听，
+     * 最多白等这一小段（与 AirPlay 握手相比可接受）。
+     */
+    private fun probeLocalCarLifeMd(timeoutMillis: Long = CARLIFE_PROBE_TIMEOUT_MILLIS): String? {
+        val deadline = SystemClock.uptimeMillis() + timeoutMillis
+        var attempts = 0
+        while (SystemClock.uptimeMillis() < deadline) {
+            attempts++
+            val listening =
+                runCatching {
+                    java.net.Socket().use { socket ->
+                        socket.connect(java.net.InetSocketAddress("127.0.0.1", CARLIFE_CMD_PORT), 200)
+                    }
+                }.isSuccess
+            if (listening) {
+                log("CARLIFE: 第 $attempts 次探测命中 127.0.0.1:$CARLIFE_CMD_PORT（CarLife 在监听）")
+                return "127.0.0.1"
+            }
+            try {
+                Thread.sleep(200)
+            } catch (_: InterruptedException) {
+                return null
+            }
+        }
+        return null
     }
 
     /**
@@ -1701,6 +1771,10 @@ object HyperCarRepo {
 
     /** 停止时等在途连接协程退出的上限（超过就先拆，连接侧另有 sessionLive 兜底）。 */
     private const val JOIN_TIMEOUT_MILLIS = 5_000L
+
+    /** CarLife CMD 端口（MD 监听时我们改拨它）与探测窗口。 */
+    private const val CARLIFE_CMD_PORT = 7240
+    private const val CARLIFE_PROBE_TIMEOUT_MILLIS = 2_500L
 
     /** 单个候选网络上连 AirPlay 控制端口的超时（多网络轮试，单次不能给太久）。 */
     private const val CONTROL_CONNECT_TIMEOUT_MILLIS = 2_500L

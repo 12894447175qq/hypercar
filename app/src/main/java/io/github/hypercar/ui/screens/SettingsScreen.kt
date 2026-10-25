@@ -1229,6 +1229,7 @@ private fun agoText(atMillis: Long): String {
  */
 @Composable
 private fun HeadUnitSection(connected: Boolean = false) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     var selectedId by rememberSaveable { mutableStateOf(SettingsStore.headUnitProfileId) }
     var expanded by rememberSaveable { mutableStateOf(false) }
     // 远程档案（GitHub 下发）：新增车型不用发版，点一下就能拉到
@@ -1392,7 +1393,7 @@ private fun HeadUnitSection(connected: Boolean = false) {
                                 refreshNote = "正在下载…"
                                 scope.launch {
                                     val result = runCatching {
-                                        io.github.hypercar.headunit.RemoteProfiles.refresh()
+                                        io.github.hypercar.headunit.RemoteProfiles.refresh(context)
                                     }
                                     refreshing = false
                                     refreshNote = result.fold(

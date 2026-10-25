@@ -1,4 +1,4 @@
-﻿//! HyperCar 核心层 —— JNI 入口、Tokio 运行时、引擎生命周期。
+//! HyperCar 核心层 —— JNI 入口、Tokio 运行时、引擎生命周期。
 //!
 //! 与「参考文档」的架构差异（docs/NEGOTIATION-GAPS.md）：
 //!  参考文档里 AirPlay 协商留在 Kotlin，Rust 只接「已连通 FD + 已派生密钥」；
@@ -108,8 +108,10 @@ pub(crate) fn emit_stats(
             obj,
             "onStats",
             // Kotlin: onStats(fps:Int, frames:Long, kbps:Long, audioPlaying:Boolean, ducking:Boolean)
-            // → I J J I Z Z（两个 Long 都是 J；曾漏写一个 J 导致 kbps 按 Int 错位解析）
-            "(IJJIZZ)V",
+            // → I J J Z Z（5 个参数）。**必须严格 5 位**：旧值多写了一个 I（"(IJJIZZ)V"）
+            // 导致 GetMethodID 直接失败、onStats 一次都没调到——首页帧率/码率/音频芯片全空
+            // （2026-10-25 定谳）。
+            "(IJJZZ)V",
             &[
                 fps.into(),
                 frames.into(),
@@ -127,16 +129,24 @@ fn with_env<T>(
 ) -> Option<T> {
     let vm_guard = JAVA_VM.read();
     let vm = vm_guard.as_ref()?;
-    match vm.get_env() {
-        // 已 attach 的线程（JNI 调用栈内 / 已挂载 worker）
-        Ok(mut env) => f(&mut env).ok(),
-        // tokio worker 线程：daemon 挂载（进程退出不阻塞）。
-        // jni 0.21：attach_current_thread_as_daemon 返回 JNIEnv（非 AttachGuard），无需 unsafe。
-        Err(_) => {
-            let mut env = vm.attach_current_thread_as_daemon().ok()?;
-            f(&mut env).ok()
-        }
+    // 已 attach 的线程（JNI 调用栈内 / 已挂载 worker）→ 直接用；
+    // tokio worker 线程 → daemon 挂载（进程退出不阻塞）。
+    // jni 0.21：attach_current_thread_as_daemon 返回 JNIEnv（非 AttachGuard），无需 unsafe。
+    let (mut env, owned) = match vm.get_env() {
+        Ok(env) => (env, false),
+        Err(_) => (vm.attach_current_thread_as_daemon().ok()?, true),
+    };
+    let result = f(&mut env);
+    // **必须清理 Pending Java Exception**：JNI 调用失败（如方法签名不对 / 业务异常）后，
+    // 异常会挂在这个线程上，下一次该线程的任何 JNI 调用（emit_log / openTcpFd …）都会
+    // 立即失败甚至崩——必须 exception_clear 掉（2026-10-25 加固）。
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_describe();
+        let _ = env.exception_clear();
     }
+    // 本地引用只在本次 f 内使用；线程 attach 生命周期由 daemon 管理，无需 detach。
+    let _ = owned;
+    result.ok()
 }
 
 fn call_listener(method: &str, f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::errors::Result<()>) {

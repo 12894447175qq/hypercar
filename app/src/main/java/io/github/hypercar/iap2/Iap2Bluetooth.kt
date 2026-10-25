@@ -517,6 +517,10 @@ class Iap2Bluetooth(
                     onEndpoint(endpoint)
                 },
                 context = appContext,
+                // **必须显式传当前车机档案**：不传就一直用构造函数默认值 BMW_ID85，
+                // 设置页切成 通用(0.27)/WinPlay/Audi（或远程下发的档案）后，
+                // 0x4300 / EA / 0x4E0E / 档案A退场这些差异全都不生效（2026-10-25 定谳）。
+                profile = io.github.hypercar.headunit.HeadUnitProfiles.current(),
             )
         try {
             session.run(SESSION_TIMEOUT_MILLIS)

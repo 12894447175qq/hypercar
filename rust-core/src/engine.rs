@@ -1,4 +1,4 @@
-﻿//! 网关引擎编排：CarLife 回环 ⇄ AirPlay 推流 的粘合层。
+//! 网关引擎编排：CarLife 回环 ⇄ AirPlay 推流 的粘合层。
 //!
 //! 数据面（全部零转码）：
 //!  - 视频：CarLife 8240 的 H.264 Annex B 裸流 → ScreenSender（128B 头 + ChaCha20-Poly1305）
@@ -110,7 +110,19 @@ pub async fn run_engine(
     };
     let (hub, mut life_events) = match cfg.md_host.clone() {
         Some(host) => CarLifeHub::connect(life_cfg, host, stop.clone())?,
-        None => CarLifeHub::start(life_cfg, stop.clone())?,
+        None => match CarLifeHub::start(life_cfg, stop.clone()) {
+            Ok(v) => v,
+            // **端口被本机 CarLife 占了 = 它才是监听方**：小米 CarLife/CarWith 在
+            // 「车辆热点 → 开始连接」后自己 bind 7240~9340 等车机连入。此时我们改当客户端，
+            // 直接拨 127.0.0.1 即可同机打通（2026-10-25 验证：两个进程抢 7240 会双双卡死）。
+            Err(e) if e.contains("Address already in use") || e.contains("os error 98") => {
+                emit_log(
+                    "CARLIFE: 7240 已被本机 CarLife/CarWith 监听占用——自动改走「主动拨号 127.0.0.1」",
+                );
+                CarLifeHub::connect(life_cfg, "127.0.0.1".to_string(), stop.clone())?
+            }
+            Err(e) => return Err(e),
+        },
     };
     let hub = Arc::new(hub);
 

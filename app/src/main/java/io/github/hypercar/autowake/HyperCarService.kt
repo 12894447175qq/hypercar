@@ -86,17 +86,42 @@ class HyperCarService : Service() {
         super.onDestroy()
     }
 
-    /** 5s 内进入前台（connectedDevice）。 */
+    /**
+     * 5s 内进入前台。
+     *
+     * **必须带上 microphone 类型**（权限已授权时）：语音助手要手机供麦（AudioRecord），
+     * 而 Android 14+ 禁止「只有 connectedDevice 类型的 FGS」在后台录音——表现为
+     * AudioRecord 静默返回 0 或直接 SecurityException（2026-10-25 定谳）。
+     * 类型与 manifest 的 `connectedDevice|microphone` 对应；失败时退回纯 connectedDevice，
+     * 至少保证会话能进前台（麦克风随后会在 AudioRecord 处再报一次原因）。
+     */
     private fun startForegroundSafe() {
-        try {
-            ServiceCompat.startForeground(
+        val micGranted =
+            androidx.core.content.ContextCompat.checkSelfPermission(
                 this,
-                NOTIFICATION_ID,
-                buildNotification(),
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
-            )
+                android.Manifest.permission.RECORD_AUDIO,
+            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        val types =
+            if (android.os.Build.VERSION.SDK_INT >= 30 && micGranted) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            } else {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            }
+        try {
+            ServiceCompat.startForeground(this, NOTIFICATION_ID, buildNotification(), types)
         } catch (t: Throwable) {
-            Log.e(TAG, "startForeground 失败：${t.message}")
+            Log.e(TAG, "startForeground（含 microphone 类型）失败：${t.message}，退回 connectedDevice")
+            try {
+                ServiceCompat.startForeground(
+                    this,
+                    NOTIFICATION_ID,
+                    buildNotification(),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
+                )
+            } catch (t2: Throwable) {
+                Log.e(TAG, "startForeground 失败：${t2.message}")
+            }
         }
     }
 

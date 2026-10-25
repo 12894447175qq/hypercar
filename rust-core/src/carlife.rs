@@ -1,4 +1,4 @@
-﻿//! CarLife HU（车机）侧网关——严格按 CarLifeWirelessBox / apollo-DuerOS 的 HU 实现重构。
+//! CarLife HU（车机）侧网关——严格按 CarLifeWirelessBox / apollo-DuerOS 的 HU 实现重构。
 //!
 //! 我们扮演「车机」，本机 CarLife / CarWith(CarLife 兼容) / 荣耀车联 作为「手机(MD)」连回
 //! 127.0.0.1 的一组标准端口。
@@ -93,6 +93,7 @@ pub const TOUCH_MOVE: u32 = 2;
 const PROTOCOL_MAJOR: u32 = 3;
 const PROTOCOL_MINOR: u32 = 2;
 
+#[derive(Clone, Copy)]
 pub struct CarLifeConfig {
     pub width: u32,
     pub height: u32,
@@ -157,6 +158,9 @@ impl CarLifeHub {
             "CARLIFE: 回环网关就绪 127.0.0.1:{} CMD / {} VIDEO / {} MEDIA / {} TTS / {} VR / {} CTRL",
             PORT_CMD, PORT_VIDEO, PORT_MEDIA, PORT_TTS, PORT_VR, PORT_CTRL
         ));
+
+        // ---- UDP 7999 发现广播（尽力而为，见函数注释）----
+        spawn_discovery_beacon(stop.clone());
 
         Ok((
             Self {
@@ -1270,6 +1274,107 @@ async fn ctrl_write_loop(
                 }
             }
         }
+    }
+}
+
+/// HU 侧「UDP 7999 发现广播」——**尽力而为**，不是公开协议。
+///
+/// 公开资料里无线 CarLife **没有**发现协议：CarLife/CarWith 只是把六条 TCP 端口打开、
+/// 等车机去连（Limo/xcertplay 的 `SubnetScanner.kt` 注释与实测都是这个结论），所以
+/// 我们真正的发现手段是「探 127.0.0.1:7240」（见 `HyperCarRepo.probeLocalCarLifeMd`）。
+///
+/// 这条 UDP 广播是给「个别车机版 MD 会等一条广播才开始回连」的情况兜底：
+///  - 每 1s（前 12 次）→ 每 5s，往 `127.0.0.1:7999` 与 `255.255.255.255:7999` 发一条
+///    **可读文本** `127.0.0.1:7240`（含 NUL）。不认识它的版本只会丢弃 UDP 包，无害。
+///  - 同时尝试 bind `0.0.0.0:7999` 收包：如果 MD 真的往这里广播，把前几包打成 hex
+///    打进日志——真抓到包就能反推它到底要什么格式（到时候再按真实报文改）。
+fn spawn_discovery_beacon(stop: Arc<Notify>) {
+    tokio::spawn(async move {
+        const DISCOVERY_PORT: u16 = 7999;
+        let payload = {
+            let mut v = format!("127.0.0.1:{PORT_CMD}").into_bytes();
+            v.push(0);
+            v
+        };
+        // 收：优先占 7999；被 CarLife 自己占了就只发不收（别去抢它的 socket）
+        let recv_sock = match tokio::net::UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)).await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                emit_log(&format!(
+                    "CARLIFE: UDP {DISCOVERY_PORT} 绑定失败（{e}）——只发发现广播、不收包"
+                ));
+                None
+            }
+        };
+        let send_sock = match tokio::net::UdpSocket::bind(("0.0.0.0", 0)).await {
+            Ok(s) => {
+                // 255.255.255.255 需要 SO_BROADCAST，否则 EACCES（loopback 不受影响）
+                if let Err(e) = s.set_broadcast(true) {
+                    emit_log(&format!("CARLIFE: UDP 广播开关设置失败（{e}）——只发回环"));
+                }
+                s
+            }
+            Err(e) => {
+                emit_log(&format!("CARLIFE: 发现广播 socket 创建失败（{e}）——跳过"));
+                return;
+            }
+        };
+        emit_log(&format!(
+            "CARLIFE: 已启动 UDP {DISCOVERY_PORT} 发现广播（payload=127.0.0.1:{PORT_CMD}）"
+        ));
+
+        let mut buf = [0u8; 2048];
+        let mut sent: u32 = 0;
+        let mut received_logged: u32 = 0;
+        let mut next = tokio::time::Instant::now();
+        loop {
+            let gap = if sent < 12 {
+                Duration::from_secs(1)
+            } else {
+                Duration::from_secs(5)
+            };
+            let sleep = tokio::time::sleep_until(next);
+            tokio::pin!(sleep);
+            tokio::select! {
+                _ = stop.notified() => return,
+                _ = &mut sleep => {
+                    for dst in [("127.0.0.1", DISCOVERY_PORT), ("255.255.255.255", DISCOVERY_PORT)] {
+                        if let Err(e) = send_sock.send_to(&payload, dst).await {
+                            if sent == 0 {
+                                emit_log(&format!("CARLIFE: 发现广播发往 {}:{} 失败（{e}）", dst.0, dst.1));
+                            }
+                        }
+                    }
+                    sent = sent.saturating_add(1);
+                    next = tokio::time::Instant::now() + gap;
+                }
+                r = recv_from_opt(&recv_sock, &mut buf) => {
+                    if let Some((n, from)) = r {
+                        // 我们自己发的那条（回环单播/广播回环）也会被本 socket 收到，
+                        // 按 payload 原样过滤掉，免得把自问自答当成 MD 的发现包。
+                        let own = n == payload.len() && buf[..n] == payload[..];
+                        if !own && received_logged < 5 {
+                            received_logged += 1;
+                            let hex: String = buf[..n.min(64)].iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+                            emit_log(&format!(
+                                "CARLIFE: UDP {DISCOVERY_PORT} 收到 {n}B ← {from}：{hex}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// `Option<UdpSocket>` 的收包：没有 socket 时永久等待（让 `select!` 的另一条腿工作）。
+async fn recv_from_opt(
+    sock: &Option<tokio::net::UdpSocket>,
+    buf: &mut [u8],
+) -> Option<(usize, std::net::SocketAddr)> {
+    match sock {
+        Some(s) => s.recv_from(buf).await.ok(),
+        None => std::future::pending().await,
     }
 }
 

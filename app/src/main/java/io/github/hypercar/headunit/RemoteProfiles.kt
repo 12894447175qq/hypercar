@@ -1,4 +1,6 @@
-package io.github.hypercar.headunit
+﻿package io.github.hypercar.headunit
+
+import android.content.Context
 
 import io.github.hypercar.settings.SettingsStore
 import kotlinx.coroutines.Dispatchers
@@ -106,8 +108,8 @@ object RemoteProfiles {
     }
 
     /** 从 [url] 拉取并落盘；返回本次拿到的档案数（失败抛异常，由调用方展示）。 */
-    suspend fun refresh(): Int = withContext(Dispatchers.IO) {
-        val body = httpGet(url())
+    suspend fun refresh(context: Context): Int = withContext(Dispatchers.IO) {
+        val body = httpGet(context, url())
         // 先解析再落盘：解析不了就保持旧缓存，避免把设置页搞成空列表
         val parsed = parseRaw(body)
         require(parsed.profiles.isNotEmpty()) { "配置里没有任何档案" }
@@ -117,11 +119,14 @@ object RemoteProfiles {
         parsed.profiles.size
     }
 
-    private fun httpGet(url: String): String {
-        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+    private fun httpGet(
+        context: Context,
+        url: String,
+    ): String {
+        // **不能直接用 URL.openConnection()**：会话期间进程被绑到车机热点（无外网），
+        // 更新车型列表会 100% 失败。InternetRoute 会挑一条真有外网的网络。
+        val conn = io.github.hypercar.net.InternetRoute.open(context, url).apply {
             requestMethod = "GET"
-            connectTimeout = 8_000
-            readTimeout = 8_000
             instanceFollowRedirects = true
             setRequestProperty("Accept", "application/json")
         }

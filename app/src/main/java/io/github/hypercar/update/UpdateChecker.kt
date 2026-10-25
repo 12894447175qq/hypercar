@@ -84,7 +84,7 @@ object UpdateCenter {
         _state.value = UpdateUiState.Checking
         prefs(context).edit().putLong(KEY_LAST_CHECK, System.currentTimeMillis()).apply()
         _state.value = try {
-            val latest = fetchLatest()
+            val latest = fetchLatest(context)
             when {
                 latest == null -> UpdateUiState.Failed("仓库还没有发布任何 Release")
                 isNewer(latest.version, currentVersion) -> UpdateUiState.Available(latest)
@@ -95,11 +95,11 @@ object UpdateCenter {
         }
     }
 
-    private suspend fun fetchLatest(): ReleaseInfo? = withContext(Dispatchers.IO) {
-        val conn = (URL(API).openConnection() as HttpURLConnection).apply {
+    private suspend fun fetchLatest(context: Context): ReleaseInfo? = withContext(Dispatchers.IO) {
+        // 会话期间进程被绑到车机热点（无外网）——必须挑一条真有外网的网络，
+        // 否则「检查更新」100% 失败（2026-10-25 验证）。
+        val conn = io.github.hypercar.net.InternetRoute.open(context, API).apply {
             requestMethod = "GET"
-            connectTimeout = 8_000
-            readTimeout = 8_000
             setRequestProperty("Accept", "application/vnd.github+json")
             // GitHub 要求带 User-Agent，否则 403
             setRequestProperty("User-Agent", "HyperCar/${BuildConfig.VERSION_NAME}")

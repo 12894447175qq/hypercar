@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.settings
+package io.github.hypercar.settings
 
 import android.content.Context
 import android.content.SharedPreferences
@@ -189,8 +189,19 @@ object SettingsStore {
         get() = p().getBoolean(KEY_DEGRADED_FIRST_CONNECT, false)
         set(v) = p().edit().putBoolean(KEY_DEGRADED_FIRST_CONNECT, v).apply()
 
-    /** 引擎配置 JSON（Rust EngineConfig::from_json 消费）。 */
-    fun engineConfigJson(carIp: String, airplayPort: Int, deviceBluetoothMac: String, identityPath: String): String {
+    /**
+     * 引擎配置 JSON（Rust EngineConfig::from_json 消费）。
+     *
+     * @param mdHost 非空 = CarLife 主动拨号模式（MD 自己在监听，我们当车机去拨它）；
+     *   为空 = HU 监听模式（我们自己 bind 7240..9340 等 CarLife 连入）。
+     */
+    fun engineConfigJson(
+        carIp: String,
+        airplayPort: Int,
+        deviceBluetoothMac: String,
+        identityPath: String,
+        mdHost: String? = null,
+    ): String {
         fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
         return buildString {
             append("{")
@@ -202,6 +213,11 @@ object SettingsStore {
             append("\"fps\":").append(carlifeFps).append(",")
             append("\"enable_audio\":").append(enableAudio).append(",")
             append("\"keep_alive_stats\":").append(keepAliveStats).append(",")
+            // 主动拨号模式：探测到本机 CarLife（MD）自己在 7240 监听时传 "127.0.0.1"，
+            // Rust 就会逐个拨这 6 条通道，而不是去 bind（两边抢端口必有一边 EADDRINUSE）。
+            if (!mdHost.isNullOrBlank()) {
+                append("\"md_host\":\"").append(esc(mdHost)).append("\",")
+            }
             append("\"identity_path\":\"").append(esc(identityPath)).append("\"")
             append("}")
         }
