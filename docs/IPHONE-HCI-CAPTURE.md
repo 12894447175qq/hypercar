@@ -1,4 +1,4 @@
-# iPhone HCI 蓝牙抓包（sysdiagnose）操作手册
+﻿# iPhone HCI 蓝牙抓包（sysdiagnose）操作手册
 
 真机联调时，「我们的实现对不对」只有**同一个车机对真 iPhone 的行为**能回答。
 iPhone 不开放 HCI 口给第三方，但可以用苹果官方的蓝牙调试描述文件让 `bluetoothd`
@@ -105,3 +105,66 @@ logs/Bluetooth/bluetoothd-hci-YYYY-MM-DD-*.pklg    ← 同一次抓包的滚动�
 - **`.tar.gz` 与 `.pklg` 一律不入库**（`.gitignore` 已排除 `*.pklg`、`sysdiagnose*`）。
 - 写进文档/issue 的片段必须掩码：设备名、SSID、PSK、蓝牙 MAC、传输 UUID、
   车机标识串、IP 末段——本项目文档里这些一律是 `*`。
+
+---
+
+## 进阶：一次抓包同时拿到 Bluetooth + Wi-Fi + CarPlay
+
+苹果的描述文件可以**叠加安装**（互不冲突）：装几个就多几类日志，`sysdiagnose` 会一次性全打包。
+所以理想做法是**把三个都装上、只按一次 sysdiagnose**。
+
+| 描述文件 | 装完生效的日志 | 对我们要查的事有用吗 |
+|---|---|---|
+| **Bluetooth**（`bluetoothd`） | `logs/Bluetooth/bluetoothd-hci-*.pklg`——iAP2 全量字节 | ★★★ 已有结论全靠它 |
+| **Wi-Fi** | `logs/WiFi/`（关联/漫游/吞吐/RSSI 细节、`wifi.log`） | ★★ 能看接入车机热点的过程、DHCP 结果、掉线原因 |
+| **CarPlay**（若列表中提供） | CarPlay 会话日志（启动、AirPlay 连接、错误码） | ★★★ 能看它拿到的 AirPlay 端点与失败原因 |
+
+> 列表按字母序排：`Bluetooth`、`CarPlay` 在 B/C 段，`Wi-Fi` 在最后。
+> 页面很长，直接用浏览器 Ctrl+F 搜名字即可。
+
+### 装多个描述文件的顺序
+
+1. 先装 **Bluetooth**（必须，iAP2 只能靠它）；
+2. 再装 **Wi-Fi**（同一个 Safari 页面，下载第二个 `.mobileconfig`）；
+3. 若页面里有 **CarPlay**，一并装上；
+4. 每个都走「设置 → 已下载描述文件 → 安装」，装完**不需要重启**；
+5. 全部装完再上车复现，**只按一次** sysdiagnose（流程同本文步骤 2~4）。
+
+### sysdiagnose 里值得先翻的目录
+
+解压 `sysdiagnose_*.tar.gz` 后，按这个顺序看：
+
+| 路径 | 内容 | 怎么用 |
+|---|---|---|
+| `logs/Bluetooth/*.pklg` | HCI 全量（iAP2 明文） | 按本文「本项目解析这文件的要点」逐帧看 |
+| `logs/WiFi/`（`wifi.log`、`*.log`） | 关联哪个 SSID、DHCP 拿到什么、RSSI/漫游 | 看车机热点到底给了什么地址与网关 |
+| `logs/CarPlay/`（若存在） | CarPlay 会话状态机与 AirPlay 连接 | 找 `AirPlay`、`endpoint`、`connect` 关键字 |
+| `logs/Networking/` | 路由/接口快照 | 确认手机在车机网段里的 IP/掩码/网关 |
+| `system_logs.logarchive` | 统一日志（需 `log show` 或在 Mac 上用 Console 打开） | 按子系统过滤：`com.apple.carplay`、`com.apple.airplay` |
+
+搜索技巧（解压目录里）：
+
+```bash
+# CarPlay 相关文件名
+find . -iname '*carplay*'
+# WiFi 日志里找车机热点与拿到的 IP
+grep -ril -e 'DIRECT-' -e 'dhcp' logs/WiFi | head
+# AirPlay 端点线索（RTSP/7000/端口）
+grep -ril -e 'airplay' -e ':7000' logs | head
+```
+
+### 一个必须说清的限制
+
+**iPhone 拿不到 802.11 空口抓包**：
+Wi-Fi 描述文件给的是**日志**（关联/吞吐/错误统计），不是 `monitor mode` 的帧抓包。
+所以「AirPlay 报文原文」在 iPhone 侧只能从 `pklg`（蓝牙侧）和统一日志里间接看。
+
+若确实需要空口抓 `_airplay._tcp` / RTSP 明文，只有两条路：
+
+1. **Mac + 无线诊断**（Wireless Diagnostics → 窗口 → 嗅探，选信道 157 等），导出 `.wcap`，
+   在 Wireshark 里用已知 PSK 解密（`Preferences → Protocols → IEEE 802.11 → Decryption Keys`，
+   填 `wpa-pwd` 或 `wpa-psk`）；
+2. 支持 monitor 模式的 USB 网卡 + Linux（`airmon-ng`）。
+
+> 顺带：我们自己的 App 每次连接都会从车机 `0x5703` 拿到这个热点的 PSK，
+> 所以"抓到了但解不开"这件事不存在——只要能抓到，就一定能解。

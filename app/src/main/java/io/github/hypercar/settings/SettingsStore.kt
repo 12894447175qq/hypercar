@@ -1,4 +1,4 @@
-package io.github.hypercar.settings
+﻿package io.github.hypercar.settings
 
 import android.content.Context
 import android.content.SharedPreferences
@@ -43,6 +43,7 @@ object SettingsStore {
     private const val KEY_DEBUG_LOG = "debug_log_enabled"
     private const val KEY_STABLE_DEVICE_ID = "stable_device_id"
     private const val KEY_DEGRADED_FIRST_CONNECT = "degraded_first_connect_done"
+    private const val KEY_LAST_AIRPLAY_ENDPOINT = "last_airplay_endpoint"
 
     /** MAC 格式（字段写入前先大写归一，再按此校验；不合法直接存 null）。 */
     private val MAC_PATTERN = Regex("([0-9A-F]{2}:){5}[0-9A-F]{2}")
@@ -90,8 +91,21 @@ object SettingsStore {
 
     /** 远程档案下载地址（可指向镜像/私有分支）；空 = 用内置默认地址。 */
     var remoteProfilesUrl: String
+
         get() = p().getString(KEY_REMOTE_PROFILES_URL, "") ?: ""
         set(v) = p().edit().putString(KEY_REMOTE_PROFILES_URL, v).apply()
+
+    /**
+     * 上次**连接成功**的 AirPlay 端点，格式 `host:port|ssid`（ssid 可为空）。
+     *
+     * 为什么要记：宝马专用 CarPlay 盒子实测（docs/NEGOTIATION-GAPS.md §14）——
+     * 它能稳定连上，是因为**直接连记住的 IP:端口**，连接时根本不做发现。
+     * 我们每次上车都从 0x5703/0x4301/mDNS/扫网段重来，发现环节一卡整轮就失败。
+     * 所以：连成功一次就存下来，下次同一热点直接试它（连通即用，失败再走发现）。
+     */
+    var lastAirplayEndpoint: String
+        get() = p().getString(KEY_LAST_AIRPLAY_ENDPOINT, "") ?: ""
+        set(v) = p().edit().putString(KEY_LAST_AIRPLAY_ENDPOINT, v).apply()
 
 
     var carlifeWidth: Int

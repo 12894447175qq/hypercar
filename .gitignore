@@ -42,4 +42,6 @@ tools/*.identity
 *.pklg
 sysdiagnose*
 *.tar.gz
-
+*.pcap
+*.pcapng
+*.etl
