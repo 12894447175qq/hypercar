@@ -1,4 +1,4 @@
-# HyperCar
+﻿# HyperCar
 
 **CarLife → AirPlay 零转码网关**：把手机上 CarLife 系应用（百度 CarLife、小米 CarWith、
 荣耀车联等）产出的 H.264 与 PCM，经 **Rust 核心层**零转码直推任意 AirPlay 接收端
@@ -93,6 +93,7 @@ docs/          架构、CarLife 协议、协商对比、编译指南、车机档
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 整体架构、数据面/控制面分工 |
 | [docs/CARLIFE-PROTOCOL.md](docs/CARLIFE-PROTOCOL.md) | CarLife 六个端口、握手阶段、消息 ID |
 | [docs/NEGOTIATION-GAPS.md](docs/NEGOTIATION-GAPS.md) | AirPlay 协商差异、真车实测、真 iPhone 对照 |
+| [docs/CARDECK-ALIGNMENT.md](docs/CARDECK-ALIGNMENT.md) | 与 cardeck 参考实现的差异对照（身份模型/配对/蓝牙/iAP2/AirPlay） |
 | [docs/HEADUNIT-PROFILES.md](docs/HEADUNIT-PROFILES.md) | 车机档案字段、**新增品牌四步走**、**远程下发（改 JSON 不发版）** |
 | [docs/IPHONE-HCI-CAPTURE.md](docs/IPHONE-HCI-CAPTURE.md) | **iPhone HCI 抓包手册**（描述文件 → sysdiagnose → .pklg） |
 | [docs/BUILD.md](docs/BUILD.md) | 编译环境、本地出包、CI 标记 |
@@ -147,6 +148,7 @@ PC 侧联调工具：
   （其协议笔记与坑位记录来自真车实测）。
 - 「CarLife」为百度商标，本项目仅个人研究用途；CarLife 接收端协议参考了
   apollo-DuerOS（Apache 2.0）与 CarLifeWirelessBox（MIT）的公开资料。
+
 
 
 

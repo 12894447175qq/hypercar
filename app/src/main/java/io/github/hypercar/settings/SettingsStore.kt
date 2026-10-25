@@ -44,6 +44,7 @@ object SettingsStore {
     private const val KEY_STABLE_DEVICE_ID = "stable_device_id"
     private const val KEY_DEGRADED_FIRST_CONNECT = "degraded_first_connect_done"
     private const val KEY_LAST_AIRPLAY_ENDPOINT = "last_airplay_endpoint"
+    private const val KEY_PAIRING_IDENTITY = "pairing_identity"
 
     /** MAC 格式（字段写入前先大写归一，再按此校验；不合法直接存 null）。 */
     private val MAC_PATTERN = Regex("([0-9A-F]{2}:){5}[0-9A-F]{2}")
@@ -103,6 +104,20 @@ object SettingsStore {
      * 我们每次上车都从 0x5703/0x4301/mDNS/扫网段重来，发现环节一卡整轮就失败。
      * 所以：连成功一次就存下来，下次同一热点直接试它（连通即用，失败再走发现）。
      */
+
+    /**
+     * 配对身份（AirPlay pair-setup 的长期身份）**备份**，格式与 `controller_identity.txt` 相同：
+     * `pairingId hex私钥`。
+     *
+     * 为什么要有备份：车机记住的是这条配对的 pairingId + 公钥。身份文件一旦丢失
+     * （进程崩溃时写盘失败、清理缓存、升级覆盖），我们会重新生成一对新密钥，
+     * 车机就认为「这是台新设备」——现象正是「第二次上车连不上、只有两边删配对才能恢复」。
+     * 这里把身份同时存进 SharedPreferences，文件丢了自动写回，相当于给配对加了份保险。
+     */
+    var pairingIdentityBackup: String
+        get() = p().getString(KEY_PAIRING_IDENTITY, "") ?: ""
+        set(v) = p().edit().putString(KEY_PAIRING_IDENTITY, v).apply()
+
     var lastAirplayEndpoint: String
         get() = p().getString(KEY_LAST_AIRPLAY_ENDPOINT, "") ?: ""
         set(v) = p().edit().putString(KEY_LAST_AIRPLAY_ENDPOINT, v).apply()

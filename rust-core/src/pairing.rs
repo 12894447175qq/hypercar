@@ -1,4 +1,4 @@
-//! AirPlay 配对客户端（cardeck `PairingClients.kt` 的 Rust 移植）：
+﻿//! AirPlay 配对客户端（cardeck `PairingClients.kt` 的 Rust 移植）：
 //! `/pair-setup`（SRP 交换长期 ed25519 公钥）与 `/pair-verify`（每次会话的
 //! 临时 X25519 + 长期签名，派生控制通道 ChaCha20 密钥）。
 //!
@@ -445,3 +445,4 @@ fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
     }
     Some(out)
 }
+

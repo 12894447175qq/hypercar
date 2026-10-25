@@ -123,7 +123,9 @@ object HyperCarRepo {
                 retryAirplayOrFail("控制端口重连失败 $host:$port")
                 return@launch
             }
-            val identityPath = context.filesDir.resolve("controller_identity.txt").absolutePath
+            val identityFile = context.filesDir.resolve("controller_identity.txt")
+            ensurePairingIdentity(context, identityFile)
+            val identityPath = identityFile.absolutePath
             val json = SettingsStore.engineConfigJson(host, port, sessionDeviceMac, identityPath, sessionMdHost)
             log("CORE: 重试 nativeStart（$host:$port fd=$fd，第 $attempt 次）")
             val started = RustCoreBridge.nativeStart(json, fd, socketProvider)
@@ -1194,6 +1196,35 @@ object HyperCarRepo {
      */
     private val socketKeepAlive = java.util.Collections.synchronizedList(mutableListOf<Any>())
 
+    /**
+     * 配对身份自愈：**文件是主、SharedPreferences 是备份**。
+     *
+     * 车机记住的是这条配对的 pairingId + 公钥；身份文件一旦丢失就会重新生成密钥，
+     * 车机认为「新设备」→ 第二次上车连不上、只有两边删配对才能恢复（现场 2026-10-25）。
+     * 这里在每次下发引擎配置前对齐两处：
+     *  - 文件缺失 + 有备份 → 写回文件（**不会**重新生成，保住车机那边的配对）
+     *  - 文件存在 → 更新备份（升级/换机后仍可恢复）
+     */
+    private fun ensurePairingIdentity(context: Context, path: java.io.File) {
+        runCatching {
+            if (!path.exists()) {
+                val backup = SettingsStore.pairingIdentityBackup
+                if (backup.isNotBlank()) {
+                    path.writeText(backup)
+                    log("PAIR: 身份文件缺失——已用备份恢复（车机侧配对保持有效）")
+                }
+            }
+            if (path.exists()) {
+                val text = path.readText().trim()
+                if (text.isNotBlank() && text != SettingsStore.pairingIdentityBackup) {
+                    SettingsStore.pairingIdentityBackup = text
+                    log("PAIR: 已备份配对身份到设置（换机/清缓存后可恢复）")
+                }
+                val pairingId = text.substringBefore(' ')
+                if (pairingId.isNotBlank()) log("PAIR: 当前身份 pairingId=$pairingId")
+            }
+        }.onFailure { log("PAIR: 身份自愈失败 - ${it.message}") }
+    }
     private fun keepAliveForRust(owner: Any) {
         socketKeepAlive.add(owner)
     }
@@ -2049,6 +2080,7 @@ object HyperCarRepo {
     /** 重启时从落盘日志带回环形缓冲的行数（够覆盖崩溃前的一段现场）。 */
     private const val DISK_LOG_TAIL_LINES = 120
 }
+
 
 
 
