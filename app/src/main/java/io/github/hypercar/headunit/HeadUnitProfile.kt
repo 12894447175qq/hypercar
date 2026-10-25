@@ -117,6 +117,44 @@ object HeadUnitProfiles {
         pairingHint = "首次要在 iDrive 里把这个设备选成 CarPlay 手机（车机会弹确认）",
     )
 
+    /**
+     * 通用（0.27 基线 / cardeck 同款）：不认识的车型先用它。
+     *
+     * 内容 = 0.27 在宝马 MGU-55 上跑通的序列（`0x4300` + `0xEA00` + `0x4E0E`、
+     * 发 iAP2 前断 HFP/A2DP、先给车机 8s 主动连入的机会），与
+     * `shaonialife/cardeck`（0.1.28）的通用流程逐项对照后取**并集**：
+     *
+     * - 两边都发的三条消息 → 全开；
+     * - 两边都在出站前断 HFP/A2DP（cardeck `Iap2BluetoothClient` 的「只配对、不连接」）→ `true`；
+     * - 0.27 有「档案 A 主动结束会话」、cardeck 没有 → 不保留（本仓库 0.28 起的现场结论也是
+     *   拆链会让车机收起 CarPlay 图标，cardeck 同样从不拆链）；
+     * - 0.27 端口写死 7000、cardeck 走 mDNS 并退 7000 → 取 cardeck 的：mDNS 优先、兜底只留
+     *   `7000`（0.27 写死 7000 时老车机只回 `455 Method Not Valid In This State`）；
+     * - 0xAE00 → 0xAE01 两边历史版本都不回，通用按真 iPhone 行为补上（3 条原样重放）。
+     *
+     * 与 0.27 的差异：档案 A 不拆链、端点改为 mDNS 优先（兜底仍是 7000）、补上 `0xAE01`。
+     * 要严格复刻 0.27：`abortWhenCarPlayWindowClosed = true`、`preferMdnsAirplay = false`、
+     * `replyPowerUpdates = false`，代码不用动。
+     */
+    val GENERIC = HeadUnitProfile(
+        id = "generic",
+        label = "通用（0.27）",
+        model = "任意车机 / 未知车型",
+        notes = "0.27 基线 + cardeck 通用序列：0x4300/0xEA00/0x4E0E 全发，发 iAP2 前先断 HFP/A2DP，" +
+            "不主动拆链；端点先查 mDNS `_airplay._tcp`，拿不到退 7000。" +
+            "与 0.27 只差两处：档案 A 不拆链（拆链会丢 CarPlay 图标）、mDNS 优先（0.27 写死 7000，遇 455 连不上）。",
+        verified = true,
+        sendCarPlayAvailability = true,
+        openEaSessions = true,
+        sendTransportIdentifier = true,
+        replyPowerUpdates = true,
+        dropProfilesBeforeIap2 = true,
+        abortWhenCarPlayWindowClosed = false,
+        preferMdnsAirplay = true,
+        fallbackAirplayPorts = listOf(7000),
+        pairingHint = "首次要在车机里把本机选成 CarPlay 手机（部分车机会弹确认）",
+    )
+
     /** WinPlay（Windows 上的 AirPlay 接收端，联调/盒子用）。 */
     val WINPLAY = HeadUnitProfile(
         id = "winplay",
@@ -166,8 +204,8 @@ object HeadUnitProfiles {
         touchDisplay = null,
         pairingHint = "首次要在 MMI 里选「Apple CarPlay」并确认这台手机（车机会弹提示）",
     )
-    /** 内置档案（出厂就有的，断网也一定在）。 */
-    val builtin: List<HeadUnitProfile> = listOf(BMW_ID85, WINPLAY, AUDI_MIB3)
+    /** 内置档案（出厂就有的，断网也一定在）。宝马排第一：它是默认档案。 */
+    val builtin: List<HeadUnitProfile> = listOf(BMW_ID85, GENERIC, WINPLAY, AUDI_MIB3)
 
     /**
      * 全部可用档案 = 内置 + 远程（GitHub 下发的 `profiles/headunits.json`）。

@@ -22,7 +22,7 @@ app/src/main/java/io/github/hypercar/headunit/HeadUnitProfile.kt   ← 档案定
 | `openEaSessions` | 是否开 `0xEA00` EA 会话 | 宝马车机 `true`（0.27 行为）；真 iPhone 一个都不发，但停发与图标消失同时发生，暂按现场 A/B 保留 |
 | `sendTransportIdentifier` | 是否发 `0x4E0E` 传输标识 | 同上，宝马 `true`（与 0x4300 携带同一个传输标识） |
 | `replyPowerUpdates` | 车机发 `0xAE00` 时是否回 `0xAE01` | 真 iPhone **必回**（3 条）；默认 `true` |
-| `dropProfilesBeforeIap2` | 发 iAP2 前是否主动断开该车机的 HFP/A2DP（「只配对、不连接」） | 奥迪那种「已连接就不开 iAP2 窗口」的车机要 `true`；**宝马要 `false`**——它的 HFP/A2DP 在线时本来就会主动连入 iAP2，主动断开反而把 ACL 一起拽掉，车机反而不发起 CarPlay |
+| `dropProfilesBeforeIap2` | 发 iAP2 前是否主动断开该车机的 HFP/A2DP（「只配对、不连接」） | 奥迪那种「已连接就不开 iAP2 窗口」的车机要 `true`；**宝马要 `false`**——它的 HFP/A2DP 在线时本来就会主动连入 iAP2，主动断开反而把 ACL 一起拽掉，车机反而不发起 CarPlay；`通用（0.27）` 取 `true`（0.27 与 cardeck 都这么做） |
 | `abortWhenCarPlayWindowClosed` | 0x1D01 判为「档案 A」（车机没开无线 CarPlay 窗口）时是否主动结束会话 | **一律 `false`**：2026-10-25 现场 A/B——0.27 保持链路时车机显示 CarPlay 图标，0.28 加了「档案 A 立即结束」后图标消失、车机不再发起 iAP2（拆链会让车机收起图标）。空转轮次改由「车机新连入顶替」处理，不靠拆链 |
 | `preferMdnsAirplay` | 端口策略：`true` = 先查 mDNS `_airplay._tcp` | 车机广播该服务（抓包/Bonjour 浏览可见）→ `true`；普通接收端（WinPlay）→ `false` |
 | `fallbackAirplayPorts` | mDNS 拿不到时的试连顺序 | AirPlay 惯例 `7000`，其次 `7001` / `7100` |
@@ -59,7 +59,7 @@ val AUDI_MIB3 = HeadUnitProfile(
 **② 注册**
 
 ```kotlin
-val all: List<HeadUnitProfile> = listOf(BMW_ID85, WINPLAY, AUDI_MIB3)
+val all: List<HeadUnitProfile> = listOf(BMW_ID85, GENERIC, WINPLAY, AUDI_MIB3)
 ```
 
 设置页与引导卡会自动多出一项（UI 遍历 `all`，不需要改 UI）。
@@ -89,6 +89,30 @@ val all: List<HeadUnitProfile> = listOf(BMW_ID85, WINPLAY, AUDI_MIB3)
 未知项：EA 会话是否需要、`/info` 是否只认 POST、AirPlay 端口、是否校验 deviceID、
 是否广播 `_airplay._tcp`。首次上车按第 3 节逐项校准后把 `verified` 改 `true`。
 
+**③.6 通用档案（`id=generic`）**
+
+不认识的车型选它。它是 0.27 与 [`shaonialife/cardeck`](https://github.com/shaonialife/cardeck)
+（0.1.28）两份「已跑通」流程的并集。两者之间真正不一致的只有 **档案 A 拆不拆链**；
+端点与电源这两项按统一约定取值（0.27 与 cardeck 的方案都归到这一条，不再有「写死 7000」
+或「不回电源」的变体）：**AirPlay 端点 mDNS `_airplay._tcp` 优先、拿不到退 7000**；
+**`0xAE00` 一律回 3 条 `0xAE01`**。
+
+| 项 | 0.27 | cardeck | 通用档案 |
+|---|---|---|---|
+| `0x4300` / `0xEA00` / `0x4E0E` | 全发 | 全发 | **全发**（`sendCarPlayAvailability` / `openEaSessions` / `sendTransportIdentifier` 都 `true`） |
+| 出站前断 HFP/A2DP | 断，先等 8s 让车机连入 | 断（「只配对、不连接」） | **断**（`dropProfilesBeforeIap2=true`，保留 8s 等待） |
+| 档案 A（车机没开无线窗口） | 主动结束会话 | 不拆链 | **不拆**（`abortWhenCarPlayWindowClosed=false`；拆链会丢 CarPlay 图标） |
+| AirPlay 端点 | 写死 7000+网关兜底 | mDNS `_airplay._tcp` + 7000 兜底 | **mDNS 优先，拿不到退 7000**（`preferMdnsAirplay=true`、`fallbackAirplayPorts=[7000]`；0.27 写死 7000 遇 `455` 连不上） |
+| `0xAE00` → `0xAE01` | 不处理 | 不处理 | **回 3 条真机字节**（`replyPowerUpdates=true`，按真 iPhone 行为补上） |
+
+`verified=true` 的依据：0.27 在宝马 MGU-55 实车跑通（用户现场 A/B），cardeck 在奥迪 MIB3
+实测；mDNS 端点发现自 0.29 起在宝马/奥迪路径上实测。未知车型仍建议先抓一轮日志确认
+`0x4300` / `0xEA00` 有没有发、`MDNS:` 有没有解析到端口，再决定要不要按第 3 节改字段。
+
+> 要严格复刻 0.27：把 `abortWhenCarPlayWindowClosed` 改 `true`、`preferMdnsAirplay` 改 `false`、
+> `replyPowerUpdates` 改 `false` 即可（`fallbackAirplayPorts` 已是 `[7000]`，正好等于 0.27 的写死端口），
+> 代码不用动。
+
 **④ 把结论写回 `notes`**
 
 `notes` 是给下一个开发者/用户看的，写清"为什么是这个值"，避免以后再踩一遍。
@@ -97,7 +121,8 @@ val all: List<HeadUnitProfile> = listOf(BMW_ID85, WINPLAY, AUDI_MIB3)
 
 | 现象 | 先查 |
 |---|---|
-| 车机上**CarPlay 图标消失**、手机只剩"电话/语音" | ① `sendCarPlayAvailability` 必须 `true`（`0x4300` 带传输标识，车机靠它把设备认成 CarPlay）；② `abortWhenCarPlayWindowClosed` 必须 `false`（拆链会让车机收起图标）；③ `dropProfilesBeforeIap2` 必须 `false`（断了 HFP/A2DP 会把 ACL 一起拽掉）；④ `0x4301` 等不到**不等于**设备身份有问题——先按上面三条恢复，再让车机重新配对一次 |
+| 车机上**CarPlay 图标消失**、手机只剩"电话/语音" | ① `sendCarPlayAvailability` 必须 `true`（`0x4300` 带传输标识，车机靠它把设备认成 CarPlay）；② `abortWhenCarPlayWindowClosed` 必须 `false`（拆链会让车机收起图标）；③ **宝马**的 `dropProfilesBeforeIap2` 必须 `false`（断了 HFP/A2DP 会把 ACL 一起拽掉；通用/奥迪档案相反，要 `true`）；④ `0x4301` 等不到**不等于**设备身份有问题——先按上面三条恢复，再让车机重新配对一次 |
+| 换了一台**没有对应档案**的车机 | 设置里先选 `通用（0.27）`：0.27 的消息集 + cardeck 的端点发现。仍不通再按本表逐项调，调好后按 §2 加一个专属档案 |
 | 车机**根本不发起 iAP2**（日志 `XXXs 内车机一次都没发起 iAP2`） | 就是上一行的①②③之一造成的车机侧降级；代码修复后需要**在 iDrive 里删掉本机重新配对**才会重新认可 |
 | 能连上但**触摸点不准** | `touchDisplay`（接收端 `_info` 报 0×0 时必须给） |
 | 连不上且日志提示 `403` | `validatesDeviceId` + 设置里手动填真实蓝牙 MAC |
@@ -116,7 +141,7 @@ val all: List<HeadUnitProfile> = listOf(BMW_ID85, WINPLAY, AUDI_MIB3)
 
 ## 5. 远程下发：新增车型不发版
 
-内置档案（`BMW_ID85` / `WINPLAY` / `AUDI_MIB3`）改一次就要重新出包、装 APK。
+内置档案（`BMW_ID85` / `GENERIC` / `WINPLAY` / `AUDI_MIB3`）改一次就要重新出包、装 APK。
 为了让「加一台车机」变成纯配置动作，App 支持从 GitHub 拉一份 JSON：
 
 ```

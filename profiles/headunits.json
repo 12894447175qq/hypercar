@@ -27,6 +27,26 @@
       "pairingHint": "首次要在 iDrive 里把这个设备选成 CarPlay 手机（车机会弹确认）"
     },
     {
+      "id": "generic",
+      "label": "通用配置",
+      "model": "任意车机 / 未知车型",
+      "notes": "0.27 基线 + cardeck 通用序列：0x4300/0xEA00/0x4E0E 全发，发 iAP2 前先断 HFP/A2DP，不主动拆链；端点先查 mDNS `_airplay._tcp`，拿不到退 7000。与 0.27 只差两处：档案 A 不拆链（拆链会丢 CarPlay 图标）、mDNS 优先（0.27 写死 7000，遇 455 连不上）。",
+      "verified": true,
+      "validatesDeviceId": false,
+      "sendCarPlayAvailability": true,
+      "openEaSessions": true,
+      "sendTransportIdentifier": true,
+      "replyPowerUpdates": true,
+      "dropProfilesBeforeIap2": true,
+      "abortWhenCarPlayWindowClosed": false,
+      "preferMdnsAirplay": true,
+      "fallbackAirplayPorts": [
+        7000
+      ],
+      "keepIap2AliveOnly": false,
+      "pairingHint": "首次要在车机里把本机选成 CarPlay 手机（部分车机会弹确认）"
+    },
+    {
       "id": "winplay",
       "label": "WinPlay",
       "model": "PC AirPlay 接收端",
