@@ -1452,7 +1452,15 @@ object HyperCarRepo {
                     }.isSuccess
                 }
                 if (alive) {
-                    log("SESSION: ✓ 上次成功的端点 ${host}:${port} 仍然可连——直接用（跳过发现）")
+                    log("SESSION: ✓ 上次成功的端点 ${host}:${port} 仍然可连——直接用它（跳过发现）")
+                    // 注意：**端点省了，iAP2 不能省**。真 iPhone 在整个 AirPlay 会话期间
+                    // 都保持 iAP2 链路，车机也靠它维持 CarPlay 窗口；我们若跳过 iAP2，
+                    // ACL 空闲几十秒就被车机拆掉——CarWith 的「选择车机蓝牙」列表里就
+                    // 看不到这台车了，连下一步都点不下去（现场反馈 2026-10-25）。
+                    // 这里只把回调丢掉：端点已定，0x5703/0x4301 来了也不需要。
+                    coordinator.start { ep ->
+                        log("IAP2: 后台会话端点回调（忽略，端点已定）ips=${ep.ipAddresses}")
+                    }
                     return@withTimeoutOrNull CarPlayEndpoint(
                         ssid = currentSsid,
                         passphrase = null,
