@@ -1,4 +1,4 @@
-package io.github.hypercar.headunit
+﻿package io.github.hypercar.headunit
 
 import io.github.hypercar.settings.SettingsStore
 
@@ -109,7 +109,7 @@ object HeadUnitProfiles {
         openEaSessions = true,
         sendTransportIdentifier = true,
         replyPowerUpdates = true,
-        dropProfilesBeforeIap2 = false,
+        dropProfilesBeforeIap2 = true,
         abortWhenCarPlayWindowClosed = false,
         preferMdnsAirplay = true,
         fallbackAirplayPorts = listOf(7000, 7001, 7100),
@@ -223,6 +223,7 @@ object HeadUnitProfiles {
     /** 当前设置里选中的档案。 */
     fun current(): HeadUnitProfile = byId(SettingsStore.headUnitProfileId)
 }
+
 
 
 
