@@ -211,38 +211,38 @@ private fun Header(
                 borderColor = CoralError.copy(alpha = 0.5f),
                 leadingIcon = Icons.Rounded.DeleteOutline,
             )
+            // 一键反馈：预填 GitHub Issue（标题/环境/日志尾部）+ 完整日志进剪贴板。
+            // 不做"静默创建"：GitHub 写 Issue 需要 token，APK 里放 token 等于公开泄露；
+            // 预填 URL + 浏览器打开是零配置方案，用户点一下 Submit 就成。
+            // 注意 URL 预算只有 1.6k（实测 ~7.1k 就 500，见 GitHubFeedback.MAX_URL_CHARS）。
+            val context = LocalContext.current
+            CapsuleButton(
+                text = "反馈",
+                onClick = {
+                    // 先把文件也导出一份：Issue 里可以直接拖附件，比纯文本更好读
+                    HyperCarRepo.exportLogs()
+                    val prepared = GitHubFeedback.prepare(context, logs)
+                    clipboard.setText(AnnotatedString(prepared.clipboard))
+                    val opened = GitHubFeedback.open(context, prepared.url)
+                    onFeedback(
+                        if (opened) {
+                            "已复制完整日志并打开 GitHub（需已登录）：在正文末尾粘贴、点 Submit 即可" +
+                                "（可再把导出的 .txt 拖进去）"
+                        } else {
+                            "完整日志已复制，但没有可打开链接的应用——" +
+                                "请到 github.com/${GitHubFeedback.REPO}/issues 新建后粘贴"
+                        },
+                    )
+                },
+                modifier = Modifier
+                    .weight(1f)
+                    .height(44.dp),
+                filled = true,
+                containerColor = ElectricCyan,
+                contentColor = io.github.hypercar.ui.theme.DeepSpace,
+                borderColor = ElectricCyan,
+            )
         }
-        Spacer(modifier = Modifier.height(8.dp))
-        // 一键反馈：预填 GitHub Issue（标题/环境/日志尾部）+ 完整日志进剪贴板。
-        // 不做"静默创建"：GitHub 写 Issue 需要 token，APK 里放 token 等于公开泄露；
-        // 预填 URL + 浏览器打开是零配置方案，用户点一下 Submit 就成。
-        val context = LocalContext.current
-        CapsuleButton(
-            text = if (logs.isEmpty()) "反馈到 GitHub" else "反馈到 GitHub（自动带日志）",
-            onClick = {
-                // 先把文件也导出一份：Issue 里可以直接拖附件，比纯文本更好读
-                HyperCarRepo.exportLogs()
-                val prepared = GitHubFeedback.prepare(context, logs)
-                clipboard.setText(AnnotatedString(prepared.clipboard))
-                val opened = GitHubFeedback.open(context, prepared.url)
-                onFeedback(
-                    if (opened) {
-                        "已复制完整日志并打开 GitHub（需已登录）：粘贴正文、点 Submit 即可" +
-                            "（预填 ${prepared.prefilledLines} 行，附件可拖导出的 .txt）"
-                    } else {
-                        "完整日志已复制，但没有可打开链接的应用——" +
-                            "请到 github.com/${GitHubFeedback.REPO}/issues 新建后粘贴"
-                    },
-                )
-            },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(44.dp),
-            filled = true,
-            containerColor = ElectricCyan,
-            contentColor = io.github.hypercar.ui.theme.DeepSpace,
-            borderColor = ElectricCyan,
-        )
     }
 }
 

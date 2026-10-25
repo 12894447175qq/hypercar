@@ -34,7 +34,17 @@ object GitHubFeedback {
      * 预填 URL 的安全长度。GitHub 侧没有公开的硬限制，但 8KB 以上的 URL 在部分浏览器/
      * WebView/GitHub App 里会被截断或拒绝，这里留足余量。
      */
-    private const val MAX_URL_CHARS = 7_600
+    /**
+     * 预填 URL 的安全长度。
+     *
+     * **实测（2026-10-25，`Invoke-WebRequest` 对 `…/issues/new?title=…&body=…` 探边）**：
+     * URL ≈ 6.9k 字符仍然正常（302 到登录页），**≈ 7.1k 起 GitHub 直接 500**
+     * （就是页面上那句 "Looks like something went wrong!"）。
+     * 而且未登录时会先跳 `login?return_to=<整条 URL 再做一次百分号编码>`，等于翻倍；
+     * 所以这里压到 **2.2k**（登录往返后 ~4.4k，仍远低于 7k），正文只留环境与现象，
+     * 完整日志走剪贴板 + 导出的 .txt 附件。
+     */
+    private const val MAX_URL_CHARS = 2_200
 
     /** 准备好的一次反馈。 */
     data class Prepared(
@@ -42,14 +52,15 @@ object GitHubFeedback {
         val url: String,
         /** 复制到剪贴板的内容（完整日志 + 环境块）。 */
         val clipboard: String,
-        /** 预填正文里包含了多少行日志（其余在剪贴板里）。 */
-        val prefilledLines: Int,
-        /** 预填正文是否因长度限制截断过日志。 */
-        val truncated: Boolean,
+        /** 预填 URL 的长度（排查"又 500 了"时能直接看出来）。 */
+        val urlChars: Int,
     )
 
     /**
-     * 组装反馈内容：标题、环境块、日志尾部、剪贴板全文。
+     * 组装反馈内容：标题、环境块、剪贴板全文。
+     *
+     * **正文里不放日志**：一条中文日志行 URL 编码后要 ~500 字符，塞两行就把预算吃光，
+     * 而且 7k 以上直接 500。日志走剪贴板 + 导出的 .txt 附件，正文只留环境与现象。
      *
      * @param logs 诊断页当前持有的日志（**旧 → 新**顺序，与页面显示相反）。
      */
@@ -60,48 +71,36 @@ object GitHubFeedback {
         val profile = HeadUnitProfiles.current()
         val car = SettingsStore.targetCarName?.takeIf { it.isNotBlank() } ?: profile.label
         val version = DeviceInfo.appVersion(context)
-        val title = "[反馈] ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} · $car · HyperCar $version"
+        val title = "[反馈] ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} · $car · $version"
             .replace('\n', ' ')
-            .take(120)
+            .take(100)
 
-        val header =
+        // 正文刻意做"短"：环境三行 + 现象占位 + 日志说明，约 300 字符。
+        val body =
             buildString {
-                appendLine("### 环境")
-                appendLine("- HyperCar：$version")
-                appendLine("- 设备：${DeviceInfo.systemSummary()}")
-                appendLine("- 目标车机：$car（档案 ${profile.id}）")
-                appendLine()
-                appendLine("### 发生了什么")
-                appendLine(
-                    "<!-- 一句话说明：连不上 / CarPlay 图标不出现 / 黑屏 / 触摸不准 / 没声音 / 其他；" +
-                        "什么时候开始的、能否复现、车机上有什么提示 -->",
-                )
-                appendLine()
-                appendLine("### 日志（尾部）")
-                appendLine("```text")
+                append("**环境**\n")
+                append("- HyperCar：$version\n")
+                append("- 设备：${DeviceInfo.systemSummary()}\n")
+                append("- 车机：$car（档案 ${profile.id}）\n\n")
+                append("**现象**：<!-- 一句话：连不上 / 图标不出现 / 黑屏 / 触摸 / 声音 -->\n\n")
+                append("**日志**：完整日志已在剪贴板（点正文末尾粘贴），也可把「导出」生成的 .txt 拖进来。\n\n")
+                append("> 日志可能含车机名/SSID/蓝牙 MAC，介意可自行打码。")
             }
-        val footer =
-            "\n```\n\n" +
-                "> 剪贴板里是**完整日志**（开头还有一行环境自述）：在正文末尾粘贴一次即可。\n" +
-                "> 也可以在「诊断」页点「导出」，把 `下载/HyperCar/*.txt` 直接拖进本 Issue 当附件。\n" +
-                "> ⚠ 日志里可能含车机名称 / 热点 SSID / 蓝牙 MAC，介意可先自行打码；" +
-                "提交前请留意不要带上私人信息。"
-
-        // 按 URL 预算挑日志：从最新一行往前取，直到再放一行就超长。
-        val budgetChars = MAX_URL_CHARS - (NEW_ISSUE_URL.length + encode(title).length + encode(header).length + encode(footer).length + 64)
-        var used = 0
-        val picked = ArrayList<String>()
-        for (index in logs.indices.reversed()) {
-            val line = logs[index]
-            val cost = encode(line).length + 3 // '\n' 与保险
-            if (used + cost > budgetChars) break
-            picked.add(0, line)
-            used += cost
-        }
-        val truncated = picked.size < logs.size
-
-        val body = header + picked.joinToString("\n") + footer
-        val url = "$NEW_ISSUE_URL?title=${encode(title)}&body=${encode(body)}"
+        val fullUrl = "$NEW_ISSUE_URL?title=${encode(title)}&body=${encode(body)}"
+        // 防御：自定义 ROM 的 Build.DISPLAY/INCREMENTAL 可能特别长，超过预算就退化成最短正文
+        // （GitHub 在 ~7.1k 会 500，这里宁可少写环境，也不能让按钮点了报错）。
+        val url =
+            if (fullUrl.length <= MAX_URL_CHARS) {
+                fullUrl
+            } else {
+                val compact =
+                    "**环境**\n- HyperCar：$version\n" +
+                        "- 设备：${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}" +
+                        "｜Android ${android.os.Build.VERSION.RELEASE}（SDK ${android.os.Build.VERSION.SDK_INT}）\n" +
+                        "- 车机：$car（档案 ${profile.id}）\n\n" +
+                        "**日志**：完整日志已在剪贴板，粘贴在正文末尾（也可拖入导出的 .txt）。"
+                "$NEW_ISSUE_URL?title=${encode(title)}&body=${encode(compact)}"
+            }
 
         val clipboard =
             buildString {
@@ -111,7 +110,7 @@ object GitHubFeedback {
                 logs.forEach { appendLine(it) }
             }
 
-        return Prepared(url = url, clipboard = clipboard, prefilledLines = picked.size, truncated = truncated)
+        return Prepared(url = url, clipboard = clipboard, urlChars = url.length)
     }
 
     /** 用系统浏览器/ GitHub App 打开预填地址；返回是否成功拉起（没有可用应用时为 false）。 */
@@ -125,5 +124,9 @@ object GitHubFeedback {
             )
         }.isSuccess
 
-    private fun encode(text: String): String = URLEncoder.encode(text, "UTF-8")
+    /**
+     * 百分号编码。空格用 `%20` 而不是 `+`：`+` 在 query 里虽然等价于空格，
+     * 但 GitHub 预填/部分浏览器会把 `+` 原样显示在正文里（预填后满屏加号）。
+     */
+    private fun encode(text: String): String = URLEncoder.encode(text, "UTF-8").replace("+", "%20")
 }
