@@ -1645,3 +1645,200 @@ CARLIFE: 首帧视频未到——第 9 次补发 LAUNCH_MODE_NORMAL + VIDEO_ENCO
 → 结论：**CarLife 视频源在非 root 下无解**（三条根因各自独立：协议缺 LAUNCH_MODE、需要前台、需要客户端 surface；
 前两条已解决，第三条必须由 CarWith 那种系统应用提供）。
 实验开关保持默认关闭；方案 A（CarPlay 稳定）继续。
+
+---
+
+> ⚠ **本节结论已作废**（2026-10-27 反编译定谳）：Qin:0 不是因为"缺客户端 Surface"。
+> 编码器的 input surface 由 CarLife 自己 createInputSurface() 持有，真正被短路的是
+> CarlifeSurfaceWrapper.bindEncodeSurface() 里的 openglRenderType()==0 早退。
+> 详见 §24。
+
+---
+
+## 24. 视频源攻坚：反编译定谳（2026-10-27 凌晨）
+
+本节把 §19~§23 关于「CarLife 为什么不出画面」的猜测全部收敛成**有代码位置的结论**，
+并记录 2026-10-27 凌晨做过的四次实测（协议加固、公版换装、重签补丁、超级投屏）。
+
+### 24.1 一句话结论
+
+> `Qin:0` 与协议无关、与 Surface 归属无关、与前后台无关。
+> **CarLife 的 GL 渲染线程被一个"只有 CarWith 会应答的远端动作"挡住了**，
+> 没有 CarWith 它根本不会把画面渲染进编码器的 input surface。
+
+### 24.2 完整证据链（jadx 反编译 `com.baidu.carlife.xiaomi` 8.8.5）
+
+工具与产物见 24.9。逐环如下（行号为反编译产物行号）：
+
+```java
+// ① 本 APK 把自己钉死成"小米定制版"
+CarLifeApplication.onCreate():47
+    CarlifeCoreSDK.getInstance().setPhoneSdk("sdk.build.xiaomi");
+CarlifeCoreSDK.setPhoneSdk():433-435
+    MixConfig.getInstance().setSdkBuild(str);
+MixConfig.isMix4Xiaomi():92-93
+    return "sdk.build.xiaomi".equalsIgnoreCase(mSdkBuild);      // → 恒 true
+
+// ② 编码器起来了，input surface 也由它自己持有（不是外部给的）
+Recorder.initMediaCodec():1239
+    this.mEncSurface = this.mEncoder.createInputSurface();
+Recorder.handleConnectEstablished():1273-1279
+    CarlifeSurfaceWrapper.getInstance().bindEncodeSurface(w, h, mEncSurface);
+    MixConnectManager.getInstance().onConnectEstablished();
+    mEncoder.start();                                          // ← 日志 STARTED 的来源
+
+// ③ 闸门：GL 渲染线程被一行 return 短路
+CarlifeSurfaceWrapper.bindEncodeSurface():82-91
+    if (getInstance().openglRenderType() == 0) {
+        return;                                                // ← 什么都不做
+    }
+    mTextureSufaceHelper.initRender(surface, w, h);
+    mTextureSufaceHelper.start();
+
+CarlifeSurfaceWrapper.openglRenderType():49-80
+    if (!isMix4Vivo() && !isMix4OPPO() && !isMix4SamsungSdk()
+            && !isMix4Honor() && !isMix4Xiaomi()) {
+        return 1;                                              // 非定制包：直接 OPENGL_OPEN
+    }
+    Bundle b = MixActionDispatcher.getInstance()
+                   .dispatcherAction(Actions.CarLife.CARLIFE_USE_OPENGL);
+    ...
+    if (!isMix4SamsungSdk() && !isMix4Honor()) {
+        return 0;                                              // ← 我们落这里：OPENGL_CLOSE
+    }
+
+// ④ 该 action 只有一个"远端"处理者
+Actions.CarLife.CARLIFE_USE_OPENGL = "use_carlife_opengl"
+处理者：RemoteActionProcessorProxy（注册在 CarLifeApplication:87）
+    invokeMethod():80-91
+        return MixPhoneStrategy.getInstance().getMixCastManager().invokeMethod(intent);
+        // getMixCastManager() 为 CarWith 侧 Binder；没有它就 return null
+其余两个处理器（DcsActionProcessor / CarLifeMixActionProcessor）都不认这个 action
+（CarLifeMixActionProcessor.MAIN_ACTIONS 里没有 CARLIFE_USE_OPENGL）。
+```
+
+**因果链**：GL 没起来 → `TextureSufaceHelper` 未初始化 →
+`ScreenCarlifeImpl.prepareCarLifeCast()` 里 `createCarlifeSurface()` 拿不到可用 Surface →
+`CarLifePresentationController.showCarlifePresentaion()` 不渲染 →
+编码器 input surface 永远收不到帧 → **`Qin:0`**。
+
+### 24.3 由此修正的三条旧认知
+
+| 旧认知 | 实际情况 |
+|---|---|
+| "CarLife 缺客户端 Surface 才会有 Qin:0" | ❌ 编码器自己持有 input surface，不需要外部 Surface |
+| "小米把 VirtualDisplay 代码阉割了" | ❌ 代码都在（`DisplayUtils.createVirtualDisplay`、`TextureSufaceHelper`、`ScreenCarlifeImpl`），只是被 24.2③ 短路 |
+| "盒子当 HU 能出画面是因为盒子做对了什么" | ⚠ 是因为 **CarWith 在驱动**（CarWith 应答 `use_carlife_opengl`），CarLife 才肯渲染 |
+
+### 24.4 实测一：协议侧加固（提交 `60c783a`）
+
+改动（`rust-core/src/carlife.rs`）：
+1. `MD_FEATURE_CONFIG_REQUEST` 回显时把值为 0 的项提升为 1；
+2. 首帧未到时除 `LAUNCH_MODE_NORMAL + VIDEO_ENCODER_START` 外，追加
+   `MSG_CMD_GO_TO_FOREGROUND (0x18025)` 与
+   `MSG_CMD_MODULE_CONTROL (0x18028, CarlifeModuleStatusList{cnt=1, moduleStatus{moduleID=1, statusID=1}})`。
+
+结果（0.1.0.200，02:04~02:05）：
+
+```
+[Phase 1..8] 全部完成（含 LAUNCH_MODE_NORMAL）
+MD 特性请求解析为空（0B）——回默认集合        ← 新发现：CarLife 发的是空请求
+[video-debug-enc] STARTED … Qin:0, DQin:0/0, Render:0, encode:0, DQout:0/99
+首帧视频未到——第 N 次补发 …（Phase 1 在 18s 内被重发 17 次）
+```
+
+**结论**：协议侧不是闸门。附带两个事实：
+- `MD_FEATURE_CONFIG_REQUEST` 的 payload 是 **0 字节**——不是我们回错，是它不问；
+- Phase 8 之后 CarLife 会关掉 CMD 连接，我们的"断了就重连"策略让它反复重来（后续应改成"握手完成后不盲目重连"）。
+
+### 24.5 实测二：换装公版 `com.baidu.carlife` 8.9.5
+
+假设：公版 `SDK_BUILD=main` → `isMix4Xiaomi()==false` → `openglRenderType()` 直接返回 1 → 不再需要 CarWith。
+
+实测（02:21~02:26，小米版已 `pm disable-user` 隔离，确保只有公版在跑）：
+
+```
+com.baidu.carlife 8.9.5 启动后即监听 7240/8240/9340
+我们发 HU_PROTOCOL_VERSION(3.2) → 公版不回版本匹配
+Phase 1 卡死，每 ~2s 重发；公版进程无 video-debug-enc
+```
+
+**结论**：公版**同样不接受**我们的 HU 握手。结合 §24.3 的第三条，
+可以判定：**历史上那些"Phase 1~8 走完"的会话，很可能是 CarWith 把 CarLife 推进去的，我们只是搭便车**。
+这一点尚未用抓包坐实（见 24.11 B）。
+
+### 24.6 实测三：重签补丁（改 `sdk.build.main` + 改包名）
+
+做法：
+- `apktool d` → 改 `CarLifeApplication.smali:270` 的 `"sdk.build.xiaomi"` → `"sdk.build.main"`；
+- manifest `package` 与 12 处 `com.baidu.carlife.xiaomi*`（含 6 个 authorities、进程名、自定义权限）→ `com.hypercar.carlife`；
+- `zipalign` + `apksigner`（自签 keystore）→ 安装。
+
+结果：
+- 包能装、能启动、也能自己监听 7240/8240/9340（说明补丁本身生效）；
+- **但应用启动/运行时提示"签名不对"** —— 自校验失败，功能不可用。
+- Java 层没找到显式校验（`GET_SIGNATURES` / `signingInfo` 只命中 androidx 与百度登录 SDK），
+  判断校验在 native（`libcarlife*.so`）或混淆类中。
+
+**结论**：**重签这条路不可行**，除非同时逆向掉 native 校验。产物保留在
+`D:\devtools\carlife-patched2-signed.apk`（仅供研究，不要装到主力机）。
+
+### 24.7 实测四：超级投屏（SuperCast）
+
+公版界面里有「投屏」入口，用户已在 PC 上通过百度网页完成解锁（需要 adb）。
+解锁后点击投屏 → 应用提示 **"需要连接车机"**。
+
+**结论**：超级投屏依赖已有 CarLife 车机连接，不能作为绕过握手的手段。
+即"先有连接，才有画面"，与 24.2 的结论一致（连接 → CarWith 应答 → GL 起来 → 才有渲染）。
+
+### 24.8 CarLife 日志：xlog 加密，读不到明文
+
+- 路径：`/sdcard/Android/data/com.baidu.carlife/files/xLog/carlife_YYYYMMDD.xlog`
+- 文件头 `09 01 00 02 02 55 01 00 00 ...`，随后是二进制；
+- 扫描全文件 **找不到任何 zlib 块**（78 01/9C/DA），判断为加密写盘。
+
+**结论**：不能靠读 CarLife 自己的日志来定位问题，只能靠反编译 + 抓包。
+
+### 24.9 复现清单（工具与产物）
+
+| 用途 | 路径 |
+|---|---|
+| jadx CLI（1.5.0） | `D:\devtools\jadx\bin\jadx.bat`（配 `JAVA_HOME=D:\devtools\jdk17`） |
+| 反编译产物（8.8.5，12207 个 java） | `D:\devtools\jadx-out\sources\` |
+| apktool（2.9.3） | `D:\devtools\apktool\apktool.jar` |
+| 解包目录（打过补丁） | `D:\devtools\carlife-patch\` |
+| 补丁 APK（含自签） | `D:\devtools\carlife-patched2-signed.apk` |
+| 原始小米版 APK（还原用） | `D:\devtools\carlife-apk\base.apk`（8.8.5/274） |
+| CarWith APK | `D:\devtools\carlink-apk\base.apk`（8.9.5 时代） |
+| 自签 keystore | `D:\devtools\hypercar-sign\carlife.keystore`（口令 hypercar123） |
+
+设备侧状态（2026-10-27 02:40 收尾时）：
+`com.baidu.carlife.xiaomi` 8.8.5（已 `pm enable`，CarWith 可正常用）、
+`com.baidu.carlife` 8.9.5（公版，共存）、HyperCar 0.1.0.200。
+
+### 24.10 一句话给未来的自己
+
+> 别再试着"给 CarLife 喂 Surface"或"改装公版"了。
+> 它要的是 **CarWith 那个远端应答 `use_carlife_opengl`**；没有 CarWith，
+> 它连自己的落地页都不会去渲染。判断一个方向是否值得做，只看一条：
+> **能不能让 `openglRenderType()` 返回 1。**
+
+### 24.11 下一步（按成本排序）
+
+**A. 反编译公版 8.9.5，查它为什么不应答我们的 CMD 握手**
+重点：
+- `ConnectClient` 在 TCP accept 之后的分发前置条件（是否需要先收到 `MSG_PORT_ESTABLISH(52480)`）；
+- `setBoxAuthorized(0/1/2/3)` 的触发点（`BoxConnectClient:114-123`、`BleBluetoothDiscover:235`、`FeatureConfigManager:301`）
+  —— 谁是"已授权的盒子"，靠什么动作授权（UDP 7999 发现？热点直连？扫码？）。
+
+**B. 用真盒子 + PC 中间人抓一次成功握手**
+把手机与盒子之间的 7240 流量经 PC 代理（盒子→PC→手机），拿到真实握手的**字节序**，
+再照着复刻。这是最可能一次成功的路线。
+
+**C. 收手，回到自绘界面**
+分支 `feat/carplay-only-ui`（提交 `2f328bb`：删除 CarLife 与 hub，只留 AirPlay 链路）已构建验证。
+`nativePushVideoFrame` / `nativeSetVideoSize` / `nativePushAudioPcm` 三个 JNI 已就位，
+接上"自绘界面 + 自编码"即可出画面，**不依赖 CarLife 的任何行为**。
+
+> 判断标准：若 A 在 1 小时内拿不到"握手前置条件"的明确线索，直接转 B；
+> 若 B 也无法在当晚拿到抓包，转 C。
