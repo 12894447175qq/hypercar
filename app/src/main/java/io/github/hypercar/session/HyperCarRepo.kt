@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.session
+package io.github.hypercar.session
 
 import android.bluetooth.BluetoothDevice
 import android.content.Context
@@ -623,13 +623,9 @@ object HyperCarRepo {
             // 只有 7240 在监听还不够：CarLife 被系统/后台拉起、服务还没起全时，
             // 7240 能连、8240/9240 却一律 refused，于是拨号模式连了个"空壳"，
             // 之后一直 `连 MD … Connection refused` 死循环（2026-10-26 01:11 现场）。
-            // 再验一条媒体端口，不全就退回 HU 监听模式（自己占住 7240 等真 HU 连进来）。
-            val mediaOk = mdHost == null || runCatching {
-                java.net.Socket().use { s ->
-                    s.connect(java.net.InetSocketAddress("127.0.0.1", CARLIFE_VIDEO_PORT), 400)
-                }
-                true
-            }.getOrDefault(false)
+            // **仍然只用零接触探测**（bind 冲突）：绝不能再 Socket().connect(8240)——
+            // 那会把 CarLife 的视频 accept 抢走，后面 Rust 拨进去一帧都收不到。
+            val mediaOk = mdHost == null || isLocalPortListening(CARLIFE_VIDEO_PORT)
             if (mdHost != null && !mediaOk) {
                 log("CARLIFE: 7240 在监听但 $CARLIFE_VIDEO_PORT 连不上——CarLife 是空壳，改走 HU 监听模式")
             }
@@ -705,11 +701,15 @@ object HyperCarRepo {
      * 既打扰车机，也会不断制造「ACL 断开」事件。
      */
     private fun releaseSessionResources() {
+        val wasDialMode = carLifeDialMode
         carLifeDialMode = false
         sessionMdHost = null
         streaming = false
         stopVoiceMic()
         runCatching { RustCoreBridge.nativeStop() }
+        // Rust 引擎停了之后清理本机 CarLife：否则它会留下"半死空壳"（7240 还占着、
+        // 内部状态机停在上一轮 Phase 7），下次上车连上去永远不回 Phase 1。
+        stopLocalCarLife(wasDialMode)
         runCatching { iap2?.stop() }
         iap2 = null
         runCatching { ctrlAdvertiser?.stop() }
@@ -1475,13 +1475,31 @@ object HyperCarRepo {
      *
      * [onAttempt] 用于等待期间补发唤醒广播（CarLife 启动慢，单次广播容易错过）。
      */
-    /** 单次探测 127.0.0.1:7240 是否在监听（唤醒流程里用，不要阻塞）。 */
-    private fun probeCarLifeOnce(): Boolean = runCatching {
-        java.net.Socket().use { s ->
-            s.connect(java.net.InetSocketAddress("127.0.0.1", CARLIFE_CMD_PORT), 300)
+    /**
+     * **零接触**判断本机某端口是否已有人 LISTEN。
+     *
+     * **千万不要用 `Socket().connect()` 去探测**：CarLife 的 `ServerSocket.accept()` 只接一次，
+     * 我们连上又立刻 close，会被它当成「车机连上又断开」，直接把 CMD/VIDEO 线程踢回初始态
+     * （2026-10-26 现场：8240 被探测过一次之后，Rust 真正拨进去 0 字节、一帧视频都没有）。
+     *
+     * 这里用「bind 冲突」判断：能 bind 成功 = 没人监听（立刻关掉）；抛 `BindException` = 有人在听。
+     * **全程不产生任何 TCP 握手**，不会碰 CarLife 的 accept 队列。
+     */
+    private fun isLocalPortListening(port: Int): Boolean =
+        try {
+            java.net.ServerSocket().use { ss ->
+                ss.reuseAddress = false // 必须在 bind 前设：SO_REUSEADDR 会让「有监听」也绑得上
+                ss.bind(java.net.InetSocketAddress("127.0.0.1", port), 1)
+            }
+            false // 绑上了 → 没人监听（已立刻关掉）
+        } catch (_: java.net.BindException) {
+            true // EADDRINUSE → CarLife 正在 LISTEN
+        } catch (_: Throwable) {
+            false
         }
-        true
-    }.getOrDefault(false)
+
+    /** 单次零接触探测 127.0.0.1:7240 是否在监听（唤醒流程里用，不要阻塞）。 */
+    private fun probeCarLifeOnce(): Boolean = isLocalPortListening(CARLIFE_CMD_PORT)
 
     private fun probeLocalCarLifeMd(
         timeoutMillis: Long = CARLIFE_PROBE_TIMEOUT_MILLIS,
@@ -1492,14 +1510,8 @@ object HyperCarRepo {
         while (SystemClock.uptimeMillis() < deadline) {
             attempts++
             onAttempt?.invoke(attempts)
-            val listening =
-                runCatching {
-                    java.net.Socket().use { socket ->
-                        socket.connect(java.net.InetSocketAddress("127.0.0.1", CARLIFE_CMD_PORT), 200)
-                    }
-                }.isSuccess
-            if (listening) {
-                log("CARLIFE: 第 $attempts 次探测命中 127.0.0.1:$CARLIFE_CMD_PORT（CarLife 在监听）")
+            if (isLocalPortListening(CARLIFE_CMD_PORT)) {
+                log("CARLIFE: 第 $attempts 次零接触探测命中 127.0.0.1:$CARLIFE_CMD_PORT（CarLife 在监听）")
                 return "127.0.0.1"
             }
             try {
@@ -1538,16 +1550,36 @@ object HyperCarRepo {
         val directLaunch = "com.baidu.carlife.xiaomi/com.baidu.carlife.CarlifeActivity"
         if (ShizukuTools.isReady && pkg == "com.miui.carlink") {
             scope.launch {
-                // **Activity 优先**：实测只有走 Activity 这条路，CarLife 才会完整回 Phase 1~7
-                // （10098~100100 现场）；只拉 `CarlifeConnectService` 时它虽然一直监听 7240、
-                // 编码器也在跑，但**不给 HU 回 Phase 1**，握手永远停在"等版本匹配"
-                // （100101 现场）。所以先拉引擎页，3 秒内 7240 没起来才退回无界面服务。
+                // 目标 display：-1 = 主屏。-1 以外是实验开关（把 CarLife 投到副屏/虚拟屏，
+                // 主屏留给 HyperCar）。屏不存在时 am start 会失败，下面自动回退主屏。
+                val wakeDisplay = SettingsStore.carlifeWakeDisplay
+                if (wakeDisplay >= 0) {
+                    // 先把设备上现有的 display 打出来：填错 id 时一眼能看出来
+                    val dump = runCatching {
+                        ShizukuTools.exec(
+                            "dumpsys display | grep -E 'mDisplayId=|DisplayDeviceInfo\\{' | head -8",
+                            5_000,
+                        )
+                    }.getOrNull()
+                    dump?.out?.lineSequence()?.filter { it.isNotBlank() }?.forEach { line ->
+                        log("WAKE: 显示设备 $line")
+                    }
+                }
+                fun startArgs(display: Int): String =
+                    if (display >= 0) "-n $directLaunch --display $display" else "-n $directLaunch"
+
                 val started = runCatching {
-                    ShizukuTools.exec("am start -n $directLaunch", 8_000)
+                    ShizukuTools.exec("am start ${startArgs(wakeDisplay)}", 8_000)
                 }.getOrNull()
-                log("WAKE: 拉起 CarLife 引擎页 exit=${started?.code} " +
+                log("WAKE: 拉起 CarLife 引擎页（display=$wakeDisplay）exit=${started?.code} " +
                     started?.out?.lineSequence()?.firstOrNull().orEmpty().take(120))
                 kotlinx.coroutines.delay(3_000)
+                if (!probeCarLifeOnce() && wakeDisplay >= 0) {
+                    // 副屏方案不可用（这块屏不存在/不允许投）：退回主屏，别把 CarLife 弄没
+                    log("WAKE: display=$wakeDisplay 上没起来（7240 未监听）——回退主屏重试")
+                    runCatching { ShizukuTools.exec("am start ${startArgs(-1)}", 8_000) }
+                    kotlinx.coroutines.delay(3_000)
+                }
                 if (!probeCarLifeOnce()) {
                     val svc = runCatching {
                         ShizukuTools.exec(
@@ -1629,6 +1661,40 @@ object HyperCarRepo {
     private var appCtx: android.content.Context? = null
 
     private fun appContext(): android.content.Context? = appCtx
+
+    /**
+     * 下车/断开会话时清理本机 CarLife。
+     *
+     * 为什么必须清：小米 CarLife 断开后经常只关掉 8240 视频端口、却留着 `CarlifeConnectService`
+     * 继续占住 7240，内部状态机也不重置——下次上车连入 7240 它永远不回 Phase 1
+     * （2026-10-26 的"空壳"现场）。所以断链后：
+     *  ① 先发无线断开广播（无 Shizuku 的降级模式也能让 CarLife 自己收尾）；
+     *  ② 有 Shizuku 时再 `am force-stop` 掉 **CarLife 引擎包**（`com.baidu.carlife.xiaomi` /
+     *     `com.baidu.carlife`），**绝不杀 `com.miui.carlink`（CarWith 外壳）**——
+     *     它管着系统级蓝牙/连接状态，杀了反而要在车机上重新配对。
+     * @param wasDialMode 本轮是否走主动拨号（是则给 Rust 的 FIN 留 250ms 再强杀）。
+     */
+    private fun stopLocalCarLife(wasDialMode: Boolean) {
+        val ctx = appContext() ?: return
+        val configured = SettingsStore.carlifePackage
+        for (action in listOf(
+            "com.baidu.carlife.Action.StopWireless",
+            "com.baidu.carlife.Action.Disconnect",
+        )) {
+            runCatching {
+                ctx.sendBroadcast(android.content.Intent(action).setPackage(configured))
+            }
+        }
+        if (!ShizukuTools.isReady) return
+        scope.launch {
+            if (wasDialMode) kotlinx.coroutines.delay(250) // 让 Rust 的 PAUSE+FIN 先送到
+            for (pkg in listOf("com.baidu.carlife.xiaomi", "com.baidu.carlife")) {
+                if (pkg == "com.miui.carlink") continue
+                runCatching { ShizukuTools.exec("am force-stop $pkg", 4_000) }
+            }
+            log("CARLIFE: 已清理后台 CarLife 引擎进程（释放 7240~9340），下次上车重新拉起")
+        }
+    }
 
     // ---------------------------------------------------------------- 工具
 
@@ -2153,6 +2219,47 @@ object HyperCarRepo {
         SettingsStore.debugLogEnabled = enabled
         _snapshots.value = _snapshots.value.copy(logRecording = enabled)
         log("LOG: 日志记录已${if (enabled) "开启" else "暂停"}")
+    }
+
+    /**
+     * 诊断：把当前所有 display 打进行日志（判断有没有可投的副屏/虚拟屏）。
+     *
+     * 用途：设置页「CarLife 启动屏」要填 display id —— 主屏是 0，CarWith 这类实现会
+     * 在副屏（如 10）上跑。这里直接读 `dumpsys display`，把 id/名称/尺寸/flags 打出来，
+     * 就不用连电脑查了。仅当有 Shizuku 时可用（`dumpsys` 需要 shell 权限）。
+     */
+    fun dumpDisplays() {
+        if (!ShizukuTools.isReady) {
+            log("DISP: 需要 Shizuku 才能读 display 列表（dumpsys display）——先授权再点一次")
+            return
+        }
+        scope.launch {
+            val r = runCatching {
+                ShizukuTools.exec(
+                    "dumpsys display | grep -E 'mDisplayId=|DisplayDeviceInfo\\{|DisplayInfo\\{|mDisplayName=' | head -60",
+                    10_000,
+                )
+            }.getOrNull()
+            if (r == null || r.code != 0) {
+                log("DISP: dumpsys display 失败 exit=${r?.code} ${r?.out?.take(120).orEmpty()}")
+                return@launch
+            }
+            val lines = r.out
+                .lineSequence()
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .take(40)
+                .toList()
+            // 只认出 id 个数，先给一行结论，细节跟在后面
+            val ids = lines.mapNotNull { Regex("mDisplayId=(\\d+)").find(it)?.groupValues?.get(1) }
+                .distinct()
+            log(
+                "DISP: 共 ${lines.size} 行，含 display id = " +
+                    if (ids.isEmpty()) "（没解析到，往下看原始行）" else ids.joinToString(", ") +
+                        "；主屏=0，要投副屏就填上面出现的非 0 id",
+            )
+            lines.forEach { log("DISP: $it") }
+        }
     }
 
     /**

@@ -310,6 +310,7 @@ private fun MainContent() {
                         onToggleRecording = { HyperCarRepo.setLogRecording(it) },
                         onClearLogs = { HyperCarRepo.clearLogs() },
                         onExport = { HyperCarRepo.exportLogs() },
+                        onDumpDisplays = { HyperCarRepo.dumpDisplays() },
                     )
 
                     AppTab.About -> AboutScreen()

@@ -23,9 +23,10 @@
 //! 9 MD→HU 鉴权响应；10 HU→MD 鉴权结果；11 MD→HU 鉴权结果；
 //! 12 HU→MD 编码器初始化；13 MD→HU 初始化完成；14 HU→MD 开始推流。
 //!
-//! ## 触摸载荷（CTRL 通道，裸 BE 结构，非 protobuf）
-//! TOUCH_ACTION 0x68001：`[u32 BE action][u32 BE x][u32 BE y]`，action 0=DOWN/1=UP/2=MOVE；
-//! HARD_KEY 0x68008：`[u32 BE keycode]`。
+//! ## 触摸/硬按键载荷（CTRL 通道，**都是 protobuf**）
+//! TOUCH_ACTION 0x68001：`CarlifeTouchAction{1:action, 2:x, 3:y, 4:pointerx, 5:pointery}`
+//! （action 0=DOWN/1=UP/2=MOVE）；HARD_KEY 0x68008：`CarlifeCarHardKeyCode{1:keycode}`。
+//! 两者早期都发过裸 BE 结构，手机按 protobuf 解不出来 → 整段无效。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,6 +57,8 @@ const CMD_MD_INFO: u32 = 0x0001_0004;
 const CMD_VIDEO_ENCODER_INIT: u32 = 0x0001_8007;
 const CMD_VIDEO_ENCODER_INIT_DONE: u32 = 0x0001_0008;
 const CMD_VIDEO_ENCODER_START: u32 = 0x0001_8009;
+/// HU→MD：暂停编码（断开前发，让手机正常收尾，不留在半开状态）
+const CMD_VIDEO_ENCODER_PAUSE: u32 = 0x0001_800A;
 const CMD_SCREEN_ON: u32 = 0x0001_0018;
 const CMD_FOREGROUND: u32 = 0x0001_001B;
 const CMD_MD_MODULE_STATUS: u32 = 0x0001_0026;
@@ -92,6 +95,26 @@ pub const TOUCH_MOVE: u32 = 2;
 /// 协议版本（CarLifeWirelessBox 默认 v3.2，实测 CarWith 接受）。
 const PROTOCOL_MAJOR: u32 = 3;
 const PROTOCOL_MINOR: u32 = 2;
+
+// ---------------------------------------------------------------- 硬按键码（CarLife）
+//
+// `CarlifeCarHardKeyCode { int32 keycode = 1; }` 的 keycode 取值。
+// ⚠ 取值来自 CarLife 协议文档/社区逆向，**尚未在真车上逐条验证**；
+// 与旧代码相比关键修正：BACK=0x11（17），旧值 0x02 其实是电话键。
+pub const KEYCODE_HOME: u32 = 0x01;
+pub const KEYCODE_PHONE_CALL: u32 = 0x02;
+pub const KEYCODE_PHONE_END: u32 = 0x03;
+pub const KEYCODE_VR_START: u32 = 0x09;
+pub const KEYCODE_VR_STOP: u32 = 0x0A;
+pub const KEYCODE_MEDIA_NEXT: u32 = 0x0E;
+pub const KEYCODE_MEDIA_PREV: u32 = 0x0F;
+pub const KEYCODE_PLAY_PAUSE: u32 = 0x10;
+pub const KEYCODE_BACK: u32 = 0x11;
+pub const KEYCODE_MOVE_UP: u32 = 0x19;
+pub const KEYCODE_MOVE_DOWN: u32 = 0x1A;
+pub const KEYCODE_MOVE_LEFT: u32 = 0x1B;
+pub const KEYCODE_MOVE_RIGHT: u32 = 0x1C;
+pub const KEYCODE_OK: u32 = 0x1D;
 
 #[derive(Clone, Copy)]
 pub struct CarLifeConfig {
@@ -425,11 +448,21 @@ impl CarLifeHub {
         let ts = self.mic_start.elapsed().as_millis() as u32;
         let _ = self.mic_tx.send(build_media_frame(VR_MIC_DATA, ts, &payload));
     }
-    /// iDrive 旋钮/媒体键 → CarLife CTRL 通道 HARD_KEY。
+    /// iDrive 旋钮/媒体键 → CarLife CTRL 通道 HARD_KEY (0x00068008)。
+    ///
+    /// 载荷是 protobuf `CarlifeCarHardKeyCode { int32 keycode = 1; }`（tag 0x08 + varint），
+    /// **不是**裸 `[u32 BE keycode]`——和触摸一样，CarLife 按 protobuf 解，裸结构会被丢弃
+    /// （触摸那边踩过同样的坑，见 `inject_touch`）。
     pub fn inject_hard_key(&self, code: u32) {
+        let mut payload = Vec::with_capacity(4);
+        proto::varint(&mut payload, 1, code as u64);
+        emit_log(&format!(
+            "CTRL: 注入硬按键 keycode={code}（0x{code:02X}）protobuf={:02X?}",
+            payload
+        ));
         let _ = self
             .touch_tx
-            .send(build_cmd_frame(CTRL_HARD_KEY, &code.to_be_bytes()));
+            .send(build_cmd_frame(CTRL_HARD_KEY, &payload));
     }
 
     pub fn resolution(&self) -> (u32, u32) {
@@ -626,6 +659,9 @@ async fn handle_cmd_client(
 ) {
     let (mut rd, mut wr) = stream.into_split();
     let mut hs = Handshake::default();
+    let mut start_retries: u32 = 0;
+    // 本会话重新计"首帧"：上一轮的 true 不能让这一轮的补发逻辑失效
+    VIDEO_FIRST_FRAME_RECEIVED.store(false, std::sync::atomic::Ordering::Relaxed);
 
     // Phase 1：HU 主动发协议版本
     if !send_cmd(&mut wr, CMD_HU_PROTOCOL_VERSION, &proto_version_payload()).await {
@@ -637,15 +673,36 @@ async fn handle_cmd_client(
 
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let mut chunk = [0u8; 2048];
-    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    // 1.5s tick：握手完成后若 8240 还没出帧，用它补发 VIDEO_ENCODER_START。
+    // （5s 太粗：CarLife 在前台就绪后等 START，我们晚 5s 才催，用户看到的是"黑屏几秒"）
+    let mut tick = tokio::time::interval(Duration::from_millis(1500));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         let n = tokio::select! {
-            _ = stop.notified() => return,
+            _ = stop.notified() => {
+                // 收尾：先让 MD 暂停编码（它据此走 onDisconnect），再发 FIN 关写半部，
+                // 避免留下"半开"的 CMD 连接、下次连进去不回 Phase 1。
+                if hs.encoder_start_sent {
+                    let _ = send_cmd(&mut wr, CMD_VIDEO_ENCODER_PAUSE, &[]).await;
+                }
+                let _ = tokio::io::AsyncWriteExt::shutdown(&mut wr).await;
+                emit_log("CARLIFE: 停止信号——已发 VIDEO_ENCODER_PAUSE 并关闭 CMD 连接");
+                return;
+            }
             _ = tick.tick() => {
                 if !hs.encoder_start_sent {
                     emit_log(&format!("CARLIFE: 握手进行中（{}）", hs.phase_name()));
+                } else if !VIDEO_FIRST_FRAME_RECEIVED.load(std::sync::atomic::Ordering::Relaxed)
+                    && start_retries < 12
+                {
+                    // START 可能发在"CarLife 还在后台、Surface 未就绪"的时刻被吞掉，
+                    // 首帧到达前每 1.5s 补一次（最多 12 次 ≈ 18s）。
+                    start_retries += 1;
+                    let _ = send_cmd(&mut wr, CMD_VIDEO_ENCODER_START, &[]).await;
+                    emit_log(&format!(
+                        "CARLIFE: 首帧视频未到——第 {start_retries} 次补发 VIDEO_ENCODER_START"
+                    ));
                 }
                 continue;
             }
@@ -739,9 +796,23 @@ async fn handle_cmd_client(
                 CMD_MD_AUTHEN_RESULT => {
                     emit_log("CARLIFE: [Phase 5] ← MD_AUTHEN_RESULT —— 连接建立");
                     if !hs.encoder_init_sent {
-                        // 用**当前**编码分辨率（/info 已按车机真实尺寸写入）
-                        let (w, h) = *encoder_size.lock();
-                        let (w, h) = (even(w.max(2)), even(h.max(2)));
+                        // 用**当前**编码分辨率（/info 已按车机真实尺寸写入），
+                        // 但要先规整成手机编码器更稳的尺寸：宽度封顶 1920、宽高 16 对齐。
+                        // 2560×744（744/16=46.5）这类值在部分机型上会让 MediaCodec 静默失败，
+                        // 表现为"握手全过、8240 一帧不出"。
+                        let (raw_w, raw_h) = *encoder_size.lock();
+                        let (w, h) = safe_carlife_encoder_size(raw_w, raw_h);
+                        if (w, h) != (even(raw_w.max(2)), even(raw_h.max(2))) {
+                            *encoder_size.lock() = (w, h);
+                            // 画布必须跟着规整后的尺寸走，否则车机端缩放/触摸坐标全偏
+                            let _ = events.send(CarLifeEvent::EncoderResolution {
+                                width: w,
+                                height: h,
+                            });
+                            emit_log(&format!(
+                                "CARLIFE: 请求分辨率 {raw_w}x{raw_h} → 规整为 {w}x{h}（16 宏块对齐，保留原生宽度）"
+                            ));
+                        }
                         let ok = send_cmd(
                             &mut wr,
                             CMD_VIDEO_ENCODER_INIT,
@@ -809,14 +880,20 @@ async fn handle_cmd_client(
                     emit_log("CARLIFE: → HU_CAR_DATA_SUBSCRIBE_DONE");
                 }
                 CMD_SCREEN_ON | CMD_FOREGROUND => {
-                    emit_log(&format!(
-                        "CARLIFE: ← {}（握手期通知）",
-                        if service_type == CMD_SCREEN_ON {
-                            "SCREEN_ON"
-                        } else {
-                            "FOREGROUND"
+                    let name = if service_type == CMD_SCREEN_ON {
+                        "SCREEN_ON"
+                    } else {
+                        "FOREGROUND"
+                    };
+                    emit_log(&format!("CARLIFE: ← {name}（手机进入前台/亮屏）"));
+                    // CarLife 的 Activity 被 `am start` 推回前台时才会真正 Resume 编码器；
+                    // 如果 START 是在后台时发的，它已经被吞掉了——这里必须补发一次。
+                    if hs.encoder_start_sent {
+                        match send_cmd(&mut wr, CMD_VIDEO_ENCODER_START, &[]).await {
+                            true => emit_log("CARLIFE: 已补发 VIDEO_ENCODER_START（前台就绪后重新触发编码）"),
+                            false => return,
                         }
-                    ));
+                    }
                 }
                 CMD_MD_MODULE_STATUS => {
                     emit_log("CARLIFE: ← MD_MODULE_STATUS");
@@ -1016,6 +1093,9 @@ async fn handle_media_client(
                 MediaKind::Video => match service_type {
                     VIDEO_DATA => {
                         if !payload.is_empty() {
+                            // 首帧到达：CMD 侧的 START 补发逻辑据此停止
+                            VIDEO_FIRST_FRAME_RECEIVED
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
                             let _ = events.send(CarLifeEvent::VideoFrame {
                                 pts_us: ts_ms as u64 * 1000,
                                 data: payload,
@@ -1081,6 +1161,36 @@ async fn handle_media_client(
 /// 偶数对齐：H.264 4:2:0 要求宽高为偶数。
 fn even(v: u32) -> u32 {
     (v / 2) * 2
+}
+
+/// 是否已经从 8240 收到过至少一帧 H.264（没收到前，CMD 侧会周期性补发
+/// VIDEO_ENCODER_START，避免"START 发出时 CarLife 还在后台、Surface 未就绪"被吞掉）。
+pub(crate) static VIDEO_FIRST_FRAME_RECEIVED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 把请求的编码分辨率规整成手机硬件编码器更稳的尺寸：
+///  **宽高都向 16 取整**（H.264 宏块 16×16；744 这种 744/16=46.5 的非整数高度，
+///  在部分机型上会让 `MediaCodec.configure()` 静默失败——握手全过但 8240 一帧不出）。
+///
+/// **不再压到 1920 宽**：CarWith 自己的分辨率设置里最大支持 2560×2560（2026-10-26 实测），
+/// 说明手机侧能直接出 2560 宽的流；压到 1920 反而白丢清晰度。
+/// 例：2560×744 → 2560×752（只做 16 对齐，宽高比 3.41 与 2560/744 基本一致）。
+const CARLIFE_ENCODER_MAX_WIDTH: u32 = 2560;
+/// 高度上限（CarWith 设置界面同样支持到 2560）。只用于防御异常值。
+const CARLIFE_ENCODER_MAX_HEIGHT: u32 = 2560;
+
+fn safe_carlife_encoder_size(w: u32, h: u32) -> (u32, u32) {
+    let mut sw = w.max(320);
+    let mut sh = h.max(240);
+    if sw > CARLIFE_ENCODER_MAX_WIDTH {
+        // 离谱的宽（>2560）才等比缩回来
+        sh = ((sh as u64 * CARLIFE_ENCODER_MAX_WIDTH as u64) / sw as u64).max(240) as u32;
+        sw = CARLIFE_ENCODER_MAX_WIDTH;
+    }
+    // 向最近的 16 取整（+8 再整除），并夹回安全范围
+    sw = ((((sw + 8) / 16) * 16).clamp(320, CARLIFE_ENCODER_MAX_WIDTH)).max(320);
+    sh = ((((sh + 8) / 16) * 16).clamp(240, CARLIFE_ENCODER_MAX_HEIGHT)).max(240);
+    (sw, sh)
 }
 
 /// 解析 `CarlifeVideoEncoderInfo{1:width, 2:height, 3:frameRate}` 的宽高。

@@ -1,4 +1,4 @@
-﻿# CarLife HU 侧协议（HyperCar 网关）
+# CarLife HU 侧协议（HyperCar 网关）
 
 > 依据：**pitate7777777/CarLifeWirelessBox**（MIT，实测兼容小米 CarWith 的 CarLife 连接）
 > 的 HU 实现与 `docs/DEVELOPMENT.md`、`docs/通讯协议分析报告.md`，与 apollo-DuerOS 同源。
@@ -130,7 +130,24 @@ message CarlifeTouchAction {
 不是原始字节！」——早期我们用 `[u32 BE action][u32 BE x][u32 BE y]`，手机按 protobuf
 解不出来，表现为「触摸完全无响应」，且日志上只能看到报文已送达。
 
-`HARD_KEY 0x68008` 仍是裸 `[u32 BE keycode]`。
+`HARD_KEY 0x68008` 也是 protobuf（2026-10-26 改）：`CarlifeCarHardKeyCode { int32 keycode = 1; }`
+→ 线格式 `0x08 <varint keycode>`。早期发的裸 `[u32 BE keycode]` 会被当成损坏的 protobuf 丢掉
+（和触摸是同一个坑）。
+
+keycode 取值（`pub const KEYCODE_*`，见 `rust-core/src/carlife.rs`）：
+
+| keycode | 含义 | keycode | 含义 |
+|---|---|---|---|
+| 0x01 | HOME | 0x11 | **BACK**（旧代码误写成 0x02＝电话键） |
+| 0x02 | 电话接听 | 0x19 | 焦点上移 |
+| 0x03 | 电话挂断 | 0x1A | 焦点下移 |
+| 0x09 | 语音唤醒（VR_START） | 0x1B | 焦点左移 / 旋钮逆时针 |
+| 0x0E | 下一曲 | 0x1C | 焦点右移 / 旋钮顺时针 |
+| 0x0F | 上一曲 | 0x1D | 旋钮按下确认（OK） |
+| 0x10 | 播放/暂停 | | |
+
+⚠ 这张表来自 CarLife 协议资料，**尚未在真车上逐条验证**；改完后先看
+`CTRL: 注入硬按键 keycode=… protobuf=…` 与车机上的实际反应再校准。
 
 ## 7. 触摸坐标的显示空间（接收端报 0×0 时）
 

@@ -71,6 +71,7 @@ fun DiagnosticsScreen(
     onToggleRecording: (Boolean) -> Unit,
     onClearLogs: () -> Unit,
     onExport: () -> Unit,
+    onDumpDisplays: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     // 轻提示（复制/导出反馈）：2s 自动消失
@@ -96,6 +97,7 @@ fun DiagnosticsScreen(
             onCopy = { toast = "已复制 ${logs.size} 行日志" },
             onExport = onExport,
             onFeedback = { toast = it },
+            onDumpDisplays = onDumpDisplays,
             logs = logs,
         )
         AnimatedVisibility(
@@ -132,6 +134,8 @@ private fun Header(
     onExport: () -> Unit,
     /** 一键反馈的结果提示（成功/失败文案交给页面统一弹 toast）。 */
     onFeedback: (String) -> Unit,
+    /** 诊断：把当前 display 列表打进日志（配合设置页「CarLife 启动屏」）。 */
+    onDumpDisplays: () -> Unit,
     logs: List<String>,
 ) {
     val clipboard = LocalClipboardManager.current
@@ -244,6 +248,21 @@ private fun Header(
                 contentColor = io.github.hypercar.ui.theme.DeepSpace,
                 borderColor = ElectricCyan,
                 horizontalPadding = 8.dp,
+            )
+            // 副屏探测：把 dumpsys display 的摘要打进日志，用来填「CarLife 启动屏」。
+            CapsuleButton(
+                text = "显示器",
+                onClick = {
+                    onDumpDisplays()
+                    onFeedback("正在读取 display 列表（需要 Shizuku）——结果会写进下面的日志")
+                },
+                modifier = Modifier
+                    .weight(1f)
+                    .height(44.dp),
+                filled = false,
+                contentColor = MintGreen,
+                borderColor = MintGreen.copy(alpha = 0.5f),
+                horizontalPadding = 4.dp,
             )
         }
     }

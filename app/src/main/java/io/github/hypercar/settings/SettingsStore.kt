@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.settings
+package io.github.hypercar.settings
 
 import android.content.Context
 import android.content.SharedPreferences
@@ -38,6 +38,7 @@ object SettingsStore {
     private const val KEY_FPS = "carlife_fps"
     private const val KEY_ENABLE_AUDIO = "enable_audio"
     private const val KEY_CARLIFE_PKG = "carlife_package"
+    private const val KEY_CARLIFE_WAKE_DISPLAY = "carlife_wake_display"
     private const val KEY_IAP2_KEEPALIVE_ONLY = "iap2_keepalive_only"
     private const val KEY_KEEP_ALIVE_STATS = "keep_alive_stats"
     private const val KEY_DEBUG_LOG = "debug_log_enabled"
@@ -143,6 +144,19 @@ object SettingsStore {
     var carlifePackage: String
         get() = p().getString(KEY_CARLIFE_PKG, "com.baidu.carlife") ?: "com.baidu.carlife"
         set(v) = p().edit().putString(KEY_CARLIFE_PKG, v).apply()
+
+    /**
+     * 拉起 CarLife 引擎页时投到哪块 display：**-1 = 主屏（默认）**。
+     *
+     * 为什么要有：CarLife 的 Activity 必须保持"可见前台"，否则它自带的 35 秒空闲 watchdog
+     * 会 `ProcessUtil.killAllProcess` 自杀（现场实测 34~35s 必死）；但窗口摆在手机主屏又会
+     * 挡住用户。`am start --display N` 可以把它投到副屏/虚拟屏（例如 CarWith 的 display 10），
+     * 主屏留给 HyperCar——**前提是设备上真的存在这块屏**；不存在时 `am start` 会失败，
+     * 唤醒逻辑会自动回退主屏重试，不会把 CarLife 弄没。
+     */
+    var carlifeWakeDisplay: Int
+        get() = p().getInt(KEY_CARLIFE_WAKE_DISPLAY, -1)
+        set(v) = p().edit().putInt(KEY_CARLIFE_WAKE_DISPLAY, v).apply()
 
     /**
      * 联调开关：只保持 iAP2 链路，不在手机上启动 AirPlay 引擎。

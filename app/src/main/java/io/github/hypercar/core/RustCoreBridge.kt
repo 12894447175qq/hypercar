@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.core
+package io.github.hypercar.core
 
 /**
  * Rust 核心层 JNI 桥（libhypercar_core.so）。
@@ -17,19 +17,24 @@ object RustCoreBridge {
     }
 
     // ---- CarLife 原生硬按键码（宝马 iDrive 旋钮/方向盘快捷键 → CarLife 0x68008）----
+    // 对齐 `CarlifeCarHardKeyCode { int32 keycode = 1; }`。**旧值有错**：BACK 曾写成 0x02，
+    // 那其实是电话键；旋钮左右/确认也整体偏了一位（0x1C/0x1D/0x1E → 0x1B/0x1C/0x1D）。
+    // 取值尚未在真车上逐条验证，先与截图/日志里的实际效果对照再定。
     const val CL_KEY_HOME = 0x01
-    const val CL_KEY_BACK = 0x02
+    const val CL_KEY_PHONE_CALL = 0x02
+    const val CL_KEY_PHONE_END = 0x03
+    const val CL_KEY_VR_START = 0x09
     const val CL_KEY_NEXT_SONG = 0x0E
     const val CL_KEY_PREV_SONG = 0x0F
     const val CL_KEY_PLAY_PAUSE = 0x10
-    const val CL_KEY_KNOB_LEFT = 0x1C
-    const val CL_KEY_KNOB_RIGHT = 0x1D
-    const val CL_KEY_KNOB_SELECT = 0x1E
+    const val CL_KEY_BACK = 0x11
+    const val CL_KEY_DPAD_UP = 0x19
+    const val CL_KEY_DPAD_DOWN = 0x1A
+    const val CL_KEY_KNOB_LEFT = 0x1B
+    const val CL_KEY_KNOB_RIGHT = 0x1C
+    const val CL_KEY_KNOB_SELECT = 0x1D
 
-    /**
-     * 触摸动作（**CarLife 语义**：0=DOWN/1=UP/2=MOVE，不是 Android MotionEvent 的 1/2/3）。
-     * CTRL 通道载荷为裸 BE 结构 `[u32 action][u32 x][u32 y]`。
-     */
+    /** 触摸动作（**CarLife 语义**：0=DOWN/1=UP/2=MOVE，不是 Android MotionEvent 的 1/2/3）。 */
     const val TOUCH_DOWN = 0
     const val TOUCH_UP = 1
     const val TOUCH_MOVE = 2

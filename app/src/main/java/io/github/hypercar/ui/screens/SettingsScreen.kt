@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.ui.screens
+package io.github.hypercar.ui.screens
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -1200,6 +1200,49 @@ private fun WakePackageSection() {
                     modifier = Modifier.fillMaxWidth(),
                 )
             }
+            // ---- CarLife 启动屏（实验开关）----
+            Spacer(modifier = Modifier.height(14.dp))
+            Text(
+                text = "CarLife 启动屏（-1 = 手机主屏）",
+                style = MaterialTheme.typography.titleSmall,
+                color = TextPrimary,
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            var displayText by rememberSaveable { mutableStateOf(SettingsStore.carlifeWakeDisplay.toString()) }
+            OutlinedTextField(
+                value = displayText,
+                onValueChange = { input ->
+                    // 只允许 -1 或数字：填错会让 am start 直接失败
+                    val cleaned = input.filter { it.isDigit() || it == '-' }.take(3)
+                    displayText = cleaned
+                    SettingsStore.carlifeWakeDisplay = cleaned.toIntOrNull() ?: -1
+                },
+                label = { Text("display id", style = MaterialTheme.typography.labelSmall) },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                shape = RoundedCornerShape(14.dp),
+                colors = TextFieldDefaults.colors(
+                    focusedContainerColor = SurfaceInset,
+                    unfocusedContainerColor = SurfaceInset,
+                    focusedTextColor = MintGreen,
+                    unfocusedTextColor = MintGreen,
+                    cursorColor = ElectricCyan,
+                    focusedLabelColor = ElectricCyan,
+                    unfocusedLabelColor = TextSecondary,
+                    focusedIndicatorColor = ElectricCyan,
+                    unfocusedIndicatorColor = StrokeGlass,
+                ),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = "默认 -1：CarLife 窗口显示在手机主屏。填副屏 id（如 10；先看日志里的 " +
+                    "「WAKE: 显示设备 …」）可把窗口移出主屏；屏不存在或不允许投时，唤醒会自动回退主屏。\n" +
+                    "注意：CarLife 的 Activity 必须保持可见前台，否则它自带的 35 秒空闲看门狗会杀进程——" +
+                    "所以「无界面服务」启动方式不可用（实测卡在 Phase 1）。",
+                style = MaterialTheme.typography.labelSmall,
+                color = TextSecondary,
+            )
         }
     }
 }

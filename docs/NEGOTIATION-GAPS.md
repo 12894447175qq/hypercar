@@ -1,4 +1,4 @@
-﻿# 协商层对比分析：参考文档 vs cardeck 实测协议
+# 协商层对比分析：参考文档 vs cardeck 实测协议
 
 > 对比对象：
 >  - **参考文档**：`E:\核心层rust实现.txt`（Kotlin 交 FD + 密钥、Rust 只做数据面转发的方案）
@@ -710,3 +710,39 @@ ActivityManager: Force stopping com.baidu.carlife.xiaomi … from process:com.mi
 CarLife 可能把画面送进"CarWith 会话"的那条通路，而不是直连 HU 的 8240。
 `/sdcard/Android/data/com.baidu.carlife.xiaomi/files/xLog/*.xlog` 是加密的，
 要看清只能 root 后 `tcpdump -i any port 8240 or port 57999`。
+
+## 17. 拉起 CarLife 但不想占主屏（2026-10-26）
+
+### 17.1 「无界面服务」启动不可用（已实测）
+
+`am start-foreground-service -n com.baidu.carlife.xiaomi/com.baidu.carlife.service.CarlifeConnectService`
+能让 7240/8240 起来、编码器也 `STARTED`，但 CarLife **不回 Phase 1**（版本匹配），握手永远
+停在第一步，8240 一帧没有（见 §15.3 的表与 100101 现场）。根因是它的会话/编码状态绑定在
+`CarlifeActivity` 上，Activity 不在"可见前台"时：
+
+- 它自带的空闲看门狗 34~35s 必杀进程（`ProcessUtil.killAllProcess`）；
+- 视频帧不会投递给 HU 的 8240 连接。
+
+所以"完全不显示窗口"在**非 root** 条件下没有干净方案。
+
+### 17.2 已加：把 Activity 投到副屏（`am start --display N`）
+
+设置页「CarLife 启动屏（-1 = 手机主屏）」：
+
+- `-1`（默认）：维持现状，窗口显示在手机主屏；
+- `>=0`：`am start -n <CarLifeActivity> --display N`，把 Activity 投到副屏/虚拟屏。
+  只有设备上**真的存在**这块屏（如 CarWith 的 display 10）才有效；`am start` 失败或 3s 内
+  7240 没起来时，会自动回退主屏重试，不会把 CarLife 弄没。
+- 开启该开关时，唤醒日志会先打印 `WAKE: 显示设备 …`（`dumpsys display` 摘要），
+  用来确认填哪个 id。
+- **不用连电脑查**：诊断页新增「显示器」按钮 → `HyperCarRepo.dumpDisplays()` 把
+  `dumpsys display` 的 display id / 名称 / 尺寸打进日志（`DISP: …`），照着填设置里的启动屏即可。
+
+判定成功的标准：日志出现 `WAKE: 拉起 CarLife 引擎页（display=N）` 后 7240 在监听、
+`CARLIFE: [Phase 1] ← 版本匹配` 正常推进，且**手机主屏不再被 CarLife 占据**。
+
+### 17.3 为什么不建议的其他做法
+
+- **分屏 / 画中画**：窗口还在，只是变小；CarLife 不支持 PiP 时直接无效。
+- **亮度 0 / 息屏保活**：Activity 仍算前台，但手机等于不可用（驾驶时取导航还得恢复亮度）。
+- **禁用看门狗**：需要改 CarLife APK（LSPatch/Xposed）或 root，超出"装个 App 就能用"的范围。
