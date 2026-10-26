@@ -1342,3 +1342,306 @@ adb shell am broadcast -a io.github.hypercar.PROBE_UI -p io.github.hypercar
 adb shell cat /sdcard/Android/data/io.github.hypercar/files/carui_probe.txt
 ```
 
+
+## 21. 官方接入文档（V2.1.1）核对结果 —— 找到 Qin:0 的真凶
+
+文档：`E:\Downloads\百度CarLife车机手机互联方案接入详细指南V2.1.1.pdf`（157 页，车机端规范）
+
+### 21.1 与本文档逐条核对，我们**对了**的部分
+
+| 项 | 文档 | 我们 |
+|---|---|---|
+| 控制消息头 | 8B：length(u16) / reserved(u16) / serviceType(u32) | ✅ 一致 |
+| 视频消息头 | 12B：length / timestamp / serviceType | ✅ 一致 |
+| 视频握手 | HU 发 `VIDEO_ENCODER_INIT` → MD 回 `INIT_DONE` → HU 发 `START`，之后 MD 开始出流 | ✅ 一致 |
+| 心跳 | 收到 `PROTOCOL_VERSION_MATCH_STATUS` 后 HU 必须**每秒**在视频通道发 `0x20002`，3s 没有 MD 会断开 | ✅ 已实现 |
+| `MSG_CMD_HU_INFO`(0x18003) PB | `CarlifeDeviceInfo{ os=1, manufacturer=13, model=14, release=19, **btaddress=23(required)**, **btname=24(required)** }` | ❌ **之前发的是手机侧全套字段，还把 24 号当 carlifeversion 塞了 "7.0.0"，缺 required 的 btaddress** → 已按文档重写（0.1.0.80） |
+
+### 21.2 真凶：`MSG_CMD_LAUNCH_MODE_NORMAL`（0x1801D）
+
+文档 §10.2.2 原表（我按行读出来的原文）：
+
+```
+MSG_CMD_LAUNCH_MODE_NORMAL  0x0001801D  无  HU->MD  车机启动移动设备 CarLife 进入 Home 界面
+MSG_CMD_LAUNCH_MODE_PHONE   0x0001801E  无  HU->MD  车机启动移动设备 CarLife 进入 Phone 界面
+MSG_CMD_LAUNCH_MODE_MAP     0x0001801F  无  HU->MD  车机启动移动设备 CarLife 进入 Map 界面
+MSG_CMD_LAUNCH_MODE_MUSIC   0x00018020  无  HU->MD  车机启动移动设备 CarLife 进入 Music 界面
+MSG_CMD_GO_TO_FOREGROUND    0x00018025  无  HU->MD  把 CarLife 切回前台（AOA 场景用）
+```
+
+我们**从来没发过这四条**。所以手机 CarLife 一直停在自己的落地页（"无线转换盒"），
+编码器空转（`Qin:0`）——这和"CarWith 在驱动它"的现象完全吻合：CarWith 每次连上都发 LAUNCH_MODE。
+
+0.1.0.80 起：
+
+```
+[Phase 7] → VIDEO_ENCODER_START
+[Phase 8] → LAUNCH_MODE_NORMAL（让 CarLife 进入投屏界面）
+```
+
+并且首帧未到时，1.5s 一次的补发包里同时带 `LAUNCH_MODE_NORMAL + VIDEO_ENCODER_START`。
+
+### 21.3 还值得继续挖的
+
+- `MSG_CMD_MODULE_CONTROL(0x18028)` / `MSG_CMD_MODULE_STATUS(0x10026)`：模块级控制（导航/音乐/VR），
+  `enum ModuleId{CARLIFE_PHONE_MODULE_ID=1, NAVI=2, MUSIC=3, VR=4, CONNECT=5, MIC=6, MEDIAPCM=7, EDOG=8, CRUISE=9}`
+- `MSG_CMD_GO_TO_FOREGROUND(0x18025)`：AOA 场景用；无线场景如果 CarLife 被系统压到后台，可以试它。
+- `MSG_CMD_VIDEO_ENCODER_RESET(0x1800B)`、`MSG_CMD_PAUSE_MEDIA(0x1800E)`。
+- PBVersion 官方最新是 `(2,0)`，我们发的是 `(3,2)`——如果 LAUNCH_MODE 不奏效，下一个实验就换 `(2,0)`。
+
+## 22. 方案 A：先保 CarPlay 稳定（0.1.0.82/83）
+
+### 22.1 事故：CarLife 一激活就把 CarPlay 顶掉（0.1.0.81 回归）
+
+```
+16:31:33.675  CORE: [connected] AirPlay 会话已激活
+16:31:35.825  CARLIFE: 视频仍为 0——第 1 次强制把 CarLife 推到前台 exit=0
+16:31:38.398  CARLIFE: 视频仍为 0——第 2 次强制把 CarLife 推到前台 exit=0
+16:31:39.090  BT-S: 车机已连入 name=Redmi Note 11 5G，开始 iAP2 发送端会话
+16:31:49.968  IAP2: 会话结束（链路断开）
+16:31:49.970  SESSION: 已断开（用户/系统断开）
+```
+
+0.1.0.81 为"视频救援"每 2.5s 把 CarLife 拉前台，CarLife 起来后会去动蓝牙
+（车机互联要抢 BT 通道），把 iAP2 的 ACL 顶断 → 车机侧表现为 CarPlay 断连。
+**两者不能同时活着**，且 CarLife 是系统特权应用，我们拦不住它动蓝牙。
+
+处置：
+- 0.1.0.82 删除"视频救援"里的强制 `am start`（恢复 0.1.0.78 的稳定行为）；
+- 0.1.0.82 修「链路已断、界面还显示已连接」：`runDisconnect` 的幂等提前返回分支
+  现在也会把 `link/carLife` 刷回 `Idle`；
+- 0.1.0.83 新增设置 **「启用 CarLife 联动」默认关**（`SettingsStore.carlifeEnabled`）：
+  关着时不拉起 CarLife、不探测、不做 AIDL 投屏探测。
+
+### 22.2 保留的协议修正（只在开启联动时生效）
+
+- `MSG_CMD_LAUNCH_MODE_NORMAL(0x1801D)`：握手后立刻发，让手机 CarLife 进 Home 投屏界面；
+- `MSG_CMD_HU_INFO(0x18003)`：按官方 proto 重写（os=1 / manufacturer=13 / model=14 /
+  release=19 / **btaddress=23 required** / **btname=24 required**）。
+
+### 22.3 下一阶段（方案 A 内）
+
+1. 待机卡片的稳定性与观感（车机不黑屏、分辨率跟随 /info）；
+2. 触摸/硬按键通道的准确性（iAP2 HID → 坐标换算）；
+3. iAP2 断线自动重连（车机重连后无需人工干预）；
+4. 诊断日志保持可导出，便于下次上车取证。
+
+### 22.4 掉线自动重连（0.1.0.84 起）
+
+问题：链路断开后 `releaseSessionResources()` 会把 iAP2 监听一起停掉；
+如果此时车机的 ACL **一直没断**，就再也不会产生 `ACL_CONNECTED` 广播，
+表现为「断了之后再也连不上，必须手动点连接」。
+
+实现（`HyperCarRepo.scheduleAutoReconnect`）：
+
+| 条件 | 行为 |
+|---|---|
+| 本次会话**建立过链路**（`sessionHadLink`） | 才重连；从没连上过不算掉线，不重连 |
+| 用户点了「断开」 | `userDisconnectRequested=true` → 不重连 |
+| 「上车自动连接」关着 | 不重连 |
+| 次数 | 最多 6 次，退避 1s→2s→4s→8s→15s→15s |
+| 成功进 `connected` | `reconnectAttempts` 清零 |
+| 重连前发现 `streaming/connecting` | 取消（车机自己已经连回来了） |
+
+触发点两处：`runDisconnect()`（正常拆除）和 `fail()`（协商失败/对端关闭控制通道）。
+
+日志：
+
+```
+RECONNECT: 链路断开（…）——1000ms 后自动重连（第 1/6 次）
+RECONNECT: 用户主动断开——不自动重连
+RECONNECT: 本次会话没建立过链路（…）——不自动重连
+RECONNECT: 已连续失败 6 次——停止自动重连，等车机重新连入
+```
+
+### 22.5 待机卡片与触摸（0.1.0.86）
+
+**待机卡片**
+
+| 项 | 之前 | 现在 |
+|---|---|---|
+| 母版选择 | 固定阈值 `ratio > 2.6` 用宽屏 | 按**最接近的宽高比**选（3.44:1 宽屏 / 1.78:1 16:9），并记一行 `AIRPLAY: 待机母版选择 WxH（R:1）→ 母版 …` |
+| 发送节奏 | tick 16ms 一帧 = **60fps 常驻** | 前 2s 60fps 让接收端锁流，之后 **15fps**（每 4 拍一帧） |
+| 自愈 | 靠循环回绕到 IDR（1s 一次） | 每 **5s 强制从 IDR 重放**一次，迟到/卡住的解码器能恢复 |
+
+日志：
+
+```
+AIRPLAY: 待机母版选择 2560x744（3.44:1）→ 母版 1280x372（3.44:1）
+AIRPLAY: 待机循环开始（母版 1280x372，60 帧；前 2s 60fps，之后 15fps，每 5s 补 IDR）
+```
+
+**触摸换算**
+
+1. 修下溢：`.min(target.0 - 1)` 在 `target=0` 时 release 会回绕、debug 会 panic（编码器还没回报尺寸时就是 0），
+   改成 `saturating_mul` + `max(1)` + `saturating_sub`；
+2. 每次换算打诊断（前 5 次 + 每 200 次一行），一眼看出空间是否给错：
+
+```
+TOUCH: 车机(1280,372) 空间 2560x744 → 画布 2560x744 = (1280,372)（第 1 次）
+```
+
+3. 首次换算时校验宽高比，不一致就告警（接收端加黑边时边缘会偏）：
+
+```
+TOUCH: ⚠ 触摸空间 2560x744（3.44:1）与画布 1920x720（2.67:1）宽高比不一致——接收端拉伸显示时线性映射正确；若它加了黑边，边缘会偏
+```
+
+### 22.6 「关掉联动就起不来」的真因（0.1.0.87）
+
+0.1.0.86 现场（`hypercar-log-20261026-164826.txt`）：
+
+```
+16:48:10.561  iap2 Phase 1 完成：拿到热点凭据与（可能的）AirPlay 端点
+16:48:11.201  CARLIFE: 仍在等 CarLife 监听 7240（第 1s），补发唤醒广播
+16:48:11.202  CARLIFE: 联动已关闭（设置里关着）——不拉起 CarLife…
+   … 一直到第 16s …
+16:48:24.934  LINK closed
+16:48:24.936  SESSION: 已断开（用户/系统断开）
+```
+
+原因：`runConnect` 里在启动 Rust 引擎**之前**有一段
+`probeLocalCarLifeMd(timeoutMillis = 30_000L)`——最多等 30 秒看 CarLife 有没有在 7240 监听
+（联动开着时合理：要判断用"主动拨号"还是"HU 监听"）。关掉联动后 CarLife 永远不会起来，
+这段就变成**整整 30 秒的空等**，而车机侧 CarPlay 只等十几秒就拆链路 → AirPlay 根本没开始。
+
+修复（0.1.0.87）：联动关闭时**跳过这段探测**，直接按 HU 身份监听并立即协商：
+
+```
+CARLIFE: 联动已关闭——跳过 7240 探测，引擎直接以 HU 身份监听并马上协商 AirPlay
+```
+
+### 22.7 调试直连（0.1.0.88）
+
+```
+adb shell am broadcast -a io.github.hypercar.PROBE_CONNECT    -p io.github.hypercar   # 触发连接
+adb shell am broadcast -a io.github.hypercar.PROBE_DISCONNECT -p io.github.hypercar   # 断连
+adb shell am broadcast -a io.github.hypercar.PROBE_CAST       -p io.github.hypercar   # CarLife AIDL 探测
+```
+
+### 22.8 待机卡片原生分辨率（0.1.0.89）
+
+原来待机母版只有 1280x372（宽屏）和 1280x720（16:9），车机 2560x744 时要把 1280 放大 2 倍 —— 字发虚。
+新增 `assets/standby-wide-2x.h264`（2560x744，由 1280x372 用 ffmpeg lanczos 放大后重编，
+baseline/level 5.1，60 帧 1 秒，36KB）：
+
+```
+ffmpeg -r 60 -i standby-wide.h264 -vf scale=2560:744:flags=lanczos \
+  -c:v libx264 -profile:v baseline -level 5.1 -pix_fmt yuv420p \
+  -g 60 -keyint_min 60 -sc_threshold 0 -b:v 700k -f h264 standby-wide-2x.h264
+```
+
+选择规则：
+
+| 车机宽高比 | 车机宽度 | 用哪套 |
+|---|---|---|
+| 接近 3.44:1 | ≥ 2000 | **2560x744 原生**（本机 Desk 接收端实测 config/idr 都成功） |
+| 接近 3.44:1 | < 2000 | 1280x372 |
+| 其余 | — | 1280x720（16:9） |
+
+同时修掉上一版的日志刷屏：`待机母版选择 …` 原来是**每帧**打一次（日志折叠器 10 秒压了 60 多条），
+现在只在切换母版时由 `待机循环开始（母版 …）` 一行说明。
+
+本机自测（Desk 接收端 192.168.1.208:7000）：
+
+```
+AIRPLAY: 已发送待机卡片母版 2560x744（config=true idr=true，60 帧素材）——车机不再黑屏
+AIRPLAY: ✓ RECORD 完成——会话已激活
+AIRPLAY: 待机循环开始（母版 2560x744，60 帧；前 2s 60fps，之后 15fps，每 5s 补 IDR）
+AUDIO: 发包 136/s（应 136/s）
+```
+
+## 23. 实验：CarLife 优先启动（0.1.0.90）
+
+依据（2015 版《CarLife 车机互联项目数据通信协议》"视频生成策略"原文）：
+
+> 当移动设备的 CarLife 应用在前台时，移动设备会一直为 CarLife 应用生成视频流……；
+> 当移动设备的 CarLife 应用不在前台时，移动设备将暂停生产视频数据，但仍然发送 length 为 0 的心跳包。
+
+→ 这解释了 `Qin:0`：手机端 CarLife 不在前台 = 只发心跳。
+而 CarLife 一起来就抢蓝牙、顶断 iAP2（见 §22.1）。
+
+**假设**：它抢蓝牙只是"启动阶段的一次性动作"→ 把顺序反过来（先 CarLife、后 iAP2）两者可能共存。
+
+开关：设置 →「CarLife 优先启动（实验）」（`SettingsStore.carlifeFirst`，默认关）。
+
+打开后 `runConnect` 的第一件事：
+
+```
+EXPERIMENT: 先拉 CarLife 到前台——等它做完蓝牙初始化，再起 iAP2
+EXPERIMENT: am start exit=0 Starting: Intent { cmp=… }
+EXPERIMENT: 第 1500ms —— BT enabled=true 已配对=8
+EXPERIMENT: 第 3000ms —— BT enabled=true 已配对=8
+EXPERIMENT: 第 4500ms —— BT enabled=true 已配对=8
+EXPERIMENT: 开始启动 iAP2（若紧接着出现 BT: 启动… 说明共存尝试开始）
+```
+
+之后照常：iAP2 → AirPlay → 若 CarLife 在 7240 监听则引擎切"主动拨号"，CarLife 出帧则视频直接通车机。
+
+判定：
+- 若 iAP2 链路能保持（不再 `LINK closed`）且 `Qin` 变正 → 共存成功，CarLife 视频可用；
+- 若 iAP2 仍被顶断 → 说明 CarLife 是持续占用蓝牙，非 root 下无解，回到方案 A。
+
+### 23.1 实验开关的一键触发（0.1.0.91）
+
+```
+adb shell am broadcast -a io.github.hypercar.PROBE_EXPERIMENT -p io.github.hypercar
+```
+
+它会把 `SettingsStore.carlifeFirst` 置 true 并立刻发起连接，省得手动翻设置页。
+
+本机自测（接收端当时没开，只验证到钩子生效）：
+
+```
+EXPERIMENT: 先拉 CarLife 到前台——等它做完蓝牙初始化，再起 iAP2
+EXPERIMENT: am start exit=0 Starting: Intent { cmp=com.baidu.carlife.xiaomi/com.baidu.carlife.CarlifeActivity }
+EXPERIMENT: 第 1500ms —— BT enabled=true 已配对=10
+EXPERIMENT: 第 3000ms —— BT enabled=true 已配对=10
+EXPERIMENT: 第 4500ms —— BT enabled=true 已配对=10
+EXPERIMENT: 开始启动 iAP2（若紧接着出现 BT: 启动… 说明共存尝试开始）
+```
+
+### 23.2 17:15 那份日志的判读
+
+- **没有 EXPERIMENT 行** → 那次实验开关是关的，跑的是常规路径；
+- `17:15:44.079 LINK closed: bt socket closed` → iAP2 链路确实掉了一次，但 `17:15:48.850` 车机又连回来（新 iAP2 会话），
+  且 `AUDIO: 136/s` 全程没断（音频走 WiFi，不受 BT 影响）——说明单次 BT 抖动不致命；
+- `DIAG-ENC: exit=0，0 行` → 当时**连一个 MediaCodec 实例都没有**，即 CarLife 的编码器根本没起来
+  （它不在投屏态），所以没有 `Qin` 可看，也不可能有视频。
+
+### 23.3 实验结论（2026-10-26 17:20 现场，桌面接收端 192.168.1.208）
+
+**共存：成立。**
+
+```
+EXPERIMENT: 先拉 CarLife 到前台——等它做完蓝牙初始化，再起 iAP2
+EXPERIMENT: am start exit=0 …
+EXPERIMENT: 第 4500ms —— BT enabled=true 已配对=10
+SESSION: 端点就绪 ips=[192.168.1.208] port=7000
+CORE: [carlife_waiting] CarLife 主动连接模式：目标 MD 127.0.0.1   ← CarLife 起来后自己占 7240（MD 角色）
+CARLIFE: [Phase 1..8] 全部完成（含 LAUNCH_MODE_NORMAL）
+CARLIFE: ← FOREGROUND（手机进入前台/亮屏）
+AIRPLAY: ✓ 主会话 SETUP / 主屏流 1920x720 / RECORD 完成
+AUDIO: 发包 136/s（应 136/s）
+topResumedActivity=com.baidu.carlife.xiaomi/com.baidu.carlife.CarlifeActivity   ← CarLife 确实在前台
+```
+
+链路中途掉过 1 次（`LINK closed: bt socket closed`），但车机自己连回来，最终状态稳定：
+CarLife 前台 + CarPlay 会话活着 + CarLife 协议握手完成 + 音频满速。**顺序反转确实解决了"一开 CarLife 就断"**。
+
+**视频：仍然没有。**
+
+```
+[mId: 0] [video-debug-enc] state STARTED …
+    Client:com.baidu.carlife.xiaomi,Component:c2.qti.avc.encoder,
+    Qin:0, DQin:0/0, Render:0, encode:0, DQout:0/99
+CARLIFE: 首帧视频未到——第 9 次补发 LAUNCH_MODE_NORMAL + VIDEO_ENCODER_START
+```
+
+编码器 STARTED 但输入队列恒空。结合 §19 的 AIDL 发现（`mixing.aidl.ICarLifeCastManager.prepareCast(CastConfig{surface})`），
+可以定性：**CarLife 的画面是"由客户端提供 Surface 后渲染进去"的**，没有 CarWith 就没人给它 surface，
+它自己的落地页也不会被采集成帧。所以 `Qin:0` 的真正原因不是协议、不是前后台，而是**缺客户端 surface 宿主**。
+
+→ 结论：**CarLife 视频源在非 root 下无解**（三条根因各自独立：协议缺 LAUNCH_MODE、需要前台、需要客户端 surface；
+前两条已解决，第三条必须由 CarWith 那种系统应用提供）。
+实验开关保持默认关闭；方案 A（CarPlay 稳定）继续。

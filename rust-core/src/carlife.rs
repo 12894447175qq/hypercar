@@ -1,4 +1,4 @@
-//! CarLife HU（车机）侧网关——严格按 CarLifeWirelessBox / apollo-DuerOS 的 HU 实现重构。
+﻿//! CarLife HU（车机）侧网关——严格按 CarLifeWirelessBox / apollo-DuerOS 的 HU 实现重构。
 //!
 //! 我们扮演「车机」，本机 CarLife / CarWith(CarLife 兼容) / 荣耀车联 作为「手机(MD)」连回
 //! 127.0.0.1 的一组标准端口。
@@ -59,6 +59,16 @@ const CMD_VIDEO_ENCODER_INIT_DONE: u32 = 0x0001_0008;
 const CMD_VIDEO_ENCODER_START: u32 = 0x0001_8009;
 /// HU→MD：暂停编码（断开前发，让手机正常收尾，不留在半开状态）
 const CMD_VIDEO_ENCODER_PAUSE: u32 = 0x0001_800A;
+/// HU→MD：让手机 CarLife 进入 Home（投屏）界面。**没有这条它就一直停在自己的落地页**。
+const CMD_LAUNCH_MODE_NORMAL: u32 = 0x0001_801D;
+/// HU→MD：进入 Phone 界面。
+const CMD_LAUNCH_MODE_PHONE: u32 = 0x0001_801E;
+/// HU→MD：进入 Map 界面。
+const CMD_LAUNCH_MODE_MAP: u32 = 0x0001_801F;
+/// HU→MD：进入 Music 界面。
+const CMD_LAUNCH_MODE_MUSIC: u32 = 0x0001_8020;
+/// HU→MD：把 CarLife 切回前台（AOA 场景用）。
+const CMD_HU_GO_TO_FOREGROUND: u32 = 0x0001_8025;
 const CMD_SCREEN_ON: u32 = 0x0001_0018;
 const CMD_FOREGROUND: u32 = 0x0001_001B;
 const CMD_MD_MODULE_STATUS: u32 = 0x0001_0026;
@@ -116,7 +126,7 @@ pub const KEYCODE_MOVE_LEFT: u32 = 0x1B;
 pub const KEYCODE_MOVE_RIGHT: u32 = 0x1C;
 pub const KEYCODE_OK: u32 = 0x1D;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct CarLifeConfig {
     pub width: u32,
     pub height: u32,
@@ -124,6 +134,10 @@ pub struct CarLifeConfig {
     /// 特性配置里的 `voice`：1 = 车机提供语音/麦克风（需要 HU 推 VR 麦克风数据），
     /// 0 = 车机不提供语音 → MD 回落到**手机自己的麦克风**。
     pub voice: u32,
+    /// `HU_INFO` 里 required 的 `btaddress`（车机蓝牙 MAC）。
+    pub bt_address: String,
+    /// `HU_INFO` 里 required 的 `btname`（车机蓝牙名）。
+    pub bt_name: String,
 }
 
 /// CarLife 网关：监听 6 条标准通道，产出结构化事件；接受外部触摸/按键注入。
@@ -159,9 +173,22 @@ impl CarLifeHub {
         spawn_single_client_server(cmd_listener, stop.clone(), "CMD", {
             let events = events.clone();
             let fps = cfg.fps;
+            let bt_address = cfg.bt_address.clone();
+            let bt_name = cfg.bt_name.clone();
             let size = encoder_size.clone();
             let stop_c = stop.clone();
-            move |stream| handle_cmd_client(stream, events.clone(), size.clone(), fps, voice, stop_c.clone())
+            move |stream| {
+                handle_cmd_client(
+                    stream,
+                    events.clone(),
+                    size.clone(),
+                    fps,
+                    voice,
+                    bt_address.clone(),
+                    bt_name.clone(),
+                    stop_c.clone(),
+                )
+            }
         });
 
         // ---- VIDEO 8240 ----
@@ -230,6 +257,8 @@ impl CarLifeHub {
             let stop_c = stop.clone();
             let host = md_host.clone();
             let fps = cfg.fps;
+            let bt_address = cfg.bt_address.clone();
+            let bt_name = cfg.bt_name.clone();
             tokio::spawn(async move {
                 let mut throttle = DialLogThrottle::new();
                 loop {
@@ -238,7 +267,17 @@ impl CarLifeHub {
                         dialed = dial(&host, PORT_CMD) => match dialed {
                             Ok(stream) => {
                                 emit_log(&format!("CARLIFE: ✓ CMD 已连上 MD {host}:{PORT_CMD}"));
-                                handle_cmd_client(stream, events.clone(), size.clone(), fps, voice, stop_c.clone()).await;
+                                handle_cmd_client(
+                                    stream,
+                                    events.clone(),
+                                    size.clone(),
+                                    fps,
+                                    voice,
+                                    bt_address.clone(),
+                                    bt_name.clone(),
+                                    stop_c.clone(),
+                                )
+                                .await;
                                 emit_log("CARLIFE: CMD 通道断开，1s 后重连");
                             }
                             Err(e) => {
@@ -664,6 +703,8 @@ async fn handle_cmd_client(
     encoder_size: Arc<Mutex<(u32, u32)>>,
     fps: u32,
     voice: u32,
+    bt_address: String,
+    bt_name: String,
     stop: Arc<Notify>,
 ) {
     let (mut rd, mut wr) = stream.into_split();
@@ -708,9 +749,13 @@ async fn handle_cmd_client(
                     // START 可能发在"CarLife 还在后台、Surface 未就绪"的时刻被吞掉，
                     // 首帧到达前每 1.5s 补一次（最多 12 次 ≈ 18s）。
                     start_retries += 1;
+                    // 官方文档（V2.1.1 §10.2.2）：`MSG_CMD_LAUNCH_MODE_NORMAL(0x1801D)`
+                    // 才是"让手机 CarLife 进入 Home 投屏界面"的命令。缺了它，手机 CarLife
+                    // 永远停在自己的落地页，编码器空转 → 车机侧 Qin:0（我们踩了一整天）。
+                    let _ = send_cmd(&mut wr, CMD_LAUNCH_MODE_NORMAL, &[]).await;
                     let _ = send_cmd(&mut wr, CMD_VIDEO_ENCODER_START, &[]).await;
                     emit_log(&format!(
-                        "CARLIFE: 首帧视频未到——第 {start_retries} 次补发 VIDEO_ENCODER_START"
+                        "CARLIFE: 首帧视频未到——第 {start_retries} 次补发 LAUNCH_MODE_NORMAL + VIDEO_ENCODER_START"
                     ));
                 }
                 continue;
@@ -749,7 +794,12 @@ async fn handle_cmd_client(
                 CMD_MD_INFO => {
                     emit_log("CARLIFE: [Phase 2] ← MD_INFO");
                     if !hs.hu_info_sent {
-                        let ok = send_cmd(&mut wr, CMD_HU_INFO, &proto_hu_info_payload()).await;
+                        let ok = send_cmd(
+                            &mut wr,
+                            CMD_HU_INFO,
+                            &proto_hu_info_payload(&bt_address, &bt_name),
+                        )
+                        .await;
                         if !ok {
                             return;
                         }
@@ -894,6 +944,12 @@ async fn handle_cmd_client(
                         hs.encoder_start_sent = true;
                         emit_log("CARLIFE: [Phase 7] → VIDEO_ENCODER_START —— 握手完成，开始推流");
                         emit_state("carlife_active", "CarLife 已开始推流");
+                        // 紧接着要求手机 CarLife 进入 Home（投屏）界面：
+                        // 官方文档 §10.2.2 MSG_CMD_LAUNCH_MODE_NORMAL(0x1801D)，
+                        // 不带这条手机就一直停在自己的落地页（编码器空转 → Qin:0）。
+                        if send_cmd(&mut wr, CMD_LAUNCH_MODE_NORMAL, &[]).await {
+                            emit_log("CARLIFE: [Phase 8] → LAUNCH_MODE_NORMAL（让 CarLife 进入投屏界面）");
+                        }
                         let _ = events.send(CarLifeEvent::Handshake);
                     }
                 }
@@ -985,28 +1041,29 @@ fn proto_statistic_payload() -> Vec<u8> {
 ///  9=fingerprint 10=hardware 11=host 12=cid 13=manufacturer 14=model 15=product
 ///  16=serial 17=codename 18=incremental 19=release 20=sdk 21=sdk_int(int32) 24=carlifeversion`。
 /// 字段 1/2 我们发了 varint，而 proto 声明是 string——手机端按 protobuf 解析这条消息会失败。
-fn proto_hu_info_payload() -> Vec<u8> {
-    let mut out = Vec::with_capacity(160);
+/// `MSG_CMD_HU_INFO`(0x18003) 的 PB：`CarlifeDeviceInfo`（HU 方向只允许这几个字段）
+///
+/// 依据《百度 CarLife 车机手机互联方案接入详细指南 V2.1.1》10.2.2 表：
+/// ```text
+/// message CarlifeDeviceInfo {
+///     optional string os           = 1;   // Android / QNX / Linux / Wince
+///     optional string manufacturer = 13;
+///     optional string model        = 14;
+///     optional string release      = 19;
+///     required string btaddress    = 23;  // 车机蓝牙 MAC
+///     required string btname       = 24;  // 车机蓝牙名
+/// }
+/// ```
+/// 之前这里塞的是**手机侧**的全套字段（还把 24 号当成 carlifeversion 放 "7.0.0"，
+/// 那是 MD_INFO 的语义），并且缺了 required 的 btaddress —— MD 解析必然异常。
+fn proto_hu_info_payload(bt_address: &str, bt_name: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(96);
     proto::string(&mut out, 1, "Android"); // os
-    proto::string(&mut out, 2, "qcom"); // board
-    proto::string(&mut out, 3, "unknown"); // bootloader
-    proto::string(&mut out, 4, "HyperCar"); // brand
-    proto::string(&mut out, 5, "arm64-v8a"); // cpu_abi
-    proto::string(&mut out, 6, "arm64-v8a"); // cpu_abi2
-    proto::string(&mut out, 7, "hypercar"); // device
-    proto::string(&mut out, 8, "HyperCar HU"); // display
-    proto::string(&mut out, 9, "HyperCar/HU/1:14/UE1A/eng"); // fingerprint
-    proto::string(&mut out, 10, "qcom"); // hardware
-    proto::string(&mut out, 11, "hypercar"); // host
-    proto::string(&mut out, 12, "HYPERCARHU"); // cid (id)
     proto::string(&mut out, 13, "HyperCar"); // manufacturer
     proto::string(&mut out, 14, "HyperCar HU"); // model
-    proto::string(&mut out, 15, "hypercar"); // product
-    proto::string(&mut out, 18, "1"); // incremental
     proto::string(&mut out, 19, "14"); // release
-    proto::string(&mut out, 20, "34"); // sdk
-    proto::varint(&mut out, 21, 34); // sdk_int
-    proto::string(&mut out, 24, "7.0.0"); // carlifeversion
+    proto::string(&mut out, 23, bt_address); // btaddress（required）
+    proto::string(&mut out, 24, bt_name); // btname（required）
     out
 }
 

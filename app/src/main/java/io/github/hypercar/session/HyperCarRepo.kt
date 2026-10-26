@@ -1,4 +1,4 @@
-package io.github.hypercar.session
+﻿package io.github.hypercar.session
 
 import android.bluetooth.BluetoothDevice
 import android.content.Context
@@ -98,6 +98,35 @@ object HyperCarRepo {
      * 用户看到的现象正是「装了新版本后车机上没有 CarPlay 图标了」。
      * 现在保留链路、按 2.5s 间隔重试 [AIRPLAY_MAX_ATTEMPTS] 次，仍不行才真失败。
      */
+    /**
+     * 实验（`SettingsStore.carlifeFirst`）：**先**把 CarLife 拉到前台，等它把蓝牙相关的
+     * 初始化折腾完，**再**启动 iAP2 监听/出站。
+     *
+     * 动机：2015 版协议明确"手机端 CarLife 在前台才产视频，不在前台只发 length=0 心跳包"，
+     * 这解释了 `Qin:0`；但 CarLife 一起前台就会抢蓝牙顶断 iAP2（2026-10-26 16:31 现场）。
+     * 如果它的抢蓝牙只是一次性启动动作，把顺序反过来两者就能共存。
+     */
+    private suspend fun experimentWakeCarLifeFirst() {
+        log("EXPERIMENT: 先拉 CarLife 到前台——等它做完蓝牙初始化，再起 iAP2")
+        val r = runCatching {
+            ShizukuTools.exec(
+                "am start -n com.baidu.carlife.xiaomi/com.baidu.carlife.CarlifeActivity",
+                8_000,
+            )
+        }.getOrNull()
+        log(
+            "EXPERIMENT: am start exit=${r?.code} " +
+                r?.out?.lineSequence()?.firstOrNull().orEmpty().take(100),
+        )
+        val adapter = runCatching { android.bluetooth.BluetoothAdapter.getDefaultAdapter() }.getOrNull()
+        for (i in 1..3) {
+            kotlinx.coroutines.delay(1_500)
+            val on = runCatching { adapter?.isEnabled }.getOrNull()
+            val bonded = runCatching { adapter?.bondedDevices?.size }.getOrNull()
+            log("EXPERIMENT: 第 ${i * 1500}ms —— BT enabled=$on 已配对=$bonded")
+        }
+        log("EXPERIMENT: 开始启动 iAP2（若紧接着出现 BT: 启动… 说明共存尝试开始）")
+    }
     private fun retryAirplayOrFail(detail: String) {
         // 车机主动关掉控制通道时**不要重试同一个端点**：它紧接着会把 7000 的监听也关掉，
         // 之后每次重试都是 ECONNREFUSED（2026-10-25 22:32 现场：6 轮 × 2.5s 全是拒连，
@@ -239,6 +268,21 @@ object HyperCarRepo {
     @Volatile
     private var lastVideoFrames: Long = 0L
 
+    // ---- 掉线自动重连（方案 A-3）----
+    // 车机侧链路断开（ACL 掉、AirPlay 会话结束、车机重启）后自动重新建链，
+    // 不需要用户去点「连接」。用户主动断开时置 userDisconnectRequested，不再重连。
+    private var reconnectJob: Job? = null
+
+    /** 连续失败次数（成功进 connected 时清零），用来做退避与上限。 */
+    private var reconnectAttempts = 0
+
+    @Volatile
+    private var userDisconnectRequested = false
+
+    /** 本次会话是否真正建立过链路（没建过就不要无限重连：那不是"掉线"）。 */
+    @Volatile
+    private var sessionHadLink = false
+
     /**
      * 会话资源是否还活着（蓝牙协商/WiFi 绑定/Rust 引擎）。拆除用它做幂等闸门：
      * 重复的 ACL 断开广播、service 二次转交都只会真正拆一次。
@@ -349,6 +393,11 @@ object HyperCarRepo {
             log("CONNECT: 已在连接/已连接，忽略重复触发")
             return
         }
+        // 手动/自动发起连接都算"用户想要连"，清掉断开标记与重连倒计时
+        userDisconnectRequested = false
+        reconnectJob?.cancel()
+        reconnectJob = null
+        sessionHadLink = false
         connecting = true
         sessionLive.set(true)
         // 阶段计时基准：之后每条 CONNECT 日志都带 +Nms，一眼看出卡在哪一步
@@ -359,6 +408,10 @@ object HyperCarRepo {
     }
 
     fun disconnect() {
+        // 用户主动断开：不再自动重连
+        userDisconnectRequested = true
+        reconnectJob?.cancel()
+        reconnectJob = null
         // 先掐在途连接：否则它会一直阻塞在「等 iAP2 端点」上，`connecting` 恒 true，
         // 之后再上车也进不来（表现为「连了一次就再也连不上」）。
         // 拆除等它在途协程真正退出后再动资源（join），避免「拆到一半新连接又建起来」；
@@ -431,6 +484,10 @@ object HyperCarRepo {
                         "断HFP/A2DP=${p.dropProfilesBeforeIap2} 档案A退场=${p.abortWhenCarPlayWindowClosed} " +
                         "保iAP2=${p.keepIap2AliveOnly}",
                 )
+            }
+            // ---- 实验：先拉 CarLife，再起 iAP2（SettingsStore.carlifeFirst，默认关）----
+            if (SettingsStore.carlifeFirst) {
+                experimentWakeCarLifeFirst()
             }
             val coordinator = Iap2Coordinator(
                 context,
@@ -689,10 +746,18 @@ object HyperCarRepo {
             // 日志实测从广播到开始监听 7240 常要十几秒（2026-10-26 00:24 现场）。
             // 窗口短了就会误判「无人监听」，转去 HU 监听模式——那样我们占住 7240，
             // 反而把慢启动的 CarLife 挡在门外。等待期间每 4s 补发一次唤醒广播。
-            val mdHost = probeLocalCarLifeMd(timeoutMillis = 30_000L) { attempt ->
-                if (attempt % 8 == 0) {   // 8 × 200ms ≈ 1.6s → 每 ~1.6s 之后 4s 补一次
-                    log("CARLIFE: 仍在等 CarLife 监听 7240（第 ${attempt * 200 / 1000}s），补发唤醒广播")
-                    wakeLocalCarLife()
+            // ⚠ 关掉联动时**必须跳过这个 30s 等待**：CarLife 不会被拉起，7240 永远不会监听，
+            // 而车机侧 CarPlay 只等十几秒就拆链路（2026-10-26 16:48 现场：iAP2 Phase 1 全过、
+            // 之后一直"仍在等 CarLife 监听 7240"到第 16s，车机 LINK closed，AirPlay 根本没开始）。
+            val mdHost = if (!SettingsStore.carlifeEnabled && !SettingsStore.carlifeFirst) {
+                log("CARLIFE: 联动已关闭——跳过 7240 探测，引擎直接以 HU 身份监听并马上协商 AirPlay")
+                null
+            } else {
+                probeLocalCarLifeMd(timeoutMillis = 30_000L) { attempt ->
+                    if (attempt % 8 == 0) {   // 8 × 200ms ≈ 1.6s → 每 ~1.6s 之后 4s 补一次
+                        log("CARLIFE: 仍在等 CarLife 监听 7240（第 ${attempt * 200 / 1000}s），补发唤醒广播")
+                        wakeLocalCarLife()
+                    }
                 }
             }
             // 只有 7240 在监听还不够：CarLife 被系统/后台拉起、服务还没起全时，
@@ -756,8 +821,20 @@ object HyperCarRepo {
      * ACTION_STOP 回灌，把「断开」刷成了每秒几百条。
      */
     private suspend fun runDisconnect(reason: String) {
-        if (!sessionLive.compareAndSet(true, false)) return
+        // 幂等：重复的断开事件（ACL 断开广播 + 引擎 ended + service 转交）只真正拆一次。
+        // 但**状态必须回 Idle**——曾经这里直接 return，导致链路已断、界面还显示"已连接"。
+        if (!sessionLive.compareAndSet(true, false)) {
+            _snapshots.update { s ->
+                if (s.link is LinkState.Connected) {
+                    s.copy(link = LinkState.Idle, carLife = CarLifeState.Idle)
+                } else {
+                    s
+                }
+            }
+            return
+        }
         push(link = LinkState.Stopping)
+        val hadLink = sessionHadLink
         releaseSessionResources()
         log("SESSION: 已断开（$reason）")
         _snapshots.update { s ->
@@ -769,6 +846,55 @@ object HyperCarRepo {
                 shizukuReady = ShizukuTools.isReady,
                 logRecording = logRecording,
             )
+        }
+        scheduleAutoReconnect(reason, hadLink)
+    }
+
+    /**
+     * 掉线自动重连（方案 A-3）。
+     *
+     * 触发条件：**本次会话真正建立过链路**（`hadLink`）、不是用户主动点断开、开着「上车自动连接」。
+     * 退避：1s → 2s → 4s → 8s → 15s，最多 5 次；成功进 connected 时计数清零。
+     *
+     * 为什么要自己重连而不是等 ACL 广播：ACL 只是**蓝牙层**的连接。链路断开后我们把
+     * iap2 监听一起停了（见 releaseSessionResources），若车机 ACL 一直没断，就再也不会
+     * 有 ACL_CONNECTED 广播进来 —— 表现就是"断了之后再也连不上，必须手动点连接"。
+     */
+    private fun scheduleAutoReconnect(reason: String, hadLink: Boolean) {
+        if (!hadLink) {
+            log("RECONNECT: 本次会话没建立过链路（$reason）——不自动重连")
+            return
+        }
+        if (userDisconnectRequested) {
+            log("RECONNECT: 用户主动断开——不自动重连")
+            return
+        }
+        if (!SettingsStore.autoConnect) {
+            log("RECONNECT: 「上车自动连接」关着——不自动重连")
+            return
+        }
+        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+            log("RECONNECT: 已连续失败 $reconnectAttempts 次——停止自动重连，等车机重新连入")
+            return
+        }
+        val ctx = appContext() ?: return
+        val attempt = reconnectAttempts + 1
+        val delayMs = RECONNECT_BACKOFF_MILLIS[
+            (attempt - 1).coerceAtMost(RECONNECT_BACKOFF_MILLIS.lastIndex),
+        ]
+        reconnectJob?.cancel()
+        reconnectJob = scope.launch {
+            // 车机自己先连回来就不用我们出手（ACL 广播会走 connect()）
+            if (streaming || connecting) return@launch
+            log("RECONNECT: 链路断开（$reason）——${delayMs}ms 后自动重连（第 $attempt/$MAX_RECONNECT_ATTEMPTS 次）")
+            kotlinx.coroutines.delay(delayMs)
+            if (userDisconnectRequested) return@launch
+            if (streaming || connecting) {
+                log("RECONNECT: 已经有连接在跑——取消本次重连")
+                return@launch
+            }
+            reconnectAttempts = attempt
+            connect(ctx)
         }
     }
 
@@ -1420,6 +1546,8 @@ object HyperCarRepo {
                 "negotiating" -> push(link = LinkState.Negotiating(detail))
                 "connected" -> {
                     streaming = true
+                    sessionHadLink = true
+                    reconnectAttempts = 0
                     push(
                         link = LinkState.Connected(
                             carName = SettingsStore.targetCarName ?: "BMW ID8.5",
@@ -1607,6 +1735,12 @@ object HyperCarRepo {
      * 顺带把设备上「CarLife/CarLink 系」的包名列进日志——包名配错时一眼可见。
      */
     private fun wakeLocalCarLife() {
+        // 用户默认关掉 CarLife 联动：CarLife 一激活就会抢蓝牙，把 CarPlay 的 ACL 顶断。
+        // （实验开关 carlifeFirst 打开时允许拉起：那正是我们要验证的场景。）
+        if (!SettingsStore.carlifeEnabled && !SettingsStore.carlifeFirst) {
+            log("CARLIFE: 联动已关闭（设置里关着）——不拉起 CarLife，避免它抢蓝牙顶掉 CarPlay")
+            return
+        }
         val pkg = resolveCarLifePackage()
         _snapshots.value = _snapshots.value.copy(carLife = CarLifeState.Waiting())
 
@@ -1623,29 +1757,14 @@ object HyperCarRepo {
         if (ShizukuTools.isReady && pkg == "com.miui.carlink") {
             wakeJob?.cancel()
             wakeJob = scope.launch {
-                // 目标 display：-1 = 主屏。-1 以外是实验开关（把 CarLife 投到副屏/虚拟屏，
-                // 主屏留给 HyperCar）。屏不存在时 am start 会失败，下面自动回退主屏。
-                val wakeDisplay = SettingsStore.carlifeWakeDisplay
-                if (wakeDisplay >= 0) {
-                    // 先把设备上现有的 display 打出来：填错 id 时一眼能看出来
-                    val dump = runCatching {
-                        ShizukuTools.exec(
-                            "dumpsys display | grep -E 'mDisplayId=|DisplayDeviceInfo\\{' | head -8",
-                            5_000,
-                        )
-                    }.getOrNull()
-                    dump?.out?.lineSequence()?.filter { it.isNotBlank() }?.forEach { line ->
-                        log("WAKE: 显示设备 $line")
-                    }
-                }
-                fun startArgs(display: Int): String =
-                    if (display >= 0) "-n $directLaunch --display $display" else "-n $directLaunch"
-
+                // 只拉主屏：副屏（--display N）方案随「CarLife 启动屏」设置一起删了。
                 val started = runCatching {
-                    ShizukuTools.exec("am start ${startArgs(wakeDisplay)}", 8_000)
+                    ShizukuTools.exec("am start -n $directLaunch", 8_000)
                 }.getOrNull()
-                log("WAKE: 拉起 CarLife 引擎页（display=$wakeDisplay）exit=${started?.code} " +
-                    started?.out?.lineSequence()?.firstOrNull().orEmpty().take(120))
+                log(
+                    "WAKE: 拉起 CarLife 引擎页 exit=${started?.code} " +
+                        started?.out?.lineSequence()?.firstOrNull().orEmpty().take(120),
+                )
                 carLifeLaunchedAt = SystemClock.uptimeMillis()
                 kotlinx.coroutines.delay(3_000)
                 // 会话可能在这 3s 里就失败了（AirPlay 端口连不上 → releaseSessionResources
@@ -1653,16 +1772,6 @@ object HyperCarRepo {
                 if (!sessionLive.get()) {
                     log("WAKE: 会话已结束——放弃继续拉起 CarLife（避免留下空壳进程）")
                     return@launch
-                }
-                if (!probeCarLifeOnce() && wakeDisplay >= 0) {
-                    // 副屏方案不可用（这块屏不存在/不允许投）：退回主屏，别把 CarLife 弄没
-                    log("WAKE: display=$wakeDisplay 上没起来（7240 未监听）——回退主屏重试")
-                    runCatching { ShizukuTools.exec("am start ${startArgs(-1)}", 8_000) }
-                    kotlinx.coroutines.delay(3_000)
-                    if (!sessionLive.get()) {
-                        log("WAKE: 会话已结束——放弃服务兜底")
-                        return@launch
-                    }
                 }
                 if (!probeCarLifeOnce() && sessionLive.get()) {
                     val svc = runCatching {
@@ -1835,6 +1944,7 @@ object HyperCarRepo {
 
     /** 强杀本机 CarLife 后重新拉起（只用于空壳自愈）。 */
     private fun restartLocalCarLife() {
+        if (!SettingsStore.carlifeEnabled) return
         scope.launch {
             for (pkg in listOf("com.baidu.carlife.xiaomi", "com.baidu.carlife")) {
                 runCatching { ShizukuTools.exec("am force-stop $pkg", 4_000) }
@@ -2099,6 +2209,7 @@ object HyperCarRepo {
 
     private fun fail(reason: String) {
         log("SESSION 失败: $reason")
+        val hadLink = sessionHadLink
         // 失败即停蓝牙/WiFi 侧（保留 Failed 状态给 UI）：否则 iAP2 出站循环会继续每 3s
         // 断一次车机音频配置文件，还占着 RFCOMM 监听，下一次上车也会被旧会话拖住。
         releaseSessionResources()
@@ -2106,6 +2217,9 @@ object HyperCarRepo {
             link = LinkState.Failed(reason),
             carLife = CarLifeState.Idle,
         )
+        // 失败也走自动重连（同样受 hadLink / 用户断开 / 自动连接开关 / 次数上限约束），
+        // 否则"车机主动关控制通道"这类场景会一直停在 Failed 等人点。
+        scheduleAutoReconnect("失败: $reason", hadLink)
     }
 
     private fun push(link: LinkState? = null, carLife: CarLifeState? = null) {
@@ -2370,7 +2484,7 @@ object HyperCarRepo {
     /**
      * 诊断：把当前所有 display 打进行日志（判断有没有可投的副屏/虚拟屏）。
      *
-     * 用途：设置页「CarLife 启动屏」要填 display id —— 主屏是 0，CarWith 这类实现会
+     * 用途：排查副屏/虚拟屏（历史上的「CarLife 启动屏」设置已删除，这里只留诊断能力）——
      * 在副屏（如 10）上跑。这里直接读 `dumpsys display`，把 id/名称/尺寸/flags 打出来，
      * 就不用连电脑查了。仅当有 Shizuku 时可用（`dumpsys` 需要 shell 权限）。
      */
@@ -2512,6 +2626,7 @@ object HyperCarRepo {
     }
 
     private fun startCarLifeDisplay() {
+        if (!SettingsStore.carlifeEnabled) return
         val ctx = appContext() ?: return
         // register(tag) 的 tag 不一定是任意字符串：CarLife 很可能拿它当"客户端标识"校验。
         // 先按最可能的值逐个试，命中（返回 1）才继续 getDisplayController/startDisplay。
@@ -2835,6 +2950,10 @@ object HyperCarRepo {
 
     /** 停止时等在途连接协程退出的上限（超过就先拆，连接侧另有 sessionLive 兜底）。 */
     private const val JOIN_TIMEOUT_MILLIS = 5_000L
+
+    /** 掉线自动重连：退避序列（ms）与最大连续尝试次数。 */
+    private val RECONNECT_BACKOFF_MILLIS = longArrayOf(1_000L, 2_000L, 4_000L, 8_000L, 15_000L)
+    private const val MAX_RECONNECT_ATTEMPTS = 6
 
     /** CarLife CMD 端口（MD 监听时我们改拨它）与探测窗口。 */
     private const val CARLIFE_CMD_PORT = 7240

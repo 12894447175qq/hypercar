@@ -1,4 +1,4 @@
-package io.github.hypercar.ui.screens
+﻿package io.github.hypercar.ui.screens
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -905,9 +905,35 @@ private fun DialogTextField(
 private fun ResolutionSection() {
     // 分辨率改为自由输入（原三个预设已删除）：编码尺寸随机型而异，
     // 写死选项反而逼用户改代码。输入即生效，偶数对齐在配置下发前完成。
+    var carlifeOn by rememberSaveable { mutableStateOf(SettingsStore.carlifeEnabled) }
+    var carlifeFirst by rememberSaveable { mutableStateOf(SettingsStore.carlifeFirst) }
     var widthText by rememberSaveable { mutableStateOf(SettingsStore.carlifeWidth.toString()) }
     var heightText by rememberSaveable { mutableStateOf(SettingsStore.carlifeHeight.toString()) }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        SectionLabel(text = "CarLife 联动")
+        GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)) {
+            SwitchRow(
+                title = "启用 CarLife 联动",
+                subtitle = "默认关闭。开启后 HyperCar 会拉起 CarLife 并尝试驱动投屏；但小米 CarLife 一激活就会抢占蓝牙，实测会把 CarPlay 的 iAP2 链路顶断。",
+                checked = carlifeOn,
+                onCheckedChange = {
+                    carlifeOn = it
+                    SettingsStore.carlifeEnabled = it
+                    io.github.hypercar.settings.SettingsRevision.bump()
+                },
+            )
+            SwitchRow(
+                title = "CarLife 优先启动（实验）",
+                subtitle = "先拉 CarLife 到前台、等它做完蓝牙初始化，再起 iAP2。CarLife 只有在前台才产视频，" +
+                    "但它一起前台就会抢蓝牙——这个开关用来验证「顺序反转后能否共存」。",
+                checked = carlifeFirst,
+                onCheckedChange = {
+                    carlifeFirst = it
+                    SettingsStore.carlifeFirst = it
+                    io.github.hypercar.settings.SettingsRevision.bump()
+                },
+            )
+        }
         SectionLabel(text = "CarLife 编码分辨率（兜底值）")
         GlassPanel(
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 16.dp),
@@ -1200,49 +1226,7 @@ private fun WakePackageSection() {
                     modifier = Modifier.fillMaxWidth(),
                 )
             }
-            // ---- CarLife 启动屏（实验开关）----
-            Spacer(modifier = Modifier.height(14.dp))
-            Text(
-                text = "CarLife 启动屏（-1 = 手机主屏）",
-                style = MaterialTheme.typography.titleSmall,
-                color = TextPrimary,
-            )
             Spacer(modifier = Modifier.height(6.dp))
-            var displayText by rememberSaveable { mutableStateOf(SettingsStore.carlifeWakeDisplay.toString()) }
-            OutlinedTextField(
-                value = displayText,
-                onValueChange = { input ->
-                    // 只允许 -1 或数字：填错会让 am start 直接失败
-                    val cleaned = input.filter { it.isDigit() || it == '-' }.take(3)
-                    displayText = cleaned
-                    SettingsStore.carlifeWakeDisplay = cleaned.toIntOrNull() ?: -1
-                },
-                label = { Text("display id", style = MaterialTheme.typography.labelSmall) },
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                shape = RoundedCornerShape(14.dp),
-                colors = TextFieldDefaults.colors(
-                    focusedContainerColor = SurfaceInset,
-                    unfocusedContainerColor = SurfaceInset,
-                    focusedTextColor = MintGreen,
-                    unfocusedTextColor = MintGreen,
-                    cursorColor = ElectricCyan,
-                    focusedLabelColor = ElectricCyan,
-                    unfocusedLabelColor = TextSecondary,
-                    focusedIndicatorColor = ElectricCyan,
-                    unfocusedIndicatorColor = StrokeGlass,
-                ),
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Spacer(modifier = Modifier.height(6.dp))
-            Text(
-                text = "默认 -1：CarLife 窗口显示在手机主屏。填副屏 id（如 10；先看日志里的 " +
-                    "「WAKE: 显示设备 …」）可把窗口移出主屏；屏不存在或不允许投时，唤醒会自动回退主屏。\n" +
-                    "注意：CarLife 的 Activity 必须保持可见前台，否则它自带的 35 秒空闲看门狗会杀进程——" +
-                    "所以「无界面服务」启动方式不可用（实测卡在 Phase 1）。",
-                style = MaterialTheme.typography.labelSmall,
-                color = TextSecondary,
-            )
         }
     }
 }

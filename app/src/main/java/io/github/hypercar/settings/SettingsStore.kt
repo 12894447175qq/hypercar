@@ -1,4 +1,4 @@
-package io.github.hypercar.settings
+﻿package io.github.hypercar.settings
 
 import android.content.Context
 import android.content.SharedPreferences
@@ -38,7 +38,8 @@ object SettingsStore {
     private const val KEY_FPS = "carlife_fps"
     private const val KEY_ENABLE_AUDIO = "enable_audio"
     private const val KEY_CARLIFE_PKG = "carlife_package"
-    private const val KEY_CARLIFE_WAKE_DISPLAY = "carlife_wake_display"
+    private const val KEY_CARLIFE_ENABLED = "carlife_enabled"
+    private const val KEY_CARLIFE_FIRST = "carlife_first"
     private const val KEY_IAP2_KEEPALIVE_ONLY = "iap2_keepalive_only"
     private const val KEY_KEEP_ALIVE_STATS = "keep_alive_stats"
     private const val KEY_DEBUG_LOG = "debug_log_enabled"
@@ -154,9 +155,25 @@ object SettingsStore {
      * 主屏留给 HyperCar——**前提是设备上真的存在这块屏**；不存在时 `am start` 会失败，
      * 唤醒逻辑会自动回退主屏重试，不会把 CarLife 弄没。
      */
-    var carlifeWakeDisplay: Int
-        get() = p().getInt(KEY_CARLIFE_WAKE_DISPLAY, -1)
-        set(v) = p().edit().putInt(KEY_CARLIFE_WAKE_DISPLAY, v).apply()
+    /**
+     * 是否启用 CarLife 联动（默认**关**）。
+     *
+     * 关掉后不拉起、不探测、不做 AIDL 投屏探测：小米 CarLife 一被激活就会去动蓝牙
+     * （车机互联要抢 BT 通道），实测会把 CarPlay 的 iAP2 ACL 链路顶断
+     * （2026-10-26 16:31 现场：强制前台 3 次 → 车机重连 → 会话 torn down）。
+     */
+    var carlifeEnabled: Boolean
+        get() = p().getBoolean(KEY_CARLIFE_ENABLED, false)
+        set(v) = p().edit().putBoolean(KEY_CARLIFE_ENABLED, v).apply()
+    /**
+     * 实验开关（默认关）：**先**把 CarLife 拉到前台，等它做完蓝牙初始化，**再**启动 iAP2。
+     *
+     * 依据：CarLife 只有在前台才产视频（2015 协议「视频生成策略」），但它一起前台就会
+     * 抢蓝牙把 iAP2 链路顶断。若它的"抢蓝牙"只发生在启动阶段，顺序反转后两者可能共存。
+     */
+    var carlifeFirst: Boolean
+        get() = p().getBoolean(KEY_CARLIFE_FIRST, false)
+        set(v) = p().edit().putBoolean(KEY_CARLIFE_FIRST, v).apply()
 
     /**
      * 联调开关：只保持 iAP2 链路，不在手机上启动 AirPlay 引擎。

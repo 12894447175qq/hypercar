@@ -112,6 +112,9 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="io.github.hypercar.PROBE_CAST" />
+                <action android:name="io.github.hypercar.PROBE_CONNECT" />
+                <action android:name="io.github.hypercar.PROBE_EXPERIMENT" />
+                <action android:name="io.github.hypercar.PROBE_DISCONNECT" />
             </intent-filter>
         </receiver>
 

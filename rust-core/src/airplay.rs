@@ -820,6 +820,7 @@ fn spawn_event_dispatcher(
         let mut tip_down = false; // 上一次报告的按下状态（down/move/up 边沿检测）
         let mut seen_commands: Vec<String> = Vec::new();
         let mut hid_reports: u64 = 0;
+    let mut touch_logged: u32 = 0; // 触摸换算诊断计数（前几次 + 每 200 次记一行）
         let mut other_lines: u64 = 0;
         loop {
             let msg = tokio::select! {
@@ -898,6 +899,7 @@ fn spawn_event_dispatcher(
                             display_size,
                             &target_size,
                             &mut tip_down,
+                            &mut touch_logged,
                         );
                     }
                 }
@@ -927,6 +929,7 @@ fn handle_hid_report(
     display: (u32, u32),
     target_size: &Arc<Mutex<(u32, u32)>>,
     tip_down: &mut bool,
+    logged: &mut u32,
 ) {
     if report.len() < 5 {
         // 短报告按 Consumer 媒体键候选处理（奥迪 uuid=0 是媒体键设备）
@@ -978,8 +981,29 @@ fn handle_hid_report(
             u16::from_le_bytes([report[3], report[4]]) as u32,
         )
     };
-    let x = (x_raw * target.0 / display.0.max(1)).min(target.0 - 1);
-    let y = (y_raw * target.1 / display.1.max(1)).min(target.1 - 1);
+    // 防下溢：`target.0 - 1` 在 target 为 0 时 release 会回绕成巨大值、
+    // debug 直接 panic（编码器还没回报尺寸时就是 0）。
+    let (tw, th) = (target.0.max(1), target.1.max(1));
+    let (dw, dh) = (display.0.max(1), display.1.max(1));
+    let x = (x_raw.saturating_mul(tw) / dw).min(tw.saturating_sub(1));
+    let y = (y_raw.saturating_mul(th) / dh).min(th.saturating_sub(1));
+    *logged = logged.wrapping_add(1);
+    if *logged <= 5 || *logged % 200 == 0 {
+        crate::emit_log(&format!(
+            "TOUCH: 车机({x_raw},{y_raw}) 空间 {dw}x{dh} → 画布 {tw}x{th} = ({x},{y})（第 {n} 次）",
+            n = *logged
+        ));
+        if *logged == 1 {
+            let rd = dw as f32 / dh as f32;
+            let rt = tw as f32 / th as f32;
+            if (rd - rt).abs() / rt.max(0.1) > 0.03 {
+                crate::emit_log(&format!(
+                    "TOUCH: ⚠ 触摸空间 {dw}x{dh}（{rd:.2}:1）与画布 {tw}x{th}（{rt:.2}:1）宽高比不一致——\
+                     接收端拉伸显示时线性映射正确；若它加了黑边，边缘会偏",
+                ));
+            }
+        }
+    }
     // 动作边沿：按下沿 → DOWN，保持 → MOVE，抬起沿 → UP。
     // 用 **CarLife 语义**（0=DOWN/1=UP/2=MOVE），不是 Android MotionEvent 的 1/2/3——
     // 下游 carlife::inject_touch 直接按 CarLife 裸结构封包。
@@ -1151,6 +1175,9 @@ fn random_uuid_upper() -> String {
 // 每套都是 1 秒 @60fps（1 个 IDR + 59 个极小 P 帧）：既占住屏幕流，又不是黑屏。
 const STANDBY_WIDE: &[u8] = include_bytes!("../assets/standby-wide.h264");
 const STANDBY_WIDE_16X9: &[u8] = include_bytes!("../assets/standby-wide16x9.h264");
+// 2560x744 宽屏母版（由 1280x372 用 lanczos 放大生成，ffmpeg 一次成型）：
+// 宝马 iD8.5 这类 2560x744 的带鱼屏直接用原生尺寸，车机不用再放大 → 待机字更锐。
+const STANDBY_WIDE_2X: &[u8] = include_bytes!("../assets/standby-wide-2x.h264");
 
 /// 一套待机素材：帧序列 + 母版原始尺寸（VideoConfig 必须按母版尺寸下发）。
 pub(crate) struct StandbySet {
@@ -1164,8 +1191,16 @@ pub(crate) fn standby_for_aspect(width: u32, height: u32) -> Option<StandbySet> 
     if width == 0 || height == 0 {
         return None;
     }
+    // 按**最接近的宽高比**挑母版（原来用固定 2.6 阈值：2560x744=3.44、2732x794=3.44
+    // 走宽屏都对，但 1920x900=2.13 这类中间比例会被强行拉伸变形）。
     let ratio = width as f32 / height as f32;
-    let (bytes, w, h) = if ratio > 2.6 {
+    let wide_ratio = 1280.0f32 / 372.0f32; // 3.441
+    let wide16_ratio = 1280.0f32 / 720.0f32; // 1.778
+    let wide = (ratio - wide_ratio).abs() <= (ratio - wide16_ratio).abs();
+    // 宽屏且车机宽度 >= 2000 时直接用 2560x744 原生母版（否则用 1280x372，车机放大）
+    let (bytes, w, h) = if wide && width >= 2000 {
+        (STANDBY_WIDE_2X, 2560u32, 744u32)
+    } else if wide {
         (STANDBY_WIDE, 1280u32, 372u32)
     } else {
         (STANDBY_WIDE_16X9, 1280u32, 720u32)
@@ -1178,10 +1213,13 @@ fn frames_of(w: u32, h: u32, data: &'static [u8]) -> Option<&'static [&'static [
     use std::sync::OnceLock;
     static WIDE: OnceLock<Vec<&'static [u8]>> = OnceLock::new();
     static WIDE16: OnceLock<Vec<&'static [u8]>> = OnceLock::new();
+    static WIDE2X: OnceLock<Vec<&'static [u8]>> = OnceLock::new();
     if w == 1280 && h == 372 {
         Some(WIDE.get_or_init(|| split_annexb_frames(STANDBY_WIDE)))
     } else if w == 1280 && h == 720 {
         Some(WIDE16.get_or_init(|| split_annexb_frames(STANDBY_WIDE_16X9)))
+    } else if w == 2560 && h == 744 {
+        Some(WIDE2X.get_or_init(|| split_annexb_frames(STANDBY_WIDE_2X)))
     } else {
         let _ = data;
         None

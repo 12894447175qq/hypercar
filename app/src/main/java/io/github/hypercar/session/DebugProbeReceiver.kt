@@ -14,8 +14,18 @@ class DebugProbeReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         runCatching {
             HyperCarRepo.init(context)
-            java.io.File(context.getExternalFilesDir(null), "cast_probe.txt").writeText("")
-            HyperCarRepo.startCarLifeDisplayProbe()
+            if (intent.action == "io.github.hypercar.PROBE_EXPERIMENT") {
+                // 一键打开「CarLife 优先启动」实验并立刻连接，省得手动翻设置页
+                io.github.hypercar.settings.SettingsStore.carlifeFirst = true
+                HyperCarRepo.connect(context)
+            } else if (intent.action == "io.github.hypercar.PROBE_CONNECT") {
+                HyperCarRepo.connect(context)
+            } else if (intent.action == "io.github.hypercar.PROBE_DISCONNECT") {
+                HyperCarRepo.disconnect()
+            } else {
+                java.io.File(context.getExternalFilesDir(null), "cast_probe.txt").writeText("")
+                HyperCarRepo.startCarLifeDisplayProbe()
+            }
         }
     }
 }

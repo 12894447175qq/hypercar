@@ -136,7 +136,7 @@ private fun Header(
     onExport: () -> Unit,
     /** 一键反馈的结果提示（成功/失败文案交给页面统一弹 toast）。 */
     onFeedback: (String) -> Unit,
-    /** 诊断：把当前 display 列表打进日志（配合设置页「CarLife 启动屏」）。 */
+    /** 诊断：把当前 display 列表打进日志（排查副屏/虚拟屏用）。 */
     onDumpDisplays: () -> Unit,
     /** 诊断：抓 CarLife 的 Activity/Surface/logcat 现场。 */
     onDumpCarLifeDiag: () -> Unit,
@@ -253,7 +253,7 @@ private fun Header(
                 borderColor = ElectricCyan,
                 horizontalPadding = 8.dp,
             )
-            // 副屏探测：把 dumpsys display 的摘要打进日志，用来填「CarLife 启动屏」。
+            // 副屏探测：把 dumpsys display 的摘要打进日志（排查副屏/虚拟屏用）。
             CapsuleButton(
                 text = "显示器",
                 onClick = {

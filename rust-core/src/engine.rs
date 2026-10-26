@@ -1,4 +1,4 @@
-//! 网关引擎编排：CarLife 回环 ⇄ AirPlay 推流 的粘合层。
+﻿//! 网关引擎编排：CarLife 回环 ⇄ AirPlay 推流 的粘合层。
 //!
 //! 数据面（全部零转码）：
 //!  - 视频：CarLife 8240 的 H.264 Annex B 裸流 → ScreenSender（128B 头 + ChaCha20-Poly1305）
@@ -107,10 +107,13 @@ pub async fn run_engine(
         height: cfg.height,
         fps: cfg.fps,
         voice: cfg.voice,
+        // HU_INFO 里 required 的 btaddress/btname：用 iAP2 的稳定设备号当车机蓝牙 MAC
+        bt_address: cfg.device_id.clone(),
+        bt_name: "BMW".to_string(),
     };
     let (hub, mut life_events) = match cfg.md_host.clone() {
         Some(host) => CarLifeHub::connect(life_cfg, host, stop.clone())?,
-        None => match CarLifeHub::start(life_cfg, stop.clone()) {
+        None => match CarLifeHub::start(life_cfg.clone(), stop.clone()) {
             Ok(v) => v,
             // **端口被本机 CarLife 占了 = 它才是监听方**：小米 CarLife/CarWith 在
             // 「车辆热点 → 开始连接」后自己 bind 7240~9340 等车机连入。此时我们改当客户端，
@@ -223,6 +226,11 @@ pub async fn run_engine(
             let mut last_real_frame: Option<std::time::Instant> = None;
             let mut standby_idx: usize = 0;
             let mut standby_size_sent: Option<(u32, u32)> = None;
+            // 待机节奏：前 2s 全速（60fps）让接收端锁住流，之后降到 15fps 省带宽；
+            // 每 5s 从 IDR 重放一次，迟到的/卡住的解码器能自己恢复。
+            let mut standby_started: Option<std::time::Instant> = None;
+            let mut standby_tick: u32 = 0;
+            let mut standby_last_idr = std::time::Instant::now();
             loop {
                 tokio::select! {
                     _ = stop_v.notified() => return,
@@ -303,15 +311,34 @@ pub async fn run_engine(
                                             }
                                             standby_size_sent = Some((set.width, set.height));
                                             standby_idx = 0;
+                                            standby_tick = 0;
+                                            standby_started = Some(std::time::Instant::now());
+                                            standby_last_idr = std::time::Instant::now();
                                             emit_log(&format!(
-                                                "AIRPLAY: 待机循环开始（母版 {}x{}，{} 帧 @60fps）",
-                                                set.width, set.height, set.frames.len()
+                                                "AIRPLAY: 待机循环开始（母版 {}x{}，{} 帧；前 2s 60fps，之后 15fps，每 5s 补 IDR）",
+                                                set.width,
+                                                set.height,
+                                                set.frames.len()
                                             ));
                                         }
-                                        let frame = set.frames[standby_idx % set.frames.len()];
-                                        let pts = crate::timing::monotonic_nanos() / 1_000;
-                                        let _ = s.send_video_annexb(frame, pts).await;
-                                        standby_idx = standby_idx.wrapping_add(1);
+                                        standby_tick = standby_tick.wrapping_add(1);
+                                        let warmup = standby_started
+                                            .map(|t| t.elapsed() < Duration::from_secs(2))
+                                            .unwrap_or(true);
+                                        // tick 是 16ms（≈60fps）：每 4 拍发一帧 = 15fps
+                                        let mut due = warmup || standby_tick % 4 == 0;
+                                        if standby_last_idr.elapsed() >= Duration::from_secs(5) {
+                                            // 强制从 IDR 重放：接收端中途重启/丢包也能恢复画面
+                                            standby_idx = 0;
+                                            standby_last_idr = std::time::Instant::now();
+                                            due = true;
+                                        }
+                                        if due {
+                                            let frame = set.frames[standby_idx % set.frames.len()];
+                                            let pts = crate::timing::monotonic_nanos() / 1_000;
+                                            let _ = s.send_video_annexb(frame, pts).await;
+                                            standby_idx = standby_idx.wrapping_add(1);
+                                        }
                                     }
                                 }
                                     }
