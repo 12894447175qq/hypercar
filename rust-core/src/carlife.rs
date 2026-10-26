@@ -73,6 +73,8 @@ const CMD_SCREEN_ON: u32 = 0x0001_0018;
 const CMD_FOREGROUND: u32 = 0x0001_001B;
 const CMD_MD_MODULE_STATUS: u32 = 0x0001_0026;
 const CMD_HU_STATISTIC_INFO: u32 = 0x0001_8027;
+/// 模块级控制（文档 §10.2.2）：CarlifeModuleStatusList{cnt, moduleStatus{moduleID,statusID}}
+const CMD_HU_MODULE_CONTROL: u32 = 0x0001_8028;
 const CMD_MD_CAR_DATA_SUBSCRIBE: u32 = 0x0001_0031;
 const CMD_HU_CAR_DATA_SUBSCRIBE_DONE: u32 = 0x0001_8032;
 const CMD_HU_AUTHEN_REQUEST: u32 = 0x0001_8048;
@@ -757,6 +759,17 @@ async fn handle_cmd_client(
                     emit_log(&format!(
                         "CARLIFE: 首帧视频未到——第 {start_retries} 次补发 LAUNCH_MODE_NORMAL + VIDEO_ENCODER_START"
                     ));
+                    // 实验 A（2026-10-27）：除了 LAUNCH_MODE，再补两条"把投屏拉起来"的命令：
+                    //   ① `MSG_CMD_GO_TO_FOREGROUND(0x18025)`：把 CarLife 切回前台（AOA 场景用，无线场景也归档在文档里）
+                    //   ② `MSG_CMD_MODULE_CONTROL(0x18028)`：显式 enable CARLIFE_PHONE 模块（moduleID=1, status=1）
+                    // 目的：验证 Qin:0 是不是"渲染源没被启用"而不是"没有 Surface"。
+                    let _ = send_cmd(&mut wr, CMD_HU_GO_TO_FOREGROUND, &[]).await;
+                    let _ = send_cmd(
+                        &mut wr,
+                        CMD_HU_MODULE_CONTROL,
+                        &proto_module_control_payload(1, 1),
+                    )
+                    .await;
                 }
                 continue;
             }
@@ -814,7 +827,15 @@ async fn handle_cmd_client(
                         // `setFeature(key,value)` 后把 listFeatures() 回给 MD）。
                         // 我们以前只回自己写死的 6 个 key，等于把 MD 想要的能力
                         // （可能包含投屏/焦点/仪表盘等解锁项）全丢了。
-                        let asked = parse_feature_config(&payload);
+                        let asked_raw = parse_feature_config(&payload);
+                        // 实验 A（2026-10-27）：把 MD 请求里值为 0 的项**提升为 1**再回显。
+                        // 依据：官方 HU 是 setFeature(key,value) 后回 listFeatures()，
+                        // 如果 MD 请求里某些"能力位"是 0，原样回 0 等于告诉它"车机没有这个能力"，
+                        // 它可能因此不建渲染源（Qin:0 的另一条候选解释）。
+                        let mut asked: Vec<(String, u32)> = asked_raw
+                            .into_iter()
+                            .map(|(k, v)| (k, if v == 0 { 1 } else { v }))
+                            .collect();
                         if !asked.is_empty() {
                             let keys: Vec<String> =
                                 asked.iter().map(|(k, v)| format!("{k}={v}")).collect();
@@ -1192,6 +1213,21 @@ fn proto_encoder_info_payload(width: u32, height: u32, fps: u32) -> Vec<u8> {
     proto::varint(&mut out, 1, width as u64);
     proto::varint(&mut out, 2, height as u64);
     proto::varint(&mut out, 3, fps as u64);
+    out
+}
+
+/// `CarlifeModuleStatusList`：`1=cnt, 2=repeated{1=moduleID, 2=statusID}`。
+///
+/// 官方文档 §10.2.2 `MSG_CMD_MODULE_CONTROL(0x18028)`：HU 用它启/停某个模块
+/// （`ModuleId{CARLIFE_PHONE=1, NAVI=2, MUSIC=3, VR=4, CONNECT=5, MIC=6, MEDIAPCM=7, EDOG=8, CRUISE=9}`），
+/// status=1 表示 enable。CarLife 若把"投屏模块"当成未启用，就不会建渲染源（Qin:0 的一种可能）。
+fn proto_module_control_payload(module_id: u32, status: u32) -> Vec<u8> {
+    let mut item = Vec::with_capacity(16);
+    proto::varint(&mut item, 1, module_id as u64);
+    proto::varint(&mut item, 2, status as u64);
+    let mut out = Vec::with_capacity(24);
+    proto::varint(&mut out, 1, 1);
+    proto::bytes(&mut out, 2, &item);
     out
 }
 
@@ -1908,6 +1944,7 @@ fn spawn_vr_listener(
         }
     });
 }
+
 
 
 
