@@ -1,4 +1,4 @@
-﻿//! 网关引擎编排：CarLife 回环 ⇄ AirPlay 推流 的粘合层。
+//! 网关引擎编排：CarLife 回环 ⇄ AirPlay 推流 的粘合层。
 //!
 //! 数据面（全部零转码）：
 //!  - 视频：CarLife 8240 的 H.264 Annex B 裸流 → ScreenSender（128B 头 + ChaCha20-Poly1305）

@@ -746,3 +746,599 @@ CarLife 可能把画面送进"CarWith 会话"的那条通路，而不是直连 H
 - **分屏 / 画中画**：窗口还在，只是变小；CarLife 不支持 PiP 时直接无效。
 - **亮度 0 / 息屏保活**：Activity 仍算前台，但手机等于不可用（驾驶时取导航还得恢复亮度）。
 - **禁用看门狗**：需要改 CarLife APK（LSPatch/Xposed）或 root，超出"装个 App 就能用"的范围。
+
+## 18. 2026-10-26 12:47 桌面联调日志（接收端 = DiPlay / xcertplay）
+
+日志 `hypercar-log-20261026-124902.txt`（0.1.0.49）。这是一次**桌面联调**，不是真车：
+接收端是 `com.shilapi.xcertplay`（DiPlay）跑在 192.168.1.208:7000，热点 SSID=YK。
+
+链路本身没问题：iAP2 识别 → 0x5703 拿凭据 → 入网（192.168.1.111/24）→ `_carplay-ctrl`
+广播 → 车机 `GET /ctrl-int/1/connect` 邀请 → 0x4301 给出 `192.168.1.208:7000`。
+失败点在**连 AirPlay 控制端口**：
+
+```
+12:47:54.362  PROBE 车机端口 192.168.1.208 → 7000=开(79ms) 7001=关 7100=关 5000=关 62078=关
+12:47:56.423  SESSION 保活结束（链路断开）      ← 接收端把 iAP2 关了
+12:47:57.311  ✗ 经 Wi-Fi 网络 #231 连 192.168.1.208:7000 失败（ECONNREFUSED）
+12:47:57.392  SESSION 失败: AirPlay 控制端口连接失败
+```
+
+### 18.1 三个真问题（已修）
+
+1. **预探测把接收端的 AirPlay 服务"探没了"**：老的 `probeCarPorts()` 会对
+   7000/7001/7100/5000/62078 各 `connect()` 一次再立刻 close（只为打日志）。
+   DiPlay 这类单控制器实现会把它当成"控制器连上又掉线"，随即关掉 AirPlay 服务——
+   日志里 54.3s 探测 7000 还开着、57.3s 真连就全 refused。**已删除该预探测**
+   （连接尝试本身就会把开/关打进日志）。
+2. **端口连接只有一轮，失败即放弃**：接收端/车机常在 ctrl 邀请之后才把 7000 打开，
+   或中途重启 AirPlay 服务。现在有 **8 秒重试窗口**（首轮 2.5s 超时，重试轮 1.2s），
+   每 400ms 一轮，期间若 0x4301 晚到就立刻改用它的地址/端口。
+3. **"拉起 CarLife"与"失败清理"赛跑**：AirPlay 端口失败 → `releaseSessionResources()`
+   force-stop CarLife（收窗口），但唤醒协程还在 3s 等待里，随后又把
+   `CarlifeConnectService` 拉起来 → 留下"7240 在听但不回 Phase 1"的空壳
+   （日志 57.6s 清理、00.4s 又拉起服务，就是这个）。现在 `releaseSessionResources()`
+   会先 `wakeJob?.cancel()`，唤醒协程自己在每步前后也检查 `sessionLive`。
+
+### 18.2 这次失败不全是我们的问题
+
+接收端在 12:47:56.4 主动关掉了 RFCOMM，并在之后拒绝 7000 连接；如果 DiPlay 只在
+iAP2 链路存活期间提供 AirPlay 服务，那就必须**在 BT 断开之前**把 AirPlay 控制连接建好。
+这次的时间线是：0x4301 在 12:47:54.17 就给出了 `192.168.1.208:7000`，我们却还去等
+3 秒 mDNS（54.26 → 57.26），等真正去连时接收端已经把 7000 关了。
+
+**已修**：`0x4301` 已给出地址+端口时也跳过 mDNS（之前只跳过 ctrl 邀请来的端点）。
+现在这种情况会在 54.2s 就直接连 7000，比 BT 被拆早 2 秒多——这是这类"接收端只在
+iAP2 期间开 AirPlay"的实现能否连上的关键差别。
+
+## 19. 2026-10-26 13:03 联调（0.1.0.50）：AirPlay 全通、CarLife 握手全过，但 8240 仍无帧
+
+日志 `hypercar-log-20261026-130400.txt`，接收端仍是 DiPlay（192.168.1.208:7000）。
+
+### 19.1 这一版修好的部分（上一轮的 4 处改动生效）
+
+```
+13:03:40.008  MDNS: 0x4301 已给出端点 [192.168.1.208]:7000——跳过 mDNS 查询   ← 省掉 3s
+13:03:40.128  NET ✓ 192.168.1.208:7000 已连通（Wi-Fi 网络 #233，112ms）      ← 一次就连上
+13:03:40.169  CARLIFE: 第 1 次零接触探测命中 127.0.0.1:7240（CarLife 在监听）  ← 不再抢 accept
+13:03:40.362  CARLIFE: [Phase 1] ← 版本匹配 … [Phase 7] 40.424 握手完成      ← 14 步全过（62ms）
+13:03:40.811  PAIR: ✓ pair-setup 完成 / 40.930 pair-verify 完成
+13:03:40.930  AIRPLAY: /info displays[0].uuid=… 0x0 features=0x615653aee2   ← 0x0 → 用设置值
+13:03:41.042  AIRPLAY: ✓ 会话 SETUP eventPort=46747 keepAlive=37557
+13:03:41.085  AIRPLAY: ✓ 主屏流就绪 1920x720 / 41.120 RECORD 完成——会话已激活
+13:03:41.264→42.269  AUDIO 14/s → 136/s（应 136/s）
+```
+
+AirPlay 侧（控制通道、配对、SETUP、屏幕流、音频流、待机卡片）已经完整跑通；
+CarLife 侧 14 步握手也全过。**唯一还缺的就是 8240 的视频帧**：
+`首帧视频未到——第 1…12 次补发 VIDEO_ENCODER_START`，一直没等到 `VIDEO_DATA`。
+
+另外两条信息：
+
+- CarLife 把我们请求的 `2560x752` **压到 1920x720**（`手机实际编码 1920x720`），
+  说明这台手机的 CarLife 编码器上限就是 1080p；画布已跟随实际值，不再是问题。
+- `0x00010022` 查官方定义是 `MSG_CMD_MIC_RECORD_WAKEUP_START`（语音唤醒开始），
+  不是视频相关，不需要处理。
+
+### 19.2 新发现：官方 HU 每秒发 `MSG_VIDEO_HEARTBEAT (0x00020002)`
+
+对照 `fgrcwp/apollo-DuerOS` 的车机端 SDK（`CarLife-Android-Vehicle-V2.0`）：
+
+```kotlin
+// ConnectionEstablishHandler.kt
+private val heartBeatTask = Runnable {
+    if (System.currentTimeMillis() - lastReceiveMessageTime > 8000) {
+        Logger.e(Constants.TAG, "ConnectionEstablishHandler heartbeat timeout")
+        context.terminate()
+    } else {
+        context.postMessage(MSG_CHANNEL_VIDEO, ServiceTypes.MSG_VIDEO_HEARTBEAT)  // 0x20002
+    }
+}
+// 收到版本匹配后：TimerUtils.schedule(heartBeatTask, 10, 1000) → 每 1s 一次
+```
+
+**我们只读 VIDEO、从不发心跳**。CarLife 很可能是靠这条心跳确认"HU 还在看视频"，
+没有它就一直让编码器空转（正好对应 `MediaCodec [video-debug-enc] STARTED` 但 8240 零字节）。
+
+已实现：`handle_media_client` 里 VIDEO 通道每 1s 写一条 `0x00020002`（空载荷、12 字节头），
+前 3 次和每 30 次打一行 `CARLIFE: → VIDEO 心跳 #n`，写失败即退出该通道。
+
+### 19.3 还没处理的
+
+- `EVENT: 未处理的车机命令 type=setNightMode` / `type=forceKeyFrame`：DiPlay 请求夜间模式与
+  关键帧，我们都没回。`forceKeyFrame` 对解码端可能重要（它要求立刻来一个 IDR），
+  但待机卡片循环本身就是 60 帧 IDR 素材，先观察。
+- 若加了 VIDEO 心跳仍无帧，下一步按 §16.3：抓 CarLife 的 xlog（需明文日志开关）或
+  root 后 `tcpdump -i any port 8240`，确认它到底把帧写去了哪条连接。
+
+### 19.4 0.1.0.51 复测（`hypercar-log-20261026-130928.txt`）：心跳发了，帧还是没有
+
+- `CARLIFE: → VIDEO 心跳 #2/#3（0x20002）` 正常发出 → 心跳不是缺的那一环。
+- **音频是通的**：`AUDIO: 发包 136/s（应 136/s）`，而音频数据来自 CarLife 的 9240 通道
+  ——同一个进程、同一套 TCP、同样的"我们拨过去"。所以不是网络/通道映射问题，
+  是 CarLife 的视频编码/投递这一路自己没吐数据。
+- 界面确实被推到前台过（上一轮日志 `已把 CarLife 推回前台 exit=0`），也不是 Activity 没起来。
+- 另外 DiPlay 侧仍在 AirPlay RECORD 后约 2s 拆 iAP2（13:09:04.787 → 06.677），
+  随后又重连一次；这与视频无关，是接收端行为。
+
+结论："握手全过 + 编码器 STARTED + 通道全连上 + 心跳在发 + 音频在走，唯独 8240 零字节"，
+范围已经收敛到 CarLife 自己的视频输出路径。下一步只能取证：
+
+### 19.5 新增：诊断页「CarLife」取证按钮
+
+`HyperCarRepo.dumpCarLifeDiag()`（需 Shizuku）一次抓三样东西写进日志：
+
+```
+DIAG: ==== CarLife 现场开始 ====
+DIAG-ACT: exit=0，2 行        ← dumpsys activity：CarLife 是否 resume / 是否 top
+DIAG-SF: exit=0，1 行         ← dumpsys SurfaceFlinger --list：有没有它的 Surface
+DIAG-LOG …                    ← logcat 里 carlife / video-debug / avc 编码器 / MediaCodec 的最后 30 行
+DIAG: ==== CarLife 现场结束 ====
+```
+
+判读方法：
+- `DIAG-ACT` 里没有 CarLife 的 resume 记录 → 它其实不在前台（编码没有输入）；
+- `DIAG-SF` 里没有它的 Surface → 渲染/编码输入源不存在；
+- `DIAG-LOG` 里若有 `[video-debug-enc] … 输出/queueInputBuffer` 之类 → 编码器在出帧，
+  那就是"帧没写到我们这条 8240 连接"（转 §16.3 抓包方向）。
+
+### 19.6 0.1.0.52 取证结果（`hypercar-log-20261026-131348.txt`）：画面缺帧是 CarLife 实例被顶掉
+
+诊断按钮抓到的现场（13:13:38.99）：
+
+```
+DIAG-ACT topResumedActivity=io.github.hypercar/.ui.MainActivity
+DIAG-ACT * Task{…#3064 A=10345:com.baidu.carlife.xiaomi … visible=false visibleRequested=false}
+DIAG-ACT mLastPausedActivity: …com.baidu.carlife.CarlifeActivity
+DIAG-SF  RequestedLayerState{…CarlifeActivity…}          ← Surface 还在，但 Activity 已 pause
+DIAG-LOG PowerInsight_…: handleAppBackground newBgApp:com.baidu.carlife.xiaomi
+```
+
+两类问题，都是"我们自己的操作"造成的：
+
+1. **CarLife 被重复拉起，已握手的实例被顶掉（主因）**
+   ```
+   13:13:31.741  WAKE: 拉起 CarLife 引擎页 exit=0
+   13:13:31.910  [Phase 7] 握手完成
+   13:13:32.056  CARLIFE: 已把 CarLife 推回前台（防 35s 空闲自杀） exit=0   ← 300ms 后又 am start 一次
+   13:13:32.059  CARLIFE: ✓ CMD 已连上 MD 127.0.0.1:7240                    ← 新实例重新连
+   13:13:32.062  CARLIFE: [Phase 1] → HU_PROTOCOL_VERSION
+   13:13:32.665  CARLIFE: ✓ VIDEO 已连上 8240                                ← 这条属于新实例
+   …            （新实例永远不回版本匹配 → 我们的 8240 是"空壳"的连接，当然没有帧）
+   ```
+   CarLife 有单实例逻辑（`ProcessUtil.killAllProcess`）：短时间内两次 `am start` 会让它重置会话。
+   **已修**：`carlife_active` 里若距上次拉起 < 25s，就跳过 `am start`（只记一行日志）。
+
+2. **CarLife 必须保持"可见前台"才有画面**
+   DIAG-ACT 显示点按钮那一刻 CarLife 已是 `visible=false`（用户切回了 HyperCar 去点诊断页）。
+   音频不需要 Surface 所以一直正常；视频需要它的 Surface/Activity 处于 resumed。
+   这也正式回答了"能不能不显示 CarLife 窗口"：**主屏上不行**，只能投到副屏/虚拟屏
+   （设置页「CarLife 启动屏」，见 §17.2）。
+
+3. 另加 **握手看门狗**：引擎起来 12s 内没等到 `carlife_active`，判定空壳，
+   force-stop 后重拉一次（每轮最多一次），日志 `CARLIFE: 12s 内没走完握手…判定空壳`。
+
+### 19.7 0.1.0.53 复测（`hypercar-log-20261026-131704.txt`）：编码器输入是 0
+
+看门狗生效了（`173ms 前刚拉起过——跳过重复 am start`），但视频依旧为 0，这次拿到了**决定性的数字**：
+
+```
+13:16:56.741  MediaCodec: [mId: 0] [video-debug-enc] state STARTED mFlags 2336
+              Stats 5006ms:Client:com.baidu.carlife.xiaomi,Component:c2.qti.avc.encoder,
+              Qin:0, DQin:0/0, Render:0, …
+```
+
+`Qin:0` = **CarLife 从来没往编码器塞过一帧**（queueInputBuffer 次数 0），`Render:0` 同理。
+也就是说不是"帧没写到我们的 socket"，而是 **CarLife 自己没有渲染/没有编码输入**。
+
+原因在同一份诊断里：
+
+```
+DIAG-ACT topResumedActivity=io.github.hypercar/.ui.MainActivity
+DIAG-ACT * Task{…#3066 A=10345:com.baidu.carlife.xiaomi … visible=false visibleRequested=false}
+DIAG-ACT mLastPausedActivity: …CarlifeActivity
+```
+
+CarLife 的 Activity 处于 paused、它的 Window 不可见 → 客户端 Surface 不渲染 → 编码器空转。
+而这一次的 paused 是**取证动作自己造成的**：要点「CarLife」按钮必须先切回 HyperCar。
+
+### 19.8 自动取证（0.1.0.54）
+
+为避免"取证把现场弄没"，新增自动取证：引擎启动后 **12s 仍无视频帧**（`onStats.frames==0`）
+就自己跑一次 `dumpCarLifeDiag()`，不需要用户切界面。日志标记为
+`DIAG: 12s 内视频帧仍为 0——自动取证（不用碰手机）`。
+
+同时 `dumpCarLifeDiag()` 增加一段 `DIAG-ENC`：`logcat -d | grep video-debug | tail -6`，
+直接给编码器的 `Qin/DQin/Render` 计数。
+
+判读：
+- 若自动取证的 `DIAG-ACT` 里 `topResumedActivity` 是 **CarLife**、而 `Qin` 仍为 0
+  → 问题在 CarLife 内部（它没渲染/没投递），与前台无关；
+- 若 `topResumedActivity` 是 **HyperCar** → 前台被抢，属"手机必须停在 CarLife 界面"的
+  产品约束（§17.2 的副屏方案才有意义）；
+- 若 `Qin > 0` 而我们的 `8240` 仍 0 字节 → 帧写错了连接，转 §16.3 抓包。
+
+### 19.9 0.1.0.54 复测（`…-134358` / `…-134452`）：CarLife 在前台也是 Qin:0 → 视频靠录屏授权
+
+这两次连接里自动取证终于抓住了"CarLife 在前台"的现场（13:44:22）：
+
+```
+DIAG-ACT topResumedActivity=com.baidu.carlife.xiaomi/com.baidu.carlife.CarlifeActivity t3069
+DIAG-ACT * Task{…#3069 … visible=true visibleRequested=true …}
+DIAG-ENC  MediaCodec [video-debug-enc] Stats 5026ms … Qin:0,DQin:0/0,Render:0
+```
+
+**Activity 是 top、可见、resumed，编码器输入仍然是 0。** 所以"CarLife 必须在可见前台"
+这个假设被否掉了（之前的 paused 只是取证手法造成的）。
+
+把 CarLife 的 APK 拉下来查（`base.apk`，44 MB）：
+
+```
+classes.dex  VirtualDisplay 5   MediaProjection 1   createVirtualDisplay 2   carlink 6
+classes2.dex VirtualDisplay 10  MediaProjection 18  createVirtualDisplay 2   createInputSurface 2   carlink 3
+classes3.dex VirtualDisplay 4   createVirtualDisplay 1   carlink 1
+```
+
+说明它的视频是 **VirtualDisplay + MediaProjection（录屏）→ createInputSurface 编码** 这条路。
+而设备上：
+
+```
+appops get com.baidu.carlife.xiaomi PROJECT_MEDIA → 默认 ignore（从没授权过）
+dumpsys media_projection → null（没有进行中的录屏会话）
+dumpsys display → 只有 0/1 两块物理屏，没有 VirtualDisplay
+```
+
+**结论：CarLife 从来没拿到录屏授权，所以它没有可编码的内容 → `Qin:0` → 8240 零字节。**
+音频不走录屏，所以一直正常——完全对得上。
+
+处置：
+1. 已执行 `appops set com.baidu.carlife.xiaomi PROJECT_MEDIA allow`（App 里也会在 12s 无帧时
+   打一行提示）。若连接后手机弹出「开始录制/投放」对话框，**点允许**。
+2. 若 appops 仍被 Android 14+ 的"每次会话都要确认"挡住，下一步可以考虑：让 CarWith
+   （`com.miui.carlink`）发起会话——CarWith 是系统应用，录屏授权走它的既有权限，
+   这也解释了"为什么 CarWith 能用而直接拉 CarLife 不行"。
+
+补充：这两份日志里"母屏画面出现几秒"看到的是我们的**待机卡片**（母版 1280x372，60 帧 IDR），
+"断连"是 13:44:50 的 `SESSION: 已断开（用户/系统断开）`（手动/系统断开），不是崩溃；
+另外 DiPlay 每次都在 RECORD 后约 2s 拆 iAP2，这是接收端行为。
+
+### 19.10 0.1.0.55 复测（`hypercar-log-20261026-135448.txt`）：又踩到"自己把 CarLife 重启掉"
+
+这次连 14 步握手都没跑完：`握手进行中（Phase 1: 等版本匹配）` 一直到看门狗（12s）触发。时间线：
+
+```
+13:54:22.758  CARLIFE: ✓ VR 已连上 MD 127.0.0.1:9242          ← 先连上了"正在跑的那份" CarLife
+13:54:22.767  CARLIFE: CMD/MEDIA/VIDEO 通道断开                 ← 它被杀了（单实例逻辑）
+13:54:22.869  WAKE: 拉起 CarLife 引擎页 exit=0                  ← 我们这次 am start 才是元凶
+13:54:23.772  CARLIFE: ✓ CMD 已连上 7240 / [Phase 1] →
+13:54:32.773  CARLIFE: 握手进行中（Phase 1: 等版本匹配）         ← 新实例永远不回
+13:54:34.772  CARLIFE: 12s 内没走完握手——判定空壳，force-stop 后重拉
+```
+
+根因：**CarLife 已经在监听 7240 时，我们仍然无条件 `wakeLocalCarLife()`**（内部就是
+`am start CarlifeActivity`）→ 触发 CarLife 单实例重启 → 新实例只 bind 端口、不回握手。
+
+已修（0.1.0.56）：连接开始时先 `isLocalPortListening(7240)`：
+- 已在监听 → **跳过拉起**，日志 `WAKE: CarLife 已在监听 7240——跳过拉起（避免触发单实例重启）`；
+- 没在监听 → 才 `wakeLocalCarLife()`（再走原来的探测/拨号流程）。
+
+这样"上一轮残留的 CarLife 还活着"时不会再被我们打断；只有真的没起来才拉。
+
+### 19.11 没有录屏弹窗是正常的——CarLife 走的是特权 CAPTURE_VIDEO_OUTPUT
+
+查 `dumpsys package com.baidu.carlife.xiaomi`：
+
+```
+android.permission.CAPTURE_VIDEO_OUTPUT        ← signature|privileged，预装应用才有
+```
+
+所以它**不需要** MediaProjection 的每次确认弹窗，就能 `createVirtualDisplay` 直接抓画面。
+"没弹窗"≠"没问题"；反过来说，之前"给 PROJECT_MEDIA appop"的猜测不成立（留着也无害）。
+
+### 19.12 又找到两个我们自己的协议 bug（已修，0.1.0.57）
+
+对照官方 proto（`apollo-DuerOS/CarLife-Vehicle-Lib/LibSource/protobuf/proto/`）：
+
+1. **`HU_INFO` 字段全错位**：我们按"1=device_type(int)、2=os_type(int)、9=screen_width…"
+   自己编了一套；官方 `CarlifeDeviceInfoProto` 是
+   `1=os(string) 2=board 3=bootloader 4=brand … 21=sdk_int(int32) 24=carlifeversion`。
+   我们给字段 1/2 发的是 **varint**，而 proto 声明是 **string** → 手机按 protobuf 解析这条
+   消息会失败。已按官方 proto 重写（全部字符串字段 + sdk_int/carlifeversion）。
+2. **忽略了 MD 的特性配置请求**：官方 HU（`FeaturesHandler.handleFeatureRequest`）是
+   `setFeature(key,value)` 记录 MD 请求的每一条，再把整个列表回给 MD；我们以前直接回
+   自己写死的 6 个 key，等于把 MD 想要的能力（可能包含投屏/焦点/仪表盘等解锁项）丢掉。
+   现在会解析 MD 的请求、**把 key=value 打进日志**、并原样回显。
+
+下一次连接的日志里请重点看这一行：
+
+```
+CARLIFE: MD 请求特性 N 项：key1=1, key2=1, …
+```
+
+这份清单就是"CarLife 认为车机该具备什么"的原始答案——如果里面有我们没实现的能力
+（例如和投屏/虚拟屏相关的 key），顺着它补就能解锁视频。
+
+### 19.13 B1 结论：CarWith 的投屏会话**非 root 无法驱动**（证据）
+
+把 `/product/app/CarWith/CarWith.apk` 拉下来（56 MB，8 个 dex）并 dump 清单：
+
+```
+Service  com.miui.carlink.castfwk.CarlinkService
+         exported=true，但 permission=miui.carlink.permission.START_CARLINKSERVICE
+         该权限 protectionLevel=0x3（signatureOrSystem）
+Activity com.miui.carlink.castfwk.CastingActivity      exported=false
+Activity com.carwith.launcher.activity.ReceiverActivity exported=?（可起，但不建虚拟屏）
+Receiver com.carwith.launcher.screenshot.CaptureScreenReceiver
+         exported=true，action=com.miui.carlink.action.CONNECT_CLICK_ACTION_CAR / CAPTURE_SCREEN_ACTION
+```
+
+实测（adb shell = uid 2000，等价于 Shizuku）：
+
+```
+$ am start-foreground-service -n com.miui.carlink/com.miui.carlink.castfwk.CarlinkService
+  Error: Requires permission miui.carlink.permission.START_CARLINKSERVICE
+$ am start -n com.miui.carlink/com.miui.carlink.castfwk.CastingActivity
+  java.lang.SecurityException: … not exported from uid 10156
+$ am broadcast -a com.miui.carlink.action.CONNECT_CLICK_ACTION_CAR -n …/CaptureScreenReceiver
+  Broadcast completed（无效果：CarWith 进程都没起来）
+$ su -c id   →  /system/bin/sh: su: inaccessible or not found
+  ro.build.type=user / ro.secure=1  → 无 root
+```
+
+结论：CarWith 的投屏会话由**系统侧（蓝牙/CarService 等特权调用者）**启动，普通应用或 shell 都进不去。
+路线 B1 在**非 root 前提下到此为止**——不是协议问题，是权限边界。
+
+后续只有三条：
+1. **root/Magisk**（模块里给我们的 app 签系统权限，或 hook CarWith 的启动）——改变产品前提；
+2. **自建车机端 UI**（我们自己渲染横屏卡片界面并用 MediaCodec 编码，走现有 AirPlay 视频泵）——
+   完全绕过 CarLife/CarWith，非 root 可行，但要自己做 UI；
+3. **屏幕镜像**（cardeck 同款）——用户已明确认为重复造轮子。
+
+### 19.14 找到了 CarWith 驱动 CarLife 投屏的 AIDL（0.1.0.58/59）
+
+探测结果（`hypercar-log-20261026-144302.txt`）：
+
+```
+CAST: ✓ 绑定 com.baidu.carlife.service.CarlifeConnectService → descriptor=（空）
+CAST: ✓ 绑定 com.baidu.carlife.complex.RemotePresentationService
+      → descriptor=com.baidu.carlifelink.listener.ICarLifeManager
+```
+
+`RemotePresentationService` 是**导出的**、无需权限，它提供的正是 `ICarLifeManager`。
+从 CarLife dex 的 Stub 常量里抄出完整 transact 码：
+
+```
+com.baidu.carlifelink.listener.ICarLifeManager
+    register(String):boolean           code 1
+    unregister(String):boolean         code 2
+    getDisplayController(String):IBinder code 3
+    getTTSController(4) / getMusicController(5) / getInduceMessageController(6)
+    setOnTouchListener(7) / removeOnTouchListener(8)
+    addLifecycleListener(9) …  addDayNightListener(17) / removeDayNightListener(18)
+com.baidu.carlifelink.listener.IDisplayController
+    startDisplay(String)   code 1
+    stopDisplay(String)    code 2
+    currentDisplayPage(String):String code 3
+com.baidu.carlifelink.listener.ILifecycleListener（回调，我们实现）
+    onDisplayAdded(1) / onDisplayActivated(2) / onDisplayStop(3) / onDisplayRemove(4)
+    onHeartBeat(5) / onConnectToHuChanged(6) / backToBackground(7) / backToForeground(8)
+    isForeground(9) / onDisplayDestroy(10) / getAppState(11)
+```
+
+另外 CarLife 还有一套 `com.baidu.carlife.mixing.aidl.ICarLifeCastManager`：
+`prepareCast(CastConfig{width,height,dpi,surface})` —— **调用方给 Surface、CarLife 往里渲染**，
+但那个 binder 不在上面两个导出服务上（`CarlifeConnectService` 的 descriptor 是空的），
+所以先用 `ICarLifeManager.startDisplay()` 这条。
+
+0.1.0.59 的行为：`carlife_active`（14 步握手完成）后 600ms 自动
+
+```
+register("hypercar") → getDisplayController("hypercar") → startDisplay("hypercar")
+```
+
+日志标记 `CAST: ICarLifeManager.register(hypercar) → 1` / `CAST: getDisplayController(…) = …` /
+`CAST: IDisplayController.startDisplay(hypercar) 已调用`。
+如果 `startDisplay` 就是"开始投屏"的开关，那么 8240 应该开始出帧（`Qin` 从 0 变正、
+`VIDEO: 首帧 …` 出现真正的 CarLife 画面）。
+
+### 19.15 `startDisplay` 第一次尝试：register 返回 0（0.1.0.59）
+
+```
+14:59:35.204  CAST: ICarLifeManager.register(hypercar) → 0
+14:59:35.205  CAST: getDisplayController(hypercar) = null
+```
+
+`register(String)` 不认 "hypercar" 这个 tag（很可能它拿 tag 当"客户端标识"校验，
+或者内部要求先建立某种会话）。0.1.0.60 改成**候选 tag 轮试**：
+
+```
+io.github.hypercar / com.miui.carlink / com.baidu.carlife / carlife / hypercar
+```
+
+每个都打 `CAST: register("…") → x`，命中（返回 1）才继续 `getDisplayController` + `startDisplay`。
+
+若全部失败，会继续 **枚举 CarLife 的导出服务**（`CAST-SVC:` 行，每个打印
+`interfaceDescriptor`），目的是找出到底哪个组件暴露了
+`com.baidu.carlife.mixing.aidl.ICarLifeCastManager`（带 `prepareCast(CastConfig{surface})` 的那个，
+能把 CarLife 画面渲染进我们给的 Surface）。
+
+### 19.16 `register` 为什么全是 0：它只认 RemoteClientConfig 里预置的 client key
+
+反编译 `com.baidu.carlife.complex.binder.RemoteGroupBinder.register(String pkgName)`：
+
+```
+log("register pkgName:" + pkgName)
+clients = RemoteClientConfig.getClients(pkgName)   // 返回 List<RemoteClient>
+if (clients.isNotEmpty()) {  new RemoteBinder(pkgName) … return true }
+else                      {  return false }
+```
+
+再看 `RemoteClientConfig` 的静态初始化（dex 常量原文）：
+
+```
+"map"                  → video_client.dev / com.chen.client.ui.MainActivity / …BaiduMapActivity
+"mini_map"             → video_client.dev / com.chen.client.ui.PlayActivity / …VideoDemoActivity
+"baidu_map"            → com.baidu.BaiduMap / com.baidu.baidumaps.WelcomeScreen / com.baidu.carlife.CarlifeActivity
+"baidu_mini_map"       → com.baidu.BaiduMap / com.baidu.carlife.minimap.MiniMapActivity
+"carlife_rcc_display"  → com.szats.breakthrough / …NaviCarlifeActivity / com.baidu.carlife.CarlifeActivity
+```
+
+所以 `register("io.github.hypercar")` / `"com.miui.carlink"` 之类**必然**返回 0——它要的是
+这几个"远程客户端"key（把某个 App 的界面渲染到车机屏），不是任意包名。
+`getClients()` 还会按**该 App 是否装上**过滤。
+
+0.1.0.61 起按这几个 key 轮试：
+`baidu_map / mini_map / baidu_mini_map / carlife_rcc_display / map` + 原来的包名候选。
+哪个返回 1，就跟进 `getDisplayController(key)` → `startDisplay(key)`，
+看 CarLife 是否开始投屏（8240 出帧 / `Qin` 变正）。
+
+若全 0，大概率是缺少对应 App（`com.baidu.BaiduMap` 等）——装一个百度地图再试即可验证机制。
+
+### 19.17 更正：`register` 比的是 pkgName，而且不检查是否安装（0.1.0.62）
+
+`RemoteClientConfig.getClients(pkgName)` 的字节码只有一句话：
+
+```
+for (client in supportRemoteClients) if (client.pkgName == pkgName) result.add(client)
+return result
+```
+
+**没有"是否已安装"的过滤**。而 `supportRemoteClients` 里的 pkgName 只有三个：
+
+```
+video_client.dev
+com.baidu.BaiduMap
+com.szats.breakthrough
+```
+
+（对应的 key/显示名是 map / mini_map / baidu_map / baidu_mini_map / carlife_rcc_display）
+
+所以之前传 "baidu_map"（key）或 "com.miui.carlink" 都是错的——要传 **pkgName**。
+0.1.0.62 起依次尝试：
+
+```
+com.baidu.BaiduMap   → video_client.dev   → com.szats.breakthrough
+（再兜底 key 与包名，便于日志对照）
+```
+
+命中（返回 1）就 `getDisplayController(pkgName)` → `startDisplay(pkgName)`。
+
+**关键**：即使没装百度地图，`register("com.baidu.BaiduMap")` 也应该返回 1，
+`startDisplay` 会尝试把这个"远程客户端"渲染到车机屏上——如果它的虚拟屏/编码管线因此启动，
+`Qin` 就会从 0 变正，我们就能看到 CarLife 的投屏数据流。
+
+另外：CarLife 里出现的 `com.autonavi.amapauto` / `com.autonavi.amapautolite` / `com.autonavi.minimap`
+是**导航源/流转**用的，不在这份"远程客户端"名单里，所以高德装不装都不影响这条链路。
+
+### 19.18 突破：`register`/`getDisplayController`/`startDisplay` 全部成功（0.1.0.63/64）
+
+```
+15:18:44.280  CAST: register("com.baidu.BaiduMap") → 1
+15:18:44.281  CAST: getDisplayController("com.baidu.BaiduMap") = android.os.BinderProxy@4ccbd4b
+15:18:44.281  CAST: startDisplay("com.baidu.BaiduMap") = true
+```
+
+参数与 19.17 的判断一致：**要传 pkgName**（`RemoteClient.pkgName`），不是 key，
+而且 `getClients()` 不检查安装 → 没装百度地图也能注册成功。
+
+但 `Qin` 仍然是 0：`startDisplay` 的语义是"把该远程客户端的 Activity 渲染到车机屏"，
+`com.baidu.BaiduMap` 没安装 → 没有界面可渲染 → 编码器还是空转。
+（设备上没有任何 `RemoteGroupBinder`/`startDisplay` 的 logcat，CarLife 是 release 版、日志被裁了。）
+
+### 19.19 调试加速器：adb 直接触发探测（0.1.0.64）
+
+```
+adb shell am broadcast -a io.github.hypercar.PROBE_CAST -p io.github.hypercar
+sleep 8
+adb shell cat /sdcard/Android/data/io.github.hypercar/files/cast_probe.txt
+```
+
+输出就是上面那三行 `CAST:`。不用连车机、不用点界面，方便快速验证参数。
+
+### 19.20 下一步：装百度地图验证视频链路
+
+`RemoteClientConfig.supportRemoteClients` 只有三个 pkgName：
+
+```
+com.baidu.BaiduMap   ← 最现实（免费 App）
+video_client.dev     ← 百度内部 demo，拿不到
+com.szats.breakthrough ← 第三方 App
+```
+
+装百度地图后 `startDisplay("com.baidu.BaiduMap")` 才有东西可渲染，届时 `Qin` 应该从 0 变正、
+8240 出帧——那就是"CarLife 把第三方界面投到车机屏"的完整链路。
+高德（`com.autonavi.*`）不在这个名单里，所以用不上。
+
+### 19.21 远程客户端 API 走到底：调用成功但 CarLife 不建屏（0.1.0.65~68）
+
+百度地图装上后（`package:com.baidu.BaiduMap` 已存在），adb 探针结果：
+
+```
+CAST: register("com.baidu.BaiduMap") → 1
+CAST: getDisplayController("com.baidu.BaiduMap") = android.os.BinderProxy@…
+CAST: startDisplay("com.baidu.BaiduMap") = true，displays=0:内置屏幕, 1:内置屏幕
+CAST: startDisplay("baidu_map") = true，displays=0:内置屏幕, 1:内置屏幕
+```
+
+关键问题：
+
+1. **`startDisplay` 的返回值没有意义**：传 pkgName、传 key、传任意串都返回 true；
+2. **没有创建任何 VirtualDisplay**（displays 始终只有 0/1 两块物理屏），`Qin` 也一直是 0；
+3. **CarLife 配置里的客户端 Activity 直接拉不起来**：
+   `am start -n com.baidu.BaiduMap/com.baidu.baidumaps.WelcomeScreen` → `Error type 3`
+   （真正的入口是 `…WelcomeScreen.Alias0`），所以 CarLife 拿这个写死的组件去启动时也起不来，
+   自然没有界面可渲染、没有帧可编码；
+4. **同一时刻只接受一个客户端**：先 register 了 `com.szats.breakthrough` 之后，
+   再 register `com.baidu.BaiduMap`，`getDisplayController` 直接返回 null。
+
+结论：`ICarLifeManager.register/startDisplay` 是 CarLife **自家"地图卡片"功能**的接口
+（把指定 App 的界面画到车机屏上），不是通用的"开始投屏"开关。它依赖 CarLife 内部
+对客户端的启动/捕获逻辑，而这条逻辑在我们（外部 HU）手上不可控。
+
+非 root 的三条入口至此全部确认不可用：
+1. 协议握手（已完成 14 步）→ 视频源在 CarLife 内部，不给我们；
+2. CarWith 的 `CarlinkService` → signatureOrSystem 权限挡住；
+3. CarLife 的 `ICarLifeManager` → 调用可用但没有实际渲染，且客户端 Activity 起不来。
+
+### 19.22 现状与决策点
+
+已经确定能跑通的：iAP2 识别/配对、无线 CarPlay 凭据、AirPlay 连接与配对、SETUP/RECORD、
+屏幕流（待机卡片）、音频 136/s、CarLife 14 步握手/音频/触摸通道。
+
+唯一缺的：**从 CarLife 拿到真实画面**（`Qin:0`）。非 root 没有可用入口，剩下的选择：
+
+| 方案 | 代价 | 备注 |
+|---|---|---|
+| ① root（Magisk 模块给权限 / hook CarWith） | 改变产品前提 | 可直接复用 CarWith 的整条投屏管线 |
+| ② 自建车机端 UI + 自己编码 | 中等工作量 | 完全绕开 CarLife/Xiaomi，非 root 可行 |
+| ③ 屏幕镜像（cardeck 同款） | 最小 | 用户已明确否掉"重复造轮子" |
+
+## 20. 方案②：自绘车机界面 + 自己编码（2026-10-26，0.1.0.69 起）
+
+CarLife 视频源在非 root 下确认拿不到（§19.21），改由我们自己产出画面：
+
+```
+MediaCodec(avc).createInputSurface()
+  → DisplayManager.createVirtualDisplay(1920x720@240dpi, surface, PUBLIC|OWN_CONTENT_ONLY)
+  → Presentation(context, virtualDisplay.display).setContentView(CarUiView)
+  → MediaCodec 输出 AnnexB（含 SPS/PPS/IDR）
+  → JNI nativePushVideoFrame(bytes, ptsUs)
+  → engine 视频泵（与 CarLife 帧同一条路径）→ ScreenSender → 车机
+```
+
+- **不需要 root**，也**不需要 MediaProjection 授权**：虚拟屏装的是我们自己的内容，
+  `createVirtualDisplay` 只要一个 Surface。
+- Rust 侧新增：`EngineHandle.video_tx / size_tx`、`nativePushVideoFrame`、`nativeSetVideoSize`；
+  视频泵 `select!` 里多两路输入（外部帧 / 外部画布尺寸），帧到就刷新 `last_real_frame`
+  （自动停掉待机卡片循环）。
+- Kotlin 侧新增：`CarUiCaster`（编码 + 虚拟屏 + Presentation）、`CarUiView`（Canvas 画的
+  车机界面：大时钟 + 地图卡片 + 音乐卡片；`navigationActive=true` 时地图铺满整屏）。
+
+#
+
+自检命令（不需要车机）：
+
+```
+adb shell am broadcast -a io.github.hypercar.PROBE_UI -p io.github.hypercar
+adb shell cat /sdcard/Android/data/io.github.hypercar/files/carui_probe.txt
+```
+

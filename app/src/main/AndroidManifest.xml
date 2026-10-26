@@ -106,6 +106,15 @@
             android:foregroundServiceType="connectedDevice|microphone" />
 
         <!-- ACL 广播在隐式广播例外清单内，清单静态注册可拉起被杀进程 -->
+        <!-- 调试：adb 广播触发 CarLife 投屏 AIDL 探测（结果写 files/cast_probe.txt） -->
+        <receiver
+            android:name=".session.DebugProbeReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.github.hypercar.PROBE_CAST" />
+            </intent-filter>
+        </receiver>
+
         <receiver
             android:name=".autowake.CarBluetoothReceiver"
             android:exported="true">

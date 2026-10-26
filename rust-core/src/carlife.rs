@@ -1,4 +1,4 @@
-﻿//! CarLife HU（车机）侧网关——严格按 CarLifeWirelessBox / apollo-DuerOS 的 HU 实现重构。
+//! CarLife HU（车机）侧网关——严格按 CarLifeWirelessBox / apollo-DuerOS 的 HU 实现重构。
 //!
 //! 我们扮演「车机」，本机 CarLife / CarWith(CarLife 兼容) / 荣耀车联 作为「手机(MD)」连回
 //! 127.0.0.1 的一组标准端口。
@@ -505,6 +505,15 @@ fn touch_proto(action: u32, x: u32, y: u32) -> Vec<u8> {
 /// 协议表见 CarLifeWirelessBox `docs/通讯协议分析报告.md`（VR: HU → MD 语音识别）。
 const VR_MIC_DATA: u32 = 0x0005_8001;
 
+/// 单调毫秒时间戳（媒体帧头用；只需相对值）。
+fn now_ms() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u32)
+        .unwrap_or(0)
+}
+
 /// 媒体帧（12 字节头）：`[u32 BE len][u32 BE ts_ms][u32 BE type][payload]`。
 fn build_media_frame(service_type: u32, timestamp_ms: u32, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + payload.len());
@@ -751,10 +760,29 @@ async fn handle_cmd_client(
                 CMD_MD_FEATURE_CONFIG_REQUEST => {
                     emit_log("CARLIFE: [Phase 3] ← MD_FEATURE_CONFIG_REQUEST");
                     if !hs.feature_sent {
+                        // **把 MD 请求的特性项原样回一遍**（官方 HU 的 FeaturesHandler 就是
+                        // `setFeature(key,value)` 后把 listFeatures() 回给 MD）。
+                        // 我们以前只回自己写死的 6 个 key，等于把 MD 想要的能力
+                        // （可能包含投屏/焦点/仪表盘等解锁项）全丢了。
+                        let asked = parse_feature_config(&payload);
+                        if !asked.is_empty() {
+                            let keys: Vec<String> =
+                                asked.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                            emit_log(&format!(
+                                "CARLIFE: MD 请求特性 {} 项：{}",
+                                asked.len(),
+                                keys.join(", ")
+                            ));
+                        } else {
+                            emit_log(&format!(
+                                "CARLIFE: MD 特性请求解析为空（{}B）——回默认集合",
+                                payload.len()
+                            ));
+                        }
                         let ok = send_cmd(
                             &mut wr,
                             CMD_HU_FEATURE_CONFIG_RESPONSE,
-                            &proto_feature_config_payload(voice),
+                            &proto_feature_config_response(voice, &asked),
                         )
                         .await;
                         if !ok {
@@ -948,38 +976,139 @@ fn proto_statistic_payload() -> Vec<u8> {
     out
 }
 
+/// `CarlifeDeviceInfo`（HU 的设备信息）——**字段必须与官方 proto 一致**。
+///
+/// 以前这里错得离谱：按"1=device_type(int) 2=os_type(int) 9=screen_width…"自己编了一套，
+/// 而官方 proto（`apollo-DuerOS/CarLife-Vehicle-Lib/LibSource/protobuf/proto/
+/// CarlifeDeviceInfoProto.proto`）是：
+/// `1=os(string) 2=board 3=bootloader 4=brand 5=cpu_abi 6=cpu_abi2 7=device 8=display
+///  9=fingerprint 10=hardware 11=host 12=cid 13=manufacturer 14=model 15=product
+///  16=serial 17=codename 18=incremental 19=release 20=sdk 21=sdk_int(int32) 24=carlifeversion`。
+/// 字段 1/2 我们发了 varint，而 proto 声明是 string——手机端按 protobuf 解析这条消息会失败。
 fn proto_hu_info_payload() -> Vec<u8> {
-    // CarlifeDeviceInfo: 1=device_type(HEAD_UNIT=2), 2=os_type(ANDROID=1),
-    // 3=os_version, 4=manufacturer, 5=model, 6=device_id, 8=device_name,
-    // 9=screen_width, 10=screen_height, 11=screen_dpi
-    let mut out = Vec::with_capacity(96);
-    proto::varint(&mut out, 1, 2);
-    proto::varint(&mut out, 2, 1);
-    proto::string(&mut out, 3, "12");
-    proto::string(&mut out, 4, "HyperCar");
-    proto::string(&mut out, 5, "HyperCar HU");
-    proto::string(&mut out, 6, "hypercar-hu");
-    proto::string(&mut out, 8, "HyperCar");
+    let mut out = Vec::with_capacity(160);
+    proto::string(&mut out, 1, "Android"); // os
+    proto::string(&mut out, 2, "qcom"); // board
+    proto::string(&mut out, 3, "unknown"); // bootloader
+    proto::string(&mut out, 4, "HyperCar"); // brand
+    proto::string(&mut out, 5, "arm64-v8a"); // cpu_abi
+    proto::string(&mut out, 6, "arm64-v8a"); // cpu_abi2
+    proto::string(&mut out, 7, "hypercar"); // device
+    proto::string(&mut out, 8, "HyperCar HU"); // display
+    proto::string(&mut out, 9, "HyperCar/HU/1:14/UE1A/eng"); // fingerprint
+    proto::string(&mut out, 10, "qcom"); // hardware
+    proto::string(&mut out, 11, "hypercar"); // host
+    proto::string(&mut out, 12, "HYPERCARHU"); // cid (id)
+    proto::string(&mut out, 13, "HyperCar"); // manufacturer
+    proto::string(&mut out, 14, "HyperCar HU"); // model
+    proto::string(&mut out, 15, "hypercar"); // product
+    proto::string(&mut out, 18, "1"); // incremental
+    proto::string(&mut out, 19, "14"); // release
+    proto::string(&mut out, 20, "34"); // sdk
+    proto::varint(&mut out, 21, 34); // sdk_int
+    proto::string(&mut out, 24, "7.0.0"); // carlifeversion
     out
 }
 
-fn proto_feature_config_payload(voice: u32) -> Vec<u8> {
-    // CarlifeFeatureConfigList: 1=cnt, 2=repeated {1=key string, 2=value int32},
-    // 3=hu_bt_audio_support, 4=hu_bt_name, 5=hu_bt_mac
-    let features: [(&str, u32); 6] = [
-        ("video", 1),
-        ("audio", 1),
-        ("touch", 1),
-        ("music", 1),
-        ("navigation", 1),
-        ("voice", voice.clamp(0, 1)),
-    ];
+/// 解析 MD 发来的 `CarlifeFeatureConfigList`（1=cnt, 2=repeated{1=key, 2=value}）。
+fn parse_feature_config(bytes: &[u8]) -> Vec<(String, u32)> {
+    let mut out: Vec<(String, u32)> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let (tag, used) = read_varint(&bytes[i..]);
+        let Some(tag) = tag else { break };
+        i += used;
+        let field = (tag >> 3) as u32;
+        let wire = (tag & 0x07) as u8;
+        match wire {
+            0 => {
+                let (_, used) = read_varint(&bytes[i..]);
+                i += used;
+            }
+            2 if field == 2 => {
+                let (len, used) = read_varint(&bytes[i..]);
+                let Some(len) = len else { break };
+                i += used;
+                let end = (i + len as usize).min(bytes.len());
+                let item = &bytes[i..end];
+                i = end;
+                let mut key = String::new();
+                let mut value: u32 = 0;
+                let mut j = 0usize;
+                while j < item.len() {
+                    let (t, u) = read_varint(&item[j..]);
+                    let Some(t) = t else { break };
+                    j += u;
+                    let f = (t >> 3) as u32;
+                    let w = (t & 0x07) as u8;
+                    match (f, w) {
+                        (1, 2) => {
+                            let (l, u2) = read_varint(&item[j..]);
+                            let Some(l) = l else { break };
+                            j += u2;
+                            let e2 = (j + l as usize).min(item.len());
+                            key = String::from_utf8_lossy(&item[j..e2]).to_string();
+                            j = e2;
+                        }
+                        (2, 0) => {
+                            let (v, u2) = read_varint(&item[j..]);
+                            let Some(v) = v else { break };
+                            j += u2;
+                            value = v as u32;
+                        }
+                        (_, 0) => {
+                            let (_, u2) = read_varint(&item[j..]);
+                            j += u2;
+                        }
+                        (_, 2) => {
+                            let (l, u2) = read_varint(&item[j..]);
+                            let Some(l) = l else { break };
+                            j += u2 + l as usize;
+                        }
+                        _ => break,
+                    }
+                }
+                if !key.is_empty() {
+                    out.push((key, value));
+                }
+            }
+            2 => {
+                let (len, used) = read_varint(&bytes[i..]);
+                let Some(len) = len else { break };
+                i += used + len as usize;
+            }
+            5 => i += 4,
+            1 => i += 8,
+            _ => break,
+        }
+    }
+    out
+}
+
+/// `CarlifeFeatureConfigList`（HU 的特性配置应答）。
+///
+/// 官方 HU 的做法（`FeaturesHandler.handleFeatureRequest`）是：先 `setFeature(key,value)`
+/// 记录 **MD 请求的每一条**，再把整个列表回给 MD。所以这里也以 MD 的请求为准回显；
+/// 只有解析不出任何项时才退回我们自己的默认集合。
+fn proto_feature_config_response(voice: u32, asked: &[(String, u32)]) -> Vec<u8> {
+    // 1=cnt, 2=repeated {1=key string, 2=value int32}, 3=hu_bt_audio_support, 4/5=bt name/mac
+    let mut features: Vec<(String, u32)> = asked.to_vec();
+    if features.is_empty() {
+        features = vec![
+            ("video".to_string(), 1),
+            ("audio".to_string(), 1),
+            ("touch".to_string(), 1),
+            ("music".to_string(), 1),
+            ("navigation".to_string(), 1),
+            ("voice".to_string(), voice.clamp(0, 1)),
+        ];
+    }
     let mut out = Vec::with_capacity(96);
     proto::varint(&mut out, 1, features.len() as u64);
-    for (key, value) in features {
+    for (key, value) in &features {
         let mut item = Vec::with_capacity(16);
         proto::string(&mut item, 1, key);
-        proto::varint(&mut item, 2, value as u64);
+        proto::varint(&mut item, 2, *value as u64);
         proto::bytes(&mut out, 2, &item);
     }
     proto::boolean(&mut out, 3, false);
@@ -1046,11 +1175,13 @@ fn spawn_media_channel(
 
 /// VIDEO/MEDIA/TTS 通道：12 字节头 + 裸数据（视频 H.264 AnnexB / 音频 PCM）。
 async fn handle_media_client(
-    mut stream: TcpStream,
+    stream: TcpStream,
     events: mpsc::UnboundedSender<CarLifeEvent>,
     kind: MediaKind,
     label: &'static str,
 ) {
+    let (mut rd, mut wr) = stream.into_split();
+    let is_video = matches!(kind, MediaKind::Video);
     let mut buf: Vec<u8> = Vec::with_capacity(256 * 1024);
     let mut chunk = [0u8; 65536];
     let mut rate: u32 = 48_000;
@@ -1059,17 +1190,36 @@ async fn handle_media_client(
     // （2026-10-26 00:24 现场：没有任何 VideoFrame 产出）。这里把前几次读到的东西打出来，
     // 一眼就能分清「8240 上一个字节都没有」还是「有数据但帧头解析不出来」。
     let mut diag_reads: u32 = 0;
+    // **VIDEO 心跳**：官方 HU 实现（apollo-DuerOS `ConnectionEstablishHandler` 的
+    // heartBeatTask）每秒往 VIDEO 通道发一条 `MSG_VIDEO_HEARTBEAT (0x20002)`；
+    // 我们之前只读不发，CarLife 可能因此认为视频通道"没人要"，编码器空转不给帧。
+    // 这里按官方节奏 1s 一条（空载荷，12 字节头）。
+    let mut hb = tokio::time::interval(Duration::from_secs(1));
+    hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut hb_sent: u64 = 0;
 
     loop {
-        match stream.read(&mut chunk).await {
+        let read = tokio::select! {
+            _ = hb.tick(), if is_video => {
+                let frame = build_media_frame(VIDEO_HEARTBEAT, now_ms(), &[]);
+                if wr.write_all(&frame).await.is_err() {
+                    return;
+                }
+                hb_sent += 1;
+                if hb_sent <= 3 || hb_sent % 30 == 0 {
+                    emit_log(&format!("CARLIFE: → VIDEO 心跳 #{hb_sent}（0x20002）"));
+                }
+                continue;
+            }
+            r = rd.read(&mut chunk) => r,
+        };
+        match read {
             Ok(0) => {
-                let _ = events.send(CarLifeEvent::ClientLeft {
-                    video: matches!(kind, MediaKind::Video),
-                });
+                let _ = events.send(CarLifeEvent::ClientLeft { video: is_video });
                 return;
             }
             Ok(n) => {
-                if matches!(kind, MediaKind::Video) && diag_reads < 5 {
+                if is_video && diag_reads < 5 {
                     diag_reads += 1;
                     let hex: String = chunk[..n.min(24)]
                         .iter()

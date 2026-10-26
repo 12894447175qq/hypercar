@@ -1,4 +1,4 @@
-//! HyperCar 核心层 —— JNI 入口、Tokio 运行时、引擎生命周期。
+﻿//! HyperCar 核心层 —— JNI 入口、Tokio 运行时、引擎生命周期。
 //!
 //! 与「参考文档」的架构差异（docs/NEGOTIATION-GAPS.md）：
 //!  参考文档里 AirPlay 协商留在 Kotlin，Rust 只接「已连通 FD + 已派生密钥」；

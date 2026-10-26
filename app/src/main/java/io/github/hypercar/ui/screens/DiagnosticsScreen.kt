@@ -72,6 +72,7 @@ fun DiagnosticsScreen(
     onClearLogs: () -> Unit,
     onExport: () -> Unit,
     onDumpDisplays: () -> Unit,
+    onDumpCarLifeDiag: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     // 轻提示（复制/导出反馈）：2s 自动消失
@@ -98,6 +99,7 @@ fun DiagnosticsScreen(
             onExport = onExport,
             onFeedback = { toast = it },
             onDumpDisplays = onDumpDisplays,
+            onDumpCarLifeDiag = onDumpCarLifeDiag,
             logs = logs,
         )
         AnimatedVisibility(
@@ -136,6 +138,8 @@ private fun Header(
     onFeedback: (String) -> Unit,
     /** 诊断：把当前 display 列表打进日志（配合设置页「CarLife 启动屏」）。 */
     onDumpDisplays: () -> Unit,
+    /** 诊断：抓 CarLife 的 Activity/Surface/logcat 现场。 */
+    onDumpCarLifeDiag: () -> Unit,
     logs: List<String>,
 ) {
     val clipboard = LocalClipboardManager.current
@@ -255,6 +259,21 @@ private fun Header(
                 onClick = {
                     onDumpDisplays()
                     onFeedback("正在读取 display 列表（需要 Shizuku）——结果会写进下面的日志")
+                },
+                modifier = Modifier
+                    .weight(1f)
+                    .height(44.dp),
+                filled = false,
+                contentColor = MintGreen,
+                borderColor = MintGreen.copy(alpha = 0.5f),
+                horizontalPadding = 4.dp,
+            )
+            // CarLife 取证：Activity 是否前台、有没有 Surface、编码器有没有输出。
+            CapsuleButton(
+                text = "CarLife",
+                onClick = {
+                    onDumpCarLifeDiag()
+                    onFeedback("正在抓 CarLife 活动/Surface/logcat（需要 Shizuku）——结果写进日志")
                 },
                 modifier = Modifier
                     .weight(1f)

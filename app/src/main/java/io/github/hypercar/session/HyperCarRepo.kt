@@ -210,6 +210,36 @@ object HyperCarRepo {
     private var sessionMdHost: String? = null
 
     /**
+     * 正在进行的「拉起 CarLife」协程。
+     *
+     * 为什么要记着它：唤醒路径里有 3s 等待 + 服务兜底，而 AirPlay 端口连接可能在这期间就失败、
+     * 触发 `releaseSessionResources()`（会 force-stop CarLife 收窗口）。若不取消这个协程，
+     * 它随后又会把 `CarlifeConnectService` 拉起来——留下一个"7240 在听但不回 Phase 1"的
+     * 空壳，下一轮连接必卡（2026-10-26 12:47 日志：57.6s 清理、00.4s 又拉起服务）。
+     */
+    private var wakeJob: kotlinx.coroutines.Job? = null
+
+    /** 上一次 `am start` 拉起 CarLife 的时间（uptimeMillis），用于避免 300ms 内重复拉起。 */
+    @Volatile
+    private var carLifeLaunchedAt: Long = 0L
+
+    /** CarLife 握手完成（`carlife_active`）的时间戳，握手看门狗用它判断是否卡住。 */
+    @Volatile
+    private var carLifeActiveAt: Long = 0L
+
+    /** 拿到的 CarLife 投屏 binder（ICarLifeCastManager，探测用）。 */
+    @Volatile
+    private var castBinder: android.os.IBinder? = null
+
+    /** CarLife 的 IDisplayController（startDisplay/stopDisplay）。 */
+    @Volatile
+    private var castDisplayController: android.os.IBinder? = null
+
+    /** 已推给车机的视频帧数（`onStats` 每秒刷新），自动取证用。 */
+    @Volatile
+    private var lastVideoFrames: Long = 0L
+
+    /**
      * 会话资源是否还活着（蓝牙协商/WiFi 绑定/Rust 引擎）。拆除用它做幂等闸门：
      * 重复的 ACL 断开广播、service 二次转交都只会真正拆一次。
      */
@@ -504,9 +534,11 @@ object HyperCarRepo {
                     " srcvers=${endpoint.sourceVersion ?: "-"}",
             )
             val network = joinAndBind(context, endpoint)
-            // 车机上还有哪些端口在听？AirPlay 控制面未必是 7000（真车 455 之后需要这个答案）。
-            // 只探测、不改变行为，结果进日志。
-            probeCarPorts(context, host)
+            // **不再预探测端口**：老代码在这里对 7000/7001/7100/5000/62078 各 connect 一次再 close
+            // （只为打日志），但很多接收端（DiPlay/xcertplay 这类单控制器实现、以及部分车机）
+            // 会把「连上又立刻断开」当成控制器掉线，随即关掉 AirPlay 服务——于是我们真正去连时
+            // 就只剩 ECONNREFUSED（2026-10-26 12:47 桌面联调现场：54.3s 探测 7000=开，
+            // 57.3s 真连 7000 全 refused）。连接尝试本身就会把「开/关」打进日志，不需要额外探。
 
             // ---- 定端口：mDNS 自报优先，拿不到再试 7000/7001/7100 ----
             push(link = LinkState.Negotiating("查找车机 AirPlay 服务"))
@@ -516,10 +548,19 @@ object HyperCarRepo {
             // 端点来自车机 ctrl 邀请时**跳过 mDNS**：地址与端口都是车机亲口给的
             // （2026-10-25 车友日志：邀请后还去 browse 3s，结果 PTR/SRV/A 全 0——
             //  这台车根本不广播 `_airplay._tcp`，而车机 20s 后就把 RFCOMM 拆了）。
-            val mdnsEndpoint = if (headUnit.preferMdnsAirplay && !endpoint.fromInvite) {
+            // 同理 **0x4301 已经给出地址+端口时也跳过**：那同样是车机亲口说的
+            // （2026-10-26 12:47 桌面联调：0x4301 在 54.17s 就给了 192.168.1.208:7000，
+            //  我们还去等 3s mDNS，结果 57.3s 才去连、接收端已经把 7000 关了）。
+            val haveEndpoint = endpoint.ipAddresses.isNotEmpty() && endpoint.airPlayPort > 0
+            val mdnsEndpoint = if (headUnit.preferMdnsAirplay && !endpoint.fromInvite && !haveEndpoint) {
                 AirplayServiceProbe(context, ::log).browse(boundNetwork)
             } else {
-                if (endpoint.fromInvite) log("MDNS: 端点来自 ctrl 邀请（${endpoint.ipAddresses}）——跳过 mDNS 查询")
+                when {
+                    endpoint.fromInvite ->
+                        log("MDNS: 端点来自 ctrl 邀请（${endpoint.ipAddresses}）——跳过 mDNS 查询")
+                    haveEndpoint ->
+                        log("MDNS: 0x4301 已给出端点 ${endpoint.ipAddresses}:${endpoint.airPlayPort}——跳过 mDNS 查询")
+                }
                 null
             }
             val apHost = mdnsEndpoint?.host ?: host
@@ -545,7 +586,17 @@ object HyperCarRepo {
             // 7240~9340** 等车机连入；我们若先 bind，它必然 EADDRINUSE、界面一直 Waiting。
             // 所以先把 CarLife 叫起来（它启动要 1~3s，正好和下面连 AirPlay 端口并行），
             // 再探测 7240：有人监听 → 走「主动拨号」；没人监听 → 仍由 HU 监听（客户端型）。
-            wakeLocalCarLife()
+            //
+            // **但已经在监听时绝不能再拉起**：CarLife 的单实例逻辑会把正在服务我们的那份
+            // 进程杀掉，新实例虽然也 bind 7240，却**不回 Phase 1**（空壳）。
+            // 2026-10-26 13:54 现场：22.758 连上 → 22.869 我们 am start → 22.767 通道断开
+            // → 23.77 新实例、一直"握手进行中（Phase 1: 等版本匹配）"。
+            if (isLocalPortListening(CARLIFE_CMD_PORT)) {
+                log("WAKE: CarLife 已在监听 7240——跳过拉起（避免触发单实例重启）")
+                _snapshots.value = _snapshots.value.copy(carLife = CarLifeState.Waiting())
+            } else {
+                wakeLocalCarLife()
+            }
 
             // ---- 连 AirPlay 控制端口并移交 FD ----
             push(link = LinkState.Negotiating("连接车机 AirPlay 端口"))
@@ -557,9 +608,22 @@ object HyperCarRepo {
             // 现在每轮先看它一眼：给了就**立刻改用**，不再陪跑候选端口。
             var hostNow = apHost
             var portsNow: List<Int> = candidatePorts
-            for (round in 0..1) {
+            // 一个**短重试窗口**：接收端/车机常常在 ctrl 邀请之后才把 7000 打开，
+            // 或者中途重启一次 AirPlay 服务；单轮「全 refused 就 fail」会误判成连不上
+            // （2026-10-26 12:47 桌面联调现场：探测时 7000 开着，1.5s 后真连全 refused）。
+            // 窗口内每 400ms 重试一轮，单次连接超时缩短到 1.2s，避免最坏情况拖太久。
+            val connectDeadline = SystemClock.uptimeMillis() + AIRPLAY_CONNECT_WINDOW_MILLIS
+            var pass = 0
+            var lateSwitched = false
+            while (true) {
+                pass++
+                val perTry = if (pass == 1) {
+                    CONTROL_CONNECT_TIMEOUT_MILLIS.toInt()
+                } else {
+                    AIRPLAY_CONNECT_RETRY_TIMEOUT_MILLIS.toInt()
+                }
                 for (candidate in portsNow) {
-                    val fd = openControlFd(context, hostNow, candidate)
+                    val fd = openControlFd(context, hostNow, candidate, perTry)
                     if (fd != null && fd >= 0) {
                         port = candidate
                         controlFd = fd
@@ -567,9 +631,11 @@ object HyperCarRepo {
                     }
                 }
                 if (controlFd != null) break
+                // 晚到的 0x4301：给了真实端口/地址就立刻改用它（只切一次，避免来回跳）
                 val latePort = lateAirplayPort
                 val lateHostRaw = lateAirplayHost
-                if (round == 0 && latePort > 0) {
+                if (!lateSwitched && latePort > 0) {
+                    lateSwitched = true
                     // 只在晚到地址是 **IPv4** 时改 host：fe80:: link-local 不带 scope 连不上
                     // （EINVAL，2026-10-25 两轮现场如此）。这种情况只借它的端口，host 保持原样。
                     val lateHost = lateHostRaw?.takeIf { it.contains('.') && !it.contains(':') }
@@ -581,13 +647,22 @@ object HyperCarRepo {
                         log("SESSION: 晚到的 0x4301 端口=${latePort}（地址 ${lateHostRaw ?: "-"} 不是 IPv4）——沿用 $hostNow，只换端口")
                     }
                     portsNow = listOf(latePort)
-                } else {
-                    break
                 }
+                if (SystemClock.uptimeMillis() >= connectDeadline) break
+                if (pass == 1) {
+                    log(
+                        "SESSION: 候选端口全部连不上——${AIRPLAY_CONNECT_WINDOW_MILLIS / 1000}s 内重试" +
+                            "（接收端可能还没把 AirPlay 端口打开）",
+                    )
+                }
+                kotlinx.coroutines.delay(400)
             }
             val apHostFinal = hostNow
             if (controlFd == null || controlFd < 0 || port == 0) {
-                fail("AirPlay 控制端口连接失败 $apHostFinal（试过 $candidatePorts；晚到的 0x4301 也没给出可用端点）")
+                fail(
+                    "AirPlay 控制端口连接失败 $apHostFinal（试过 ${portsNow};" +
+                        " 端口探测时可能还开着，连接被拒说明接收端已把 AirPlay 服务关掉）",
+                )
                 return
             }
             airplayPort = port
@@ -661,6 +736,8 @@ object HyperCarRepo {
             streaming = true
             // CarLife 唤醒放在 onState("connected") 里做（AirPlay RECORD 完成后），
             // 避免 CarLife 视频帧在屏幕流就绪前被丢弃。
+            watchCarLifeHandshake()
+            armVideoDiag()
         } catch (cancelled: CancellationException) {
             // disconnect() 掐掉在途连接：正常取消，不算失败（也不要把 Failed 写进快照）
             throw cancelled
@@ -707,6 +784,12 @@ object HyperCarRepo {
         streaming = false
         stopVoiceMic()
         runCatching { RustCoreBridge.nativeStop() }
+        // 先掐掉"正在拉起 CarLife"的协程，再清理进程：
+        // 否则它会在 3s 等待结束后把无界面服务重新拉起来，留下 7240 空壳（2026-10-26 12:47 现场）。
+        wakeJob?.cancel()
+        wakeJob = null
+        carLifeActiveAt = 0L
+        carLifeLaunchedAt = 0L
         // Rust 引擎停了之后清理本机 CarLife：否则它会留下"半死空壳"（7240 还占着、
         // 内部状态机停在上一轮 Phase 7），下次上车连上去永远不回 Phase 1。
         stopLocalCarLife(wasDialMode)
@@ -876,35 +959,6 @@ object HyperCarRepo {
             " validated=${caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) ?: false}" +
             " internet=${caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) ?: false}"
     }.getOrElse { "网络属性读取失败（${it.message}）" }
-
-    /**
-     * 车机端口快探（只写日志，不改变行为）。
-     *
-     * 为什么需要：真车（BMW MGU-55）在 7000 端口上对 `GET /info` 回 455，
-     * 说明「有个 RTSP 服务在听，但不是我们能用的那个状态」。AirPlay 接收端
-     * 也可能在 7001/7100/5000/62078 上（Roku/Apple TV/BMW 各家不同），
-     * 扫一遍把「哪些端口活着」记下来，比盲猜快。
-     */
-    private fun probeCarPorts(context: Context, host: String) {
-        scope.launch(Dispatchers.IO) {
-            val ports = listOf(7000, 7001, 7100, 5000, 62078)
-            val network = boundNetwork
-            val results = ports.map { port ->
-                val startedAt = System.currentTimeMillis()
-                val ok = runCatching {
-                    val socket = Socket()
-                    socket.tcpNoDelay = true
-                    if (network != null) network.bindSocket(socket)
-                    socket.connect(InetSocketAddress(host, port), 600)
-                    socket.close()
-                    true
-                }.getOrDefault(false)
-                val cost = System.currentTimeMillis() - startedAt
-                "${port}=${if (ok) "开(${cost}ms)" else "关"}"
-            }
-            log("PROBE 车机端口 $host → ${results.joinToString(" ")}")
-        }
-    }
 
     /** 兜底：拿当前默认网络（连上车机热点但静默路径失败时，Android 可能仍选蜂窝）。 */
     private fun currentDefaultNetwork(context: Context): Network? = runCatching {
@@ -1212,6 +1266,7 @@ object HyperCarRepo {
         context: Context,
         host: String,
         port: Int,
+        timeoutMillis: Int = CONTROL_CONNECT_TIMEOUT_MILLIS.toInt(),
     ): Int? = withContext(Dispatchers.IO) {
         val cm = context.getSystemService(ConnectivityManager::class.java)
         val candidates = buildList<Network?> {
@@ -1227,7 +1282,7 @@ object HyperCarRepo {
             val fd = runCatching {
                 val socket = Socket()
                 socket.tcpNoDelay = true
-                socket.connect(resolveEndpoint(host, port), CONTROL_CONNECT_TIMEOUT_MILLIS.toInt())
+                socket.connect(resolveEndpoint(host, port), timeoutMillis)
                 keepAliveForRust(socket)
                 ParcelFileDescriptor.fromSocket(socket).detachFd()
             }.onFailure { lastError = it.javaClass.simpleName + ": " + it.message }.getOrNull()
@@ -1388,18 +1443,34 @@ object HyperCarRepo {
                 // Rust 侧 CarLife 14 步握手完成（VIDEO_ENCODER_START 已发）
                 "carlife_active" -> {
                     push(carLife = CarLifeState.Active())
+                    carLifeActiveAt = SystemClock.uptimeMillis()
+                    // CarWith 用 ICarLifeManager.register + IDisplayController.startDisplay 让
+                    // CarLife 真正开始投屏（见 startCarLifeDisplay）；我们也调一次试试。
+                    scope.launch {
+                        kotlinx.coroutines.delay(600)
+                        startCarLifeDisplay()
+                    }
                     // CarLife 有 ~35 秒的空闲看门狗：Activity 一旦不在前台，它自己的
                     // `ProcessUtil.killAllProcess` 就把整进程干掉（2026-10-26 00:45/00:48 两次
                     // 现场都是"握手成功后第 34~35 秒进程自杀"，紧接着 CarWith 又 force-stop 重启）。
-                    // 所以握手一成，立刻把 CarLife 重新推到前台，让我们的界面退到后台。
-                    scope.launch {
-                        val r = runCatching {
-                            ShizukuTools.exec(
-                                "am start -n com.baidu.carlife.xiaomi/com.baidu.carlife.CarlifeActivity",
-                                8_000,
-                            )
-                        }.getOrNull()
-                        log("CARLIFE: 已把 CarLife 推回前台（防 35s 空闲自杀） exit=${r?.code}")
+                    // 所以握手一成要把 CarLife 推到前台——但**不能刚拉起就再推一次**：
+                    // 2026-10-26 13:13 现场，唤醒时（31.741）已经 `am start` 过一次，
+                    // 这里 300ms 后又来一次（32.056），紧接着就出现「CarLife 重新连一遍 7240、
+                    // 新的 CMD 会话永远不回 Phase 1」——已握手的那份实例被顶掉了。
+                    val sinceLaunch = SystemClock.uptimeMillis() - carLifeLaunchedAt
+                    if (sinceLaunch < 25_000L) {
+                        log("CARLIFE: ${sinceLaunch}ms 前刚拉起过——跳过重复 am start（防止单实例重启）")
+                    } else {
+                        scope.launch {
+                            val r = runCatching {
+                                ShizukuTools.exec(
+                                    "am start -n com.baidu.carlife.xiaomi/com.baidu.carlife.CarlifeActivity",
+                                    8_000,
+                                )
+                            }.getOrNull()
+                            carLifeLaunchedAt = SystemClock.uptimeMillis()
+                            log("CARLIFE: 已把 CarLife 推回前台（防 35s 空闲自杀） exit=${r?.code}")
+                        }
                     }
                 }
                 "failed" -> retryAirplayOrFail(detail)
@@ -1414,6 +1485,7 @@ object HyperCarRepo {
 
         override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {
             // 用 update（CAS）而不是读-改-写：每秒一次，与 log() 的读-改-写并发会吞掉日志行。
+            lastVideoFrames = frames
             _snapshots.update { s ->
                 s.copy(
                     video = s.video.copy(fps = fps, frames = frames, kbps = kbps),
@@ -1549,7 +1621,8 @@ object HyperCarRepo {
         // 否则等于自己制造双实例。
         val directLaunch = "com.baidu.carlife.xiaomi/com.baidu.carlife.CarlifeActivity"
         if (ShizukuTools.isReady && pkg == "com.miui.carlink") {
-            scope.launch {
+            wakeJob?.cancel()
+            wakeJob = scope.launch {
                 // 目标 display：-1 = 主屏。-1 以外是实验开关（把 CarLife 投到副屏/虚拟屏，
                 // 主屏留给 HyperCar）。屏不存在时 am start 会失败，下面自动回退主屏。
                 val wakeDisplay = SettingsStore.carlifeWakeDisplay
@@ -1573,14 +1646,25 @@ object HyperCarRepo {
                 }.getOrNull()
                 log("WAKE: 拉起 CarLife 引擎页（display=$wakeDisplay）exit=${started?.code} " +
                     started?.out?.lineSequence()?.firstOrNull().orEmpty().take(120))
+                carLifeLaunchedAt = SystemClock.uptimeMillis()
                 kotlinx.coroutines.delay(3_000)
+                // 会话可能在这 3s 里就失败了（AirPlay 端口连不上 → releaseSessionResources
+                // 会 force-stop CarLife）。此时继续拉起只会留下"7240 在听但不回 Phase 1"的空壳。
+                if (!sessionLive.get()) {
+                    log("WAKE: 会话已结束——放弃继续拉起 CarLife（避免留下空壳进程）")
+                    return@launch
+                }
                 if (!probeCarLifeOnce() && wakeDisplay >= 0) {
                     // 副屏方案不可用（这块屏不存在/不允许投）：退回主屏，别把 CarLife 弄没
                     log("WAKE: display=$wakeDisplay 上没起来（7240 未监听）——回退主屏重试")
                     runCatching { ShizukuTools.exec("am start ${startArgs(-1)}", 8_000) }
                     kotlinx.coroutines.delay(3_000)
+                    if (!sessionLive.get()) {
+                        log("WAKE: 会话已结束——放弃服务兜底")
+                        return@launch
+                    }
                 }
-                if (!probeCarLifeOnce()) {
+                if (!probeCarLifeOnce() && sessionLive.get()) {
                     val svc = runCatching {
                         ShizukuTools.exec(
                             "am start-foreground-service -n com.baidu.carlife.xiaomi/" +
@@ -1697,6 +1781,68 @@ object HyperCarRepo {
     }
 
     // ---------------------------------------------------------------- 工具
+
+    /**
+     * 握手看门狗：引擎起来后 12s 内没收到 `carlife_active`（14 步握手完成），
+     * 就判定本机 CarLife 是"空壳"——7240 在听、但新的 CMD 会话永远不回 Phase 1
+     * （2026-10-26 13:13 现场：CarLife 被重复拉起后单实例重启，新实例不回握手）。
+     * 处置：force-stop 后重新拉起一次（每轮会话最多一次，避免反复杀）。
+     */
+    private fun watchCarLifeHandshake() {
+        val startedAt = SystemClock.uptimeMillis()
+        carLifeActiveAt = 0L
+        scope.launch {
+            while (sessionLive.get()) {
+                kotlinx.coroutines.delay(1_000)
+                if (carLifeActiveAt >= startedAt) return@launch
+                if (SystemClock.uptimeMillis() - startedAt >= 12_000L) break
+            }
+            if (!sessionLive.get() || carLifeActiveAt >= startedAt) return@launch
+            log("CARLIFE: 12s 内没走完握手（Phase 1 无回应）——判定空壳，force-stop 后重拉一次")
+            restartLocalCarLife()
+        }
+    }
+
+    /**
+     * 自动取证：引擎起来 12s 后若视频帧数仍是 0，自己抓一次 CarLife 现场。
+     *
+     * **为什么不用按钮**：点按钮必须先切回 HyperCar，这一下就会把 CarLife 打成
+     * paused（2026-10-26 13:16 现场：DIAG-ACT `topResumedActivity=HyperCar`、
+     * `Task{com.baidu.carlife.xiaomi … visible=false}`、编码器 `Qin:0`），
+     * 取证动作本身把现场破坏了。这里在"用户还没动手机"的时间点自动采一次。
+     */
+    private fun armVideoDiag() {
+        lastVideoFrames = 0L
+        scope.launch {
+            kotlinx.coroutines.delay(12_000)
+            if (!sessionLive.get() || !streaming) return@launch
+            if (lastVideoFrames > 0) {
+                log("DIAG: 12s 内已出帧（frames=$lastVideoFrames）——不需要取证")
+                return@launch
+            }
+            log("DIAG: 12s 内视频帧仍为 0——自动取证（不用碰手机）")
+            // CarLife 的 APK 里有 MediaProjection/createVirtualDisplay/createInputSurface：
+            // 它的视频很可能是"录屏 → 编码"。Android 13+ 每次都要系统授权（或 PROJECT_MEDIA appop），
+            // 没授权就只会出现"编码器 STARTED 但 Qin:0"。
+            log(
+                "DIAG: 提示——CarLife 视频依赖录屏授权（MediaProjection）。若手机上刚弹过" +
+                    "「开始录制/投放」请点允许；没有弹窗时可在 Shizuku 里执行 " +
+                    "`appops set com.baidu.carlife.xiaomi PROJECT_MEDIA allow`",
+            )
+            dumpCarLifeDiag()
+        }
+    }
+
+    /** 强杀本机 CarLife 后重新拉起（只用于空壳自愈）。 */
+    private fun restartLocalCarLife() {
+        scope.launch {
+            for (pkg in listOf("com.baidu.carlife.xiaomi", "com.baidu.carlife")) {
+                runCatching { ShizukuTools.exec("am force-stop $pkg", 4_000) }
+            }
+            kotlinx.coroutines.delay(600)
+            wakeLocalCarLife()
+        }
+    }
 
     private fun pickHost(endpoint: CarPlayEndpoint): String? {
         // IPv4 优先 → 其余地址；全空再试网关（cardeck EndpointHosts 同序）
@@ -2263,6 +2409,311 @@ object HyperCarRepo {
     }
 
     /**
+     * 诊断：抓 CarLife 的"现场"，用来定位「握手全过、8240 一帧没有」这类问题。
+     *
+     * 抓三样东西（都只读，不改行为）：
+     *  ① Activity 是否真的在前台（`dumpsys activity activities`）；
+     *  ② 它有没有 Surface（`dumpsys SurfaceFlinger --list`——没有 Surface 就没有编码输入）；
+     *  ③ logcat 里 CarLife / MediaCodec / `video-debug` 相关最后几十行（编码器有没有输出）。
+     *
+     * 只在有 Shizuku 时可用；输出截断到 40 行、每行 200 字符，避免把环形日志刷满。
+     */
+    fun dumpCarLifeDiag() {
+        if (!ShizukuTools.isReady) {
+            log("DIAG: 需要 Shizuku 才能抓 CarLife 现场（dumpsys/logcat）——先授权再点一次")
+            return
+        }
+        scope.launch(Dispatchers.IO) {
+            suspend fun run(prefix: String, cmd: String, maxLines: Int) {
+                val r = runCatching { ShizukuTools.exec(cmd, 12_000) }.getOrNull()
+                if (r == null) {
+                    log("$prefix: 执行失败（无输出）")
+                    return
+                }
+                val lines = r.out.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
+                log("$prefix: exit=${r.code}，${lines.size} 行")
+                lines.take(maxLines).forEach { log("$prefix ${it.take(200)}") }
+            }
+            log("DIAG: ==== CarLife 现场开始 ====")
+            run(
+                "DIAG-ACT",
+                "dumpsys activity activities | grep -iE 'carlife|mResumedActivity|topResumedActivity' | head -6",
+                6,
+            )
+            run(
+                "DIAG-SF",
+                "dumpsys SurfaceFlinger --list | grep -iE 'carlife|SurfaceView|Video' | head -10",
+                10,
+            )
+            run(
+                "DIAG-ENC",
+                "logcat -d -t 2000 | grep -iE 'video-debug' | tail -6",
+                6,
+            )
+            run(
+                "DIAG-LOG",
+                "logcat -d -t 3000 | grep -iE 'carlife|video-debug|avcE_|MediaCodec' | tail -30",
+                30,
+            )
+            log("DIAG: ==== CarLife 现场结束 ====")
+            // 顺手探一下 CarLife 的投屏 AIDL（CarWith 就是靠它驱动投屏的）
+            probeCarLifeCastBinder()
+            // 顺便把 register/getDisplayController/startDisplay 这套也跑一遍：
+            // 不需要先连车机，点一次「CarLife」就能看到结果。
+            startCarLifeDisplay()
+        }
+    }
+
+    /**
+     * 探测 CarLife 的投屏 AIDL 通道（`com.baidu.carlife.mixing.aidl.ICarLifeCastManager`）。
+     *
+     * 逆向 CarLife APK 得到：
+     * ```
+     * interface ICarLifeCastManager {
+     *     Bundle invokeMethod(in Intent);   // code 1
+     *     void   prepareCast(in CastConfig);// code 2
+     *     void   setCastCallback(ICarLifeCastCallback); // code 3
+     *     void   setSystemAudioCallback(ISystemAudioCallback); // code 4
+     *     void   stopCast();                // code 5
+     * }
+     * class CastConfig { int width; int height; int dpi; Surface surface; }  // Parcelable
+     * ```
+     * 也就是说 **调用方提供一个 Surface，CarLife 把车机画面渲染进去**——CarWith 就是这么做的。
+     * 如果这个 binder 能拿到，我们就能把 CastConfig.surface 设成 MediaCodec 的输入 Surface，
+     * 直接拿到 CarLife 的真实车机画面（不再需要 CarWith，也不需要 root）。
+     */
+    /**
+     * 让 CarLife 真正开始投屏：走它自己的 `ICarLifeManager` AIDL（CarWith 就是这么做的）。
+     *
+     * descriptor 与 transact code 全部来自 CarLife APK 的 Stub 常量：
+     * ```
+     * com.baidu.carlifelink.listener.ICarLifeManager      （由导出的 RemotePresentationService 提供）
+     *     register(String): boolean          code 1
+     *     unregister(String): boolean        code 2
+     *     getDisplayController(String): IBinder code 3
+     * com.baidu.carlifelink.listener.IDisplayController
+     *     startDisplay(String)               code 1
+     *     stopDisplay(String)                code 2
+     *     currentDisplayPage(String): String code 3
+     * ```
+     * 推测：`startDisplay` 就是"开始投屏"的开关，CarLife 会创建虚拟屏/启动编码；
+     * 如果此时我们的引擎正以 HU 身份连着它（7240/8240），帧应该就会从 8240 出来。
+     */
+    /** 供 adb 广播（DebugProbeReceiver）触发的投屏探测入口。 */
+    fun startCarLifeDisplayProbe() = startCarLifeDisplay()
+
+    /** 探测日志：同时进 App 日志与 /sdcard/Android/data/<pkg>/files/cast_probe.txt（adb 可直接读）。 */
+    private fun probeLog(msg: String) {
+        log(msg)
+        runCatching {
+            val ctx = appCtx ?: return
+            java.io.File(ctx.getExternalFilesDir(null), "cast_probe.txt").appendText(msg + "\n")
+        }
+    }
+
+    private fun startCarLifeDisplay() {
+        val ctx = appContext() ?: return
+        // register(tag) 的 tag 不一定是任意字符串：CarLife 很可能拿它当"客户端标识"校验。
+        // 先按最可能的值逐个试，命中（返回 1）才继续 getDisplayController/startDisplay。
+        // RemoteClientConfig 里只认这几个 client key（见 dex 常量），其余一律 false。
+        val candidates = listOf(
+            // register(tag) 实际比的是 RemoteClient.pkgName（不是 key），
+            // RemoteClientConfig.supportRemoteClients 里只有这三个 pkgName：
+            //   video_client.dev / com.baidu.BaiduMap / com.szats.breakthrough
+            // 且 getClients() **不检查是否已安装**，所以没装百度地图也能命中。
+            "com.baidu.BaiduMap", "com.szats.breakthrough", "video_client.dev",
+            "baidu_map", "map", "mini_map", "baidu_mini_map", "carlife_rcc_display",
+            ctx.packageName, "com.miui.carlink", "com.baidu.carlife",
+        )
+
+        fun register(svc: android.os.IBinder, tag: String): Int = runCatching {
+            val d = android.os.Parcel.obtain()
+            val r = android.os.Parcel.obtain()
+            try {
+                d.writeInterfaceToken("com.baidu.carlifelink.listener.ICarLifeManager")
+                d.writeString(tag)
+                svc.transact(1, d, r, 0)
+                r.readException()
+                if (r.dataSize() >= 4) r.readInt() else -1
+            } finally {
+                d.recycle()
+                r.recycle()
+            }
+        }.onFailure {
+            log("CAST: register(\"$tag\") 抛异常 ${it.javaClass.simpleName}: ${it.message}")
+        }.getOrDefault(-1)
+
+        fun displayController(svc: android.os.IBinder, tag: String): android.os.IBinder? = runCatching {
+            val d = android.os.Parcel.obtain()
+            val r = android.os.Parcel.obtain()
+            try {
+                d.writeInterfaceToken("com.baidu.carlifelink.listener.ICarLifeManager")
+                d.writeString(tag)
+                svc.transact(3, d, r, 0)
+                r.readException()
+                r.readStrongBinder()
+            } finally {
+                d.recycle()
+                r.recycle()
+            }
+        }.getOrNull()
+
+        fun startDisplay(ctrl: android.os.IBinder, tag: String): Boolean = runCatching {
+            val d = android.os.Parcel.obtain()
+            val r = android.os.Parcel.obtain()
+            try {
+                d.writeInterfaceToken("com.baidu.carlifelink.listener.IDisplayController")
+                d.writeString(tag)
+                ctrl.transact(1, d, r, 0)
+                r.readException()
+                true
+            } finally {
+                d.recycle()
+                r.recycle()
+            }
+        }.getOrDefault(false)
+
+        runCatching {
+            val intent = android.content.Intent().setComponent(
+                android.content.ComponentName(
+                    "com.baidu.carlife.xiaomi",
+                    "com.baidu.carlife.complex.RemotePresentationService",
+                ),
+            )
+            ctx.bindService(
+                intent,
+                object : android.content.ServiceConnection {
+                    override fun onServiceConnected(
+                        name: android.content.ComponentName?,
+                        service: android.os.IBinder?,
+                    ) {
+                        if (service == null) {
+                            log("CAST: RemotePresentationService 绑定成功但 binder 为 null")
+                            return
+                        }
+                        try {
+                            for (tag in candidates) {
+                                val reg = register(service, tag)
+                                probeLog("CAST: register(\"$tag\") → $reg")
+                                if (reg != 1) continue
+                                val ctrl = displayController(service, tag)
+                                probeLog("CAST: getDisplayController(\"$tag\") = $ctrl")
+                                if (ctrl == null) continue
+                                castDisplayController = ctrl
+                                // startDisplay 的参数可能是 client 的 displayName（key）而不是 pkgName：
+                                // 两个都试，各看一次 displays。
+                                val keys = when (tag) {
+                                    "com.baidu.BaiduMap" -> listOf("baidu_map", "baidu_mini_map")
+                                    "video_client.dev" -> listOf("map", "mini_map")
+                                    "com.szats.breakthrough" -> listOf("carlife_rcc_display")
+                                    else -> emptyList()
+                                }
+                                for (arg in listOf(tag) + keys) {
+                                    val started = startDisplay(ctrl, arg)
+                                    val dm = ctx.getSystemService(
+                                        android.hardware.display.DisplayManager::class.java,
+                                    )
+                                    val displays = dm?.displays
+                                        ?.joinToString(", ") { "${it.displayId}:${it.name}" }
+                                        ?: "-"
+                                    probeLog("CAST: startDisplay(\"$arg\") = $started，displays=$displays")
+                                }
+                                return // CarLife 同一时刻只接受一个远程客户端
+                            }
+                            log("CAST: 候选 tag 全部注册失败——枚举 CarLife 的导出服务，找别的 AIDL 入口")
+                            probeCarLifeExportedServices()
+                        } catch (t: Throwable) {
+                            log("CAST: 调用异常 ${t.javaClass.simpleName}: ${t.message}")
+                        }
+                    }
+
+                    override fun onServiceDisconnected(name: android.content.ComponentName?) {
+                        log("CAST: RemotePresentationService 断开")
+                        castDisplayController = null
+                    }
+                },
+                android.content.Context.BIND_AUTO_CREATE,
+            )
+        }.onFailure { log("CAST: bindService 异常 ${it.message}") }
+    }
+
+    /**
+     * 枚举 CarLife 的**导出**服务，逐个 bind 并打印 binder 的 interfaceDescriptor。
+     *
+     * 目的：找出哪个组件暴露了 `com.baidu.carlife.mixing.aidl.ICarLifeCastManager`
+     * （带 `prepareCast(CastConfig{surface})`，能把 CarLife 的画面渲染进我们给的 Surface）。
+     */
+    private fun probeCarLifeExportedServices() {
+        val ctx = appContext() ?: return
+        val pm = ctx.packageManager
+        val services = runCatching {
+            pm.getPackageInfo("com.baidu.carlife.xiaomi", android.content.pm.PackageManager.GET_SERVICES)
+                .services
+        }.getOrNull().orEmpty()
+        log("CAST-SVC: CarLife 共 ${services.size} 个 service，导出中…")
+        for (s in services) {
+            if (!s.exported) continue
+            val cls = s.name
+            log("CAST-SVC: $cls permission=${s.permission ?: "-"}")
+            runCatching {
+                var conn: android.content.ServiceConnection? = null
+                conn = object : android.content.ServiceConnection {
+                    override fun onServiceConnected(
+                        name: android.content.ComponentName?,
+                        binder: android.os.IBinder?,
+                    ) {
+                        val desc = runCatching { binder?.interfaceDescriptor }.getOrNull()
+                        val impl = binder?.javaClass?.name ?: "null"
+                        log("CAST-SVC: $cls → descriptor=$desc binder=$impl")
+                        runCatching { conn?.let { ctx.unbindService(it) } }
+                    }
+
+                    override fun onServiceDisconnected(name: android.content.ComponentName?) {
+                        log("CAST-SVC: $cls 断开")
+                    }
+                }
+                val intent = android.content.Intent().setComponent(
+                    android.content.ComponentName("com.baidu.carlife.xiaomi", cls),
+                )
+                ctx.bindService(intent, conn, android.content.Context.BIND_AUTO_CREATE)
+            }.onFailure { log("CAST-SVC: 绑定 $cls 失败 ${it.message}") }
+        }
+    }
+
+    private fun probeCarLifeCastBinder() {
+        val ctx = appContext() ?: return
+        val components = listOf(
+            "com.baidu.carlife.service.CarlifeConnectService",
+            "com.baidu.carlife.complex.RemotePresentationService",
+        )
+        for (cls in components) {
+            runCatching {
+                val intent = android.content.Intent().setComponent(
+                    android.content.ComponentName("com.baidu.carlife.xiaomi", cls),
+                )
+                val conn = object : android.content.ServiceConnection {
+                    override fun onServiceConnected(
+                        name: android.content.ComponentName?,
+                        binder: android.os.IBinder?,
+                    ) {
+                        val desc = runCatching { binder?.interfaceDescriptor }.getOrNull()
+                        val binderClass = binder?.javaClass?.name ?: "null"
+                        log("CAST: ✓ 绑定 $cls → binder=$binderClass descriptor=$desc")
+                        castBinder = binder
+                    }
+
+                    override fun onServiceDisconnected(name: android.content.ComponentName?) {
+                        log("CAST: 断开 $cls")
+                        castBinder = null
+                    }
+                }
+                val ok = ctx.bindService(intent, conn, android.content.Context.BIND_AUTO_CREATE)
+                log("CAST: bindService($cls) = $ok")
+            }.onFailure { log("CAST: 绑定 $cls 异常 ${it.message}") }
+        }
+    }
+
+    /**
      * 导出日志到 `下载/HyperCar/`（MediaStore，免存储权限，文件管理器/微信可见）。
      * 完成后路径写进快照 [SessionSnapshot.lastExportPath] 并落一条日志（诊断页最上方可见）。
      * 必须在后台线程调用（内部已切 IO）。
@@ -2392,6 +2843,12 @@ object HyperCarRepo {
 
     /** 单个候选网络上连 AirPlay 控制端口的超时（多网络轮试，单次不能给太久）。 */
     private const val CONTROL_CONNECT_TIMEOUT_MILLIS = 2_500L
+
+    /** 连 AirPlay 控制端口的重试窗口（接收端常在 invite 之后才开端口，一轮失败不能当死）。 */
+    private const val AIRPLAY_CONNECT_WINDOW_MILLIS = 8_000L
+
+    /** 重试轮里的单次连接超时（比首轮短，避免窗口被几轮超时吃光）。 */
+    private const val AIRPLAY_CONNECT_RETRY_TIMEOUT_MILLIS = 1_200L
 
     /** 环形日志保留行数（诊断页展示 + 导出）。 */
     private const val LOG_KEEP_LINES = 300

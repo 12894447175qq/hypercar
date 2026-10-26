@@ -1,4 +1,4 @@
-package io.github.hypercar.core
+﻿package io.github.hypercar.core
 
 /**
  * Rust 核心层 JNI 桥（libhypercar_core.so）。
