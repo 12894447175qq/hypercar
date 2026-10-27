@@ -77,13 +77,16 @@ bash ./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleDebug :app:ass
 
 ## vivo 组件安装及手机配置
 
+后续已补充公开文档对照与独立视频解码，见[文档与视频链路复核](VIVO-DOCUMENT-VERIFICATION.md)。
+该复核也记录了 Jovi 原厂用户协议提示，不能把视频数据非零等同于车载桌面功能已验收。
+
 首次提交时手机离线；用户随后重新开启无线调试并解锁，已完成以下手机端验证：
 
 - 原签名安装 `com.baidu.carlife.vivo / 8.8.4 / 273`，UID 10424；Activity 冷启动成功。
 - 7240、8240、9240、9241、9242、9340 均属于 UID 10424。
 - 只启动 Activity：握手成功，但 45 秒内 0 帧。
 - 绑定已安装 Jovi 的 `CarLifeMixingService` 后，Jovi 创建 `vivo_car_screen` 虚拟屏，收到真实 H.264。
-- 使用生产参数（未开启 `carlife_log_open`）：45 秒内完成 1 次握手、326 帧、410,900 字节。
+- 首次仅计数探针使用生产参数（未开启 `carlife_log_open`）：45 秒内完成 1 次握手、326 条视频数据事件、410,900 字节。
   请求分辨率由组件协商为 1280×720。
 - 测试探针直接复用仓库 `rust-core/src/carlife.rs`，通过 ADB 转发连接六个通道，只计数，未保存视频内容。
   这是手机取源验证，未连接 MIB3，也未验证 AirPlay 输出、声音或触控。
