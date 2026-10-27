@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.headunit
+package io.github.hypercar.headunit
 
 import android.content.Context
 
@@ -41,11 +41,11 @@ object RemoteProfiles {
 
     /** 档案列表地址（raw.githubusercontent.com，改 `main` 为其它分支即可灰度）。 */
     const val DEFAULT_URL =
-        "https://raw.githubusercontent.com/fw867/hypercar/main/profiles/headunits.json"
+        io.github.hypercar.core.ProjectLinks.PROFILES
 
     /** 设置页可改下载源（自建镜像/私有分支），空则用 [DEFAULT_URL]。 */
     fun url(): String =
-        SettingsStore.remoteProfilesUrl.ifBlank { DEFAULT_URL }
+        io.github.hypercar.core.ProjectLinks.profilesUrl(SettingsStore.remoteProfilesUrl)
 
     /**
      * 解析结果缓存：设置页每次重组都会调 [cached]，重复 parse 几百字节
@@ -153,7 +153,7 @@ object RemoteProfiles {
         val profiles: List<HeadUnitProfile>,
     )
 
-    private fun parseRaw(raw: String): Parsed {
+    internal fun parseRaw(raw: String): Parsed {
         val trimmed = raw.trim()
         if (trimmed.startsWith("[")) {
             val array = JSONArray(trimmed)
@@ -194,6 +194,8 @@ object RemoteProfiles {
             touchDisplay = o.optString("touchDisplay", "").ifBlank { defaults.touchDisplay },
             keepIap2AliveOnly = o.optBoolean("keepIap2AliveOnly", defaults.keepIap2AliveOnly),
             pairingHint = o.optString("pairingHint", "").ifBlank { null },
+            mfiPreferredChallengeBytes = o.optInt("mfiPreferredChallengeBytes", defaults.mfiPreferredChallengeBytes)
+                .takeIf { it in setOf(16, 20, 32) } ?: defaults.mfiPreferredChallengeBytes,
         )
     }
 
@@ -215,6 +217,7 @@ object RemoteProfiles {
                     put("notes", p.notes)
                     put("verified", p.verified)
                     put("validatesDeviceId", p.validatesDeviceId)
+                    put("mfiPreferredChallengeBytes", p.mfiPreferredChallengeBytes)
                     put("sendCarPlayAvailability", p.sendCarPlayAvailability)
                     put("openEaSessions", p.openEaSessions)
                     put("sendTransportIdentifier", p.sendTransportIdentifier)

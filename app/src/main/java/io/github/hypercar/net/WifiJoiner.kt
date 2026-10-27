@@ -30,9 +30,8 @@ import java.util.concurrent.atomic.AtomicReference
  *    反而绕开「热点已被保存反而连不上」的地雷（cardeck §13b 大众探歌实测）。
  *
  * 两条路径最终都走 [bindProcess]：
- *  **必须绑 `bindProcessToNetwork` 的原因**：mDNS `NsdManager.registerService` 没有 Network 参数
- *  （API 36 才有 `AdvertisingRequest` 重载），广播跟随进程默认网络；不绑就从蜂窝发出去，车机
- *  永远发现不了手机（0x4301/邀请不到）。它只影响本进程，虚拟屏里的导航/音乐是独立进程不受影响。
+ *  绑定 `bindProcessToNetwork` 让原生媒体 socket 使用车机 Wi-Fi；API 33+ 的 mDNS 公告
+ *  还显式指定同一 Network。绑定只影响本进程，导航/音乐的独立进程不受影响。
  *
  * 三个内化的坑（Shizuku 路径）：
  *  - `connect-network` 的 **exit=0 不代表已连上**（命令只把连接投给 WifiService 就返回）→
@@ -146,7 +145,7 @@ class WifiJoiner(
             }
 
             // ④ 不带 specifier 的 requestNetwork 取 Network 句柄（不会弹任何确认框）
-            val network = awaitNetworkHandle(HANDLE_WAIT_MS)
+            val network = awaitNetworkHandle(ssid, HANDLE_WAIT_MS)
             if (network == null) {
                 lastFailureReason = "已连上 \"$ssid\" 但拿不到 Network 句柄"
                 return@withContext JoinResult.Failed
@@ -254,7 +253,23 @@ class WifiJoiner(
     fun bindProcess(network: Network): Boolean = synchronized(bindLock) {
         if (boundNetwork.get() == network) return true // 快路径：已绑同一网络
         val ok = connectivityManager.bindProcessToNetwork(network)
-        if (ok) boundNetwork.set(network)
+        if (ok) {
+            boundNetwork.set(network)
+            if (callback.get() == null) {
+                val monitor = object : ConnectivityManager.NetworkCallback() {
+                    override fun onLost(lost: Network) {
+                        if (boundNetwork.compareAndSet(lost, null)) {
+                            connectivityManager.bindProcessToNetwork(null)
+                            lostCallback()
+                        }
+                    }
+                }
+                callback.set(monitor)
+                runCatching { connectivityManager.registerNetworkCallback(
+                    NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build(), monitor) }
+                    .onFailure { callback.compareAndSet(monitor, null) }
+            }
+        }
         ok
     }
 
@@ -293,51 +308,34 @@ class WifiJoiner(
         return status.contains("\"$ssid\"") // 兜底：输出里出现带引号的 SSID
     }
 
-    /** 用不带 specifier 的 requestNetwork 捕获当前 WiFi 的 Network 句柄；超时/onUnavailable 返回 null。 */
-    private suspend fun awaitNetworkHandle(timeoutMs: Long): Network? {
-        val request = NetworkRequest.Builder()
-            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-            .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) // 车机热点无外网，别让它被拆
-            .build()
-        val latch = CountDownLatch(1)
-        val result = AtomicReference<Network?>(null)
-        val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                result.set(network)
-                latch.countDown()
-            }
-
-            override fun onUnavailable() {
-                latch.countDown()
-            }
-
-            override fun onLost(network: Network) {
-                // 车机熄火/离开范围：热点消失 → 解绑并通知会话层
-                if (boundNetwork.compareAndSet(network, null)) {
-                    connectivityManager.bindProcessToNetwork(null)
-                }
-                lostCallback()
-            }
+    /** Match the actual Wi-Fi handle, never the cellular default or an unrelated second Wi-Fi. */
+    suspend fun existingNetwork(ssid: String): Network? {
+        val networks = connectivityManager.allNetworks.filter {
+            connectivityManager.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
         }
-        callback.set(cb)
-        try {
-            connectivityManager.requestNetwork(request, cb)
-        } catch (t: Throwable) {
-            callback.compareAndSet(cb, null)
-            Log.i(TAG, "requestNetwork 失败：${t.message}")
-            return null
+        val matching = networks.filter {
+            val info = connectivityManager.getNetworkCapabilities(it)?.transportInfo as? android.net.wifi.WifiInfo
+            info?.ssid?.trim('"') == ssid
         }
+        if (matching.size == 1) return matching.single()
+        // Redacted transportInfo: only a single Wi-Fi plus an independently confirmed SSID is unambiguous.
+        if (networks.size != 1) return null
+        val apiSsid = runCatching {
+            (context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager)?.connectionInfo?.ssid?.trim('"')
+        }.getOrNull()
+        if (apiSsid == ssid) return networks.single()
+        if (ShizukuTools.isReady && statusShowsSsid(ShizukuTools.exec("cmd wifi status", 3_000).out, ssid)) return networks.single()
+        return null
+    }
+
+    private suspend fun awaitNetworkHandle(ssid: String, timeoutMs: Long): Network? {
         val deadline = SystemClock.uptimeMillis() + timeoutMs
         while (SystemClock.uptimeMillis() < deadline) {
             currentCoroutineContext().ensureActive()
-            if (latch.await(200, TimeUnit.MILLISECONDS)) break
+            existingNetwork(ssid)?.let { return it }
+            delay(250)
         }
-        val network = result.get()
-        if (network == null) {
-            release() // 未拿到句柄：注销回调，别泄漏
-            return null
-        }
-        return network
+        return null
     }
 
     private companion object {

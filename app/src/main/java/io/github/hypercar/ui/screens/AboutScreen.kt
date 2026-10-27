@@ -104,11 +104,11 @@ fun AboutScreen(modifier: Modifier = Modifier) {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             SectionLabel(text = "关于")
             GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)) {
-                InfoRow(label = "作者", value = "fw867")
+                InfoRow(label = "维护者", value = "12894447175qq（基于 fw867）")
                 InfoRow(
                     label = "开源仓库",
-                    value = "github.com/fw867/hypercar",
-                    onClick = { openUrl(context, "https://github.com/fw867/hypercar") },
+                    value = "github.com/12894447175qq/hypercar",
+                    onClick = { openUrl(context, io.github.hypercar.core.ProjectLinks.PROJECT) },
                 )
                 InfoRow(label = "更新来源", value = "GitHub Releases")
             }

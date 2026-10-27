@@ -8,13 +8,13 @@ plugins {
 
 // ---- 版本号机制（与 CI android-ci.yml 配套）----
 // 基础版本：发布时只手改这一行。
-val appVersionName = "0.1.0"
+val appVersionName = "0.1.1"
 
 // CI 构建号：`-Phypercar.buildNumber=<github.run_number>`（CI 每次 push 传入）。
-//   versionName = 0.1.0.<N>、versionCode = base*10000 + N —— 每次推送 +1，可覆盖安装。
-// 本地不传 -P 时就是纯 base 版本（0.1.0 / 1）。
+//   versionName = 0.1.1.<N>、versionCode = base*10000 + N —— 每次推送 +1，可覆盖安装。
+// 本地不传 -P 时为 0.1.1 / 20000，仍可升级旧的 100xx 构建。
 val buildNumber: Int? = providers.gradleProperty("hypercar.buildNumber").orNull?.toIntOrNull()
-val baseVersionCode = 1
+val baseVersionCode = 2
 
 android {
     namespace = "io.github.hypercar"
@@ -28,7 +28,7 @@ android {
         // targetSdk 34：与 cardeck 一致——Android 15+ 对 mediaProjection FGS 的
         // 额外 AppOps 校验、以及悬浮窗可见性补充条款都不触发（HyperOS4 实测宽容）。
         targetSdk = 34
-        versionCode = buildNumber?.let { baseVersionCode * 10_000 + it } ?: baseVersionCode
+        versionCode = buildNumber?.let { baseVersionCode * 10_000 + it } ?: baseVersionCode * 10_000
         versionName = buildNumber?.let { "$appVersionName.$it" } ?: appVersionName
 
         ndk {
@@ -130,5 +130,6 @@ dependencies {
     implementation("dev.rikka.shizuku:provider:13.1.5")
 
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
 }

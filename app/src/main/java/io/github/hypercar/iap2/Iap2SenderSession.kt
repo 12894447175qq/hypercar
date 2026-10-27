@@ -406,8 +406,9 @@ class Iap2SenderSession(
                     // 热点凭据（0x5703 或 0x4301）。所以这里只记日志、返回空端点，
                     // 由 [pumpIncomingForever] 继续守着这条链路等凭据。
                     log(
-                        "iap2 ⚠ 车机既未声明 0x5702/0x5703，也未声明 0x4301" +
-                            "（iAP2 清单里没有无线 CarPlay 组件）——保持链路等待车机开放 CarPlay 窗口",
+                        "iap2 ⚠ 热点凭据/端点等待超时：0x5702 可收=${declaresReceiveWifi ?: "未知"}、" +
+                            "0x5703 可发=${declaresSendWifi ?: "未知"}、0x4301 可发=${declaresStartSession ?: "未知"}" +
+                            "——超时不代表能力缺失，保持链路等待；若 MFi 无签名，先排查认证",
                     )
                     log("iap2 提示：请在车机上进入「移动设备 → 选择本机 → Apple CarPlay」点一次；链路会一直保持")
                 }
@@ -815,9 +816,9 @@ class Iap2SenderSession(
         deadline: Long,
         receiverKey: String,
     ) {
-        val baseline = MFI_ATTEMPTS.map { it.first }
+        val baseline = MfiLengthMemory.baseline(profile.mfiPreferredChallengeBytes)
         val windowOf = MFI_ATTEMPTS.toMap()
-        val memory = MfiLengthMemory.load(context, receiverKey)
+        val memory = MfiLengthMemory.forPreference(context, receiverKey, profile.mfiPreferredChallengeBytes)
         val order = MfiLengthMemory.orderAttempts(baseline, memory)
         if (!memory.isEmpty) {
             log(

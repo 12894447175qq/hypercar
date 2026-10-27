@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.settings
+package io.github.hypercar.settings
 
 import android.content.Context
 import android.content.SharedPreferences
@@ -124,6 +124,12 @@ object SettingsStore {
         get() = p().getString(KEY_LAST_AIRPLAY_ENDPOINT, "") ?: ""
         set(v) = p().edit().putString(KEY_LAST_AIRPLAY_ENDPOINT, v).apply()
 
+
+    fun trustedCarSsid(mac: String?): String? = mac?.let { p().getString("trusted_ssid_${it.uppercase()}", null) }
+
+    fun rememberCarSsid(mac: String?, ssid: String?) {
+        if (!mac.isNullOrBlank() && !ssid.isNullOrBlank()) p().edit().putString("trusted_ssid_${mac.uppercase()}", ssid).apply()
+    }
 
     var carlifeWidth: Int
         get() = p().getInt(KEY_WIDTH, 2560)

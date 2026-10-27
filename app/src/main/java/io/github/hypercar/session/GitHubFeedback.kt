@@ -25,7 +25,7 @@ import java.net.URLEncoder
 object GitHubFeedback {
 
     /** 反馈目标仓库。 */
-    const val REPO = "fw867/hypercar"
+    const val REPO = io.github.hypercar.core.ProjectLinks.REPOSITORY
 
     /** `issues/new` 基础地址。 */
     const val NEW_ISSUE_URL = "https://github.com/$REPO/issues/new"

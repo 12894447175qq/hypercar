@@ -152,3 +152,7 @@ PC 侧联调工具：
 
 
 
+
+## Fork 维护
+
+本分支由 [12894447175qq](https://github.com/12894447175qq/hypercar) 维护，基于 [fw867/hypercar](https://github.com/fw867/hypercar)。保留原项目许可证和作者署名；更新检查、车型配置及反馈均指向本 fork。

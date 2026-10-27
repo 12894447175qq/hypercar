@@ -91,22 +91,18 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 ## 5. CI 与发布（.github/workflows/android-ci.yml）
 
-每次 push 自动出**正式签名**包（CarDeck 同款机制 + Rust 环节）：
+每次 push 先运行 Rust 检查、arm64 交叉编译、Android 单元测试、Lint 和测试 APK 打包。
+测试产物名为 `HyperCar-test-debug-<run>`，只保存在 Actions Artifacts，不作为正式版本发布。
 
-- 构建顺序：判定发布 → JDK 17 → **Rust 交叉编译**（dtolnay/rust-toolchain +
-  nttld/setup-ndk r27c + cargo-ndk → `app/src/main/jniLibs/arm64-v8a/libhypercar_core.so`，
-  target 与 cargo 目录均有缓存）→ 签名配置 → Gradle Release → 签名校验
-  （并核对 APK 内确有 .so）→ 单测 →（可选）发布 Release。
-- 版本号自动累计：`appVersionName`（app/build.gradle.kts，发布时只手改这一行）+
-  run_number → `0.1.0.<N>`、`versionCode = 1*10000 + N`，每次推送 +1 可覆盖安装。
-- **发布条件**：提交标题**末尾**带 `[release]` 或 `[publish]`（或 Actions 页手动
-  Run workflow 勾选 publish）→ 构建并跑完单测后自动发 GitHub Release（tag `v<版本>`）。
-- 必需 Secrets：`KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD`
-  （可选 `EXPECTED_CERT_SHA256` 指纹比对）。**没配 KEYSTORE_BASE64 流水线直接失败**，
-  绝不退回 debug 签名；Gradle 侧第二道闸：传了 `-Phypercar.buildNumber` 却没有
-  keystore.properties 也直接构建失败。
-- 签名是不可逆决定：首个公开版本就必须用正式 keystore（debug 证书发出后换证书
-  需要所有用户卸载重装）；keystore 与密码只存本地/密码管理器。
+- 配置四项签名 Secrets 后，继续构建并验证正式签名 APK；缺少签名的 fork 普通推送只完成验证。
+- 正式版本由 `appVersionName` + run_number 组成：`0.1.1.<N>`，`versionCode = 2*10000 + N`。
+  本地不传构建号时为 `0.1.1 / 20000`，高于旧版 `10050`。
+- 发布仍需提交标题末尾的发布标记或手动勾选 publish；普通修复推送不会创建 Release。
+- 必需 Secrets：`KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD`；可选
+  `EXPECTED_CERT_SHA256`。显式发布时缺任一材料即失败，绝不以 debug 签名替代正式版。
+- Gradle 仍拒绝在没有 `keystore.properties` 时接收 `-Phypercar.buildNumber`。
+- 已安装应用只能被同签名的新包覆盖。测试 APK 与原包签名不同就不要卸载原包或清数据；
+  配对身份和设置需要保留，正式升级应使用匹配的签名材料。
 
 ## 6. 排查
 

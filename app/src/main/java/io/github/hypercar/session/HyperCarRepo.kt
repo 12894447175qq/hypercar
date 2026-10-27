@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.session
+package io.github.hypercar.session
 
 import android.bluetooth.BluetoothDevice
 import android.content.Context
@@ -22,6 +22,10 @@ import io.github.hypercar.net.AirplayServiceProbe
 import io.github.hypercar.net.CarPlayCtrlAdvertiser
 import io.github.hypercar.net.SpecifierPermissions
 import io.github.hypercar.net.WifiJoiner
+import io.github.hypercar.net.CarHotspotPolicy
+import io.github.hypercar.net.CarWifiBootstrap
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import io.github.hypercar.settings.SettingsStore
 import io.github.hypercar.shizuku.ShizukuTools
 import java.net.DatagramSocket
@@ -85,6 +89,7 @@ object HyperCarRepo {
 
     @Volatile
     private var joinedNetwork: Network? = null
+    private val scannedCarSubnets = java.util.Collections.synchronizedSet(HashSet<String>())
 
     /** AirPlay 会话是否已建立（冗余端点去重，cardeck「推流中忽略 0x5703/0x4301」教训）。 */
     @Volatile
@@ -108,21 +113,17 @@ object HyperCarRepo {
      */
     private suspend fun experimentWakeCarLifeFirst() {
         log("EXPERIMENT: 先拉 CarLife 到前台——等它做完蓝牙初始化，再起 iAP2")
-        val r = runCatching {
-            ShizukuTools.exec(
-                "am start -n com.baidu.carlife.xiaomi/com.baidu.carlife.CarlifeActivity",
-                8_000,
-            )
-        }.getOrNull()
-        log(
-            "EXPERIMENT: am start exit=${r?.code} " +
-                r?.out?.lineSequence()?.firstOrNull().orEmpty().take(100),
-        )
+        val owner = carLifeSession ?: return
+        wakeLocalCarLife()
+        wakeJob?.join()
+        if (!owner.isOpen) return
         val adapter = runCatching { android.bluetooth.BluetoothAdapter.getDefaultAdapter() }.getOrNull()
         for (i in 1..3) {
             kotlinx.coroutines.delay(1_500)
             val on = runCatching { adapter?.isEnabled }.getOrNull()
-            val bonded = runCatching { adapter?.bondedDevices?.size }.getOrNull()
+            val bonded = if (appContext()?.checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                try { adapter?.bondedDevices?.size } catch (_: SecurityException) { null }
+            } else null
             log("EXPERIMENT: 第 ${i * 1500}ms —— BT enabled=$on 已配对=$bonded")
         }
         log("EXPERIMENT: 开始启动 iAP2（若紧接着出现 BT: 启动… 说明共存尝试开始）")
@@ -229,6 +230,7 @@ object HyperCarRepo {
      */
     @Volatile
     private var aclCarMac: String? = null
+    @Volatile private var aclCarName: String? = null
 
     /** 本轮是否探测到本机 CarLife 在监听 7240（true = 引擎走主动拨号 md_host）。 */
     @Volatile
@@ -247,6 +249,9 @@ object HyperCarRepo {
      * 空壳，下一轮连接必卡（2026-10-26 12:47 日志：57.6s 清理、00.4s 又拉起服务）。
      */
     private var wakeJob: kotlinx.coroutines.Job? = null
+
+    @Volatile private var carLifeSession: CarLifeWakeSession? = null
+    private var carLifeCleanupJob: Job? = null
 
     /** 上一次 `am start` 拉起 CarLife 的时间（uptimeMillis），用于避免 300ms 内重复拉起。 */
     @Volatile
@@ -267,6 +272,7 @@ object HyperCarRepo {
     /** 已推给车机的视频帧数（`onStats` 每秒刷新），自动取证用。 */
     @Volatile
     private var lastVideoFrames: Long = 0L
+    private val sourceVideoConfirmed = AtomicBoolean(false)
 
     // ---- 掉线自动重连（方案 A-3）----
     // 车机侧链路断开（ACL 掉、AirPlay 会话结束、车机重启）后自动重新建链，
@@ -325,7 +331,8 @@ object HyperCarRepo {
                     runCatching { device.address }.getOrNull()?.let { address ->
                         if (address != aclCarMac) {
                             aclCarMac = address
-                            log("AUTO: 本轮 iAP2 目标锁定为 ACL 车机 $address（${runCatching { device.name }.getOrNull() ?: "?"}）")
+                            aclCarName = bluetoothName(device)
+                            log("AUTO: 本轮 iAP2 目标锁定为 ACL 车机 $address（${bluetoothName(device) ?: "?"}）")
                         }
                     }
                     if (!HyperCarService.isRunning) {
@@ -350,7 +357,7 @@ object HyperCarRepo {
                         runCatching { app.startService(HyperCarService.stopIntent(app, device)) }
                     }
                     runCatching { device.address }.getOrNull()?.let { address ->
-                        if (address == aclCarMac) aclCarMac = null
+                        if (address == aclCarMac) { aclCarMac = null; aclCarName = null }
                     }
                     disconnect()
                 }
@@ -368,7 +375,7 @@ object HyperCarRepo {
      * 车机若在极短时间内反复重建 ACL，也不会把日志刷满（见 [log] 的限流兜底）。
      */
     private fun logAclEvent(device: BluetoothDevice, connected: Boolean) {
-        val name = runCatching { device.name }.getOrNull() ?: "未知设备"
+        val name = bluetoothName(device) ?: "未知设备"
         val address = runCatching { device.address }.getOrNull() ?: "?"
         val key = "$address/$connected"
         val now = SystemClock.elapsedRealtime()
@@ -384,6 +391,20 @@ object HyperCarRepo {
     /** handler 只在主线程（receiver/service 都是主线程）调用，无需加锁。 */
     private var lastAclEventKey: String? = null
     private var lastAclEventAt = 0L
+
+    private fun bluetoothName(device: BluetoothDevice): String? {
+        if (appContext()?.checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) != android.content.pm.PackageManager.PERMISSION_GRANTED) return null
+        return try { device.name } catch (_: SecurityException) { null }
+    }
+
+    private fun targetBluetoothName(): String? {
+        val mac = SettingsStore.targetCarMac ?: aclCarMac
+        val fromDevice = runCatching {
+            val adapter = appContext()?.getSystemService(android.bluetooth.BluetoothManager::class.java)?.adapter
+            mac?.let { adapter?.getRemoteDevice(it) }?.let(::bluetoothName)
+        }.getOrNull()
+        return fromDevice ?: SettingsStore.targetCarName ?: aclCarName
+    }
 
     // ---------------------------------------------------------------- 对 UI
 
@@ -408,6 +429,8 @@ object HyperCarRepo {
     }
 
     fun disconnect() {
+        carLifeSession?.close()
+        wakeJob?.cancel()
         // 用户主动断开：不再自动重连
         userDisconnectRequested = true
         reconnectJob?.cancel()
@@ -441,6 +464,17 @@ object HyperCarRepo {
 
     private suspend fun runConnect(context: Context) {
         try {
+            sourceVideoConfirmed.set(false)
+            scannedCarSubnets.clear()
+            carLifeCleanupJob?.join()
+            currentCoroutineContext().ensureActive()
+            carLifeSession = if (SettingsStore.carlifeEnabled || SettingsStore.carlifeFirst) {
+                resolveCarLifeSource()?.let(::CarLifeWakeSession)
+            } else null
+            if ((SettingsStore.carlifeEnabled || SettingsStore.carlifeFirst) && carLifeSession == null) {
+                fail("所选 CarLife 组件未安装：${SettingsStore.carlifePackage}；请安装或重新选择来源")
+                return
+            }
             // Shizuku 从「必须」降级为「可选增强」：没有它照样能连，只是两条路径降级——
             //  WiFi 走 WifiNetworkSpecifier（热点首连弹一次系统确认框）+ deviceID 用稳定伪 MAC。
             if (!ShizukuTools.isReady) {
@@ -591,6 +625,8 @@ object HyperCarRepo {
                     " srcvers=${endpoint.sourceVersion ?: "-"}",
             )
             val network = joinAndBind(context, endpoint)
+            if (network == null) { fail("无法绑定车机 Wi-Fi；请确认已连目标热点"); return }
+            endpoint.ssid?.let { advertiser.ensureForNetwork(it, network = network) }
             // **不再预探测端口**：老代码在这里对 7000/7001/7100/5000/62078 各 connect 一次再 close
             // （只为打日志），但很多接收端（DiPlay/xcertplay 这类单控制器实现、以及部分车机）
             // 会把「连上又立刻断开」当成控制器掉线，随即关掉 AirPlay 服务——于是我们真正去连时
@@ -648,7 +684,7 @@ object HyperCarRepo {
             // 进程杀掉，新实例虽然也 bind 7240，却**不回 Phase 1**（空壳）。
             // 2026-10-26 13:54 现场：22.758 连上 → 22.869 我们 am start → 22.767 通道断开
             // → 23.77 新实例、一直"握手进行中（Phase 1: 等版本匹配）"。
-            if (isLocalPortListening(CARLIFE_CMD_PORT)) {
+            if (probeCarLifeOnce()) {
                 log("WAKE: CarLife 已在监听 7240——跳过拉起（避免触发单实例重启）")
                 _snapshots.value = _snapshots.value.copy(carLife = CarLifeState.Waiting())
             } else {
@@ -765,9 +801,13 @@ object HyperCarRepo {
             // 之后一直 `连 MD … Connection refused` 死循环（2026-10-26 01:11 现场）。
             // **仍然只用零接触探测**（bind 冲突）：绝不能再 Socket().connect(8240)——
             // 那会把 CarLife 的视频 accept 抢走，后面 Rust 拨进去一帧都收不到。
-            val mediaOk = mdHost == null || isLocalPortListening(CARLIFE_VIDEO_PORT)
+            val mediaOk = mdHost == null || ownedCarLifePort(CARLIFE_VIDEO_PORT)
             if (mdHost != null && !mediaOk) {
-                log("CARLIFE: 7240 在监听但 $CARLIFE_VIDEO_PORT 连不上——CarLife 是空壳，改走 HU 监听模式")
+                log("CARLIFE: 命令端口存在，但 $CARLIFE_VIDEO_PORT 未由所选引擎监听；停止取源")
+            }
+            if (((mdHost == null && isLocalPortListening(CARLIFE_CMD_PORT)) || (mdHost != null && !mediaOk)) && carLifeSession != null) {
+                fail("CarLife 7240 端口归属不匹配或无法核实；不连接其他应用，请检查 Shizuku/端口占用")
+                return
             }
             val effectiveMdHost = if (mediaOk) mdHost else null
             carLifeDialMode = effectiveMdHost != null
@@ -904,6 +944,7 @@ object HyperCarRepo {
      * 既打扰车机，也会不断制造「ACL 断开」事件。
      */
     private fun releaseSessionResources() {
+        carLifeSession?.close()
         val wasDialMode = carLifeDialMode
         carLifeDialMode = false
         sessionMdHost = null
@@ -1008,66 +1049,32 @@ object HyperCarRepo {
     private suspend fun joinAndBind(context: Context, endpoint: CarPlayEndpoint): Network? {
         val ssid = endpoint.ssid
         val psk = endpoint.passphrase
-        // 幂等：先拿 0x5703 入过网、端点到了又走一遍（0x4301 晚到）时不要重复 connect-network
-        if (!ssid.isNullOrBlank() && ssid == joinedSsid && joinedNetwork != null) {
-            log("WIFI: 本轮已加入热点 $ssid——复用网络，不重复连接")
+        val cm = context.getSystemService(ConnectivityManager::class.java)
+        if (ssid != null && joinedSsid == ssid && joinedNetwork != null && cm?.getNetworkCapabilities(joinedNetwork!!) != null && boundNetwork == joinedNetwork && wifiJoiner?.currentNetwork == joinedNetwork) {
             return joinedNetwork
         }
-        // 静默网关试探已经把进程绑到该 WiFi 了（无密码、只知道网关）——别再用
-        // 「当前默认网络」把它顶掉（热点无外网时默认网络常常是蜂窝）
-        if (!ssid.isNullOrBlank() && psk.isNullOrBlank() && boundNetwork != null && endpoint.gateway != null) {
-            log("WIFI: 已由静默试探绑定 \"$ssid\" 的网络——复用，不重新选网")
-            joinedSsid = ssid
-            joinedNetwork = boundNetwork
-            return boundNetwork
-        }
-        val joiner = WifiJoiner(context) {
-            // 车机熄火热点消失：结束会话，回到待机
-            log("WIFI: 车机热点消失（熄火/离开）");
+        val joiner = wifiJoiner ?: WifiJoiner(context) {
+            log("WIFI: 车机热点消失")
             scope.launch { runDisconnect("热点消失") }
-        }
-        wifiJoiner = joiner
-
-        val network: Network? = if (!ssid.isNullOrBlank() && !psk.isNullOrBlank()) {
-            log("WIFI: 尝试静默加入热点 $ssid（Wi-Fi 开关=${if (joiner.isWifiEnabled()) "开" else "关"}）")
+        }.also { wifiJoiner = it }
+        val existing = ssid?.let { joiner.existingNetwork(it) }
+        val network = existing ?: if (!ssid.isNullOrBlank() && !psk.isNullOrBlank()) {
+            log("WIFI: 尝试加入热点 $ssid")
             when (val result = joiner.joinCarHotspotSilently(ssid, psk)) {
-                is WifiJoiner.JoinResult.Joined -> {
-                    // 降级模式成功连上 = 系统确认框已批准（或此前批准过），记首连完成
-                    markDegradedFirstConnectIfNeeded()
-                    result.network
-                }
-                WifiJoiner.JoinResult.Unsupported -> {
-                    log("WIFI: 静默入网不支持（${joiner.lastFailureReason ?: "WEP/ROM 限制"}），尝试复用当前网络")
-                    null
-                }
-                WifiJoiner.JoinResult.Failed -> {
-                    log("WIFI: 静默入网失败（${joiner.lastFailureReason ?: "原因未知"}）")
-                    log("WIFI: → 若手机已手动连上该热点，会继续用下面挑出来的网络试连；否则请在手机上手动连接")
-                    null
-                }
+                is WifiJoiner.JoinResult.Joined -> { markDegradedFirstConnectIfNeeded(); result.network }
+                else -> { log("WIFI: 入网失败：${joiner.lastFailureReason}"); joiner.existingNetwork(ssid) }
             }
-        } else {
-            log("WIFI: 端点无热点凭据（可能已在车机网络），直接绑定当前网络")
-            null
+        } else if (ssid == null) wifiNetworks(context).singleOrNull() else null
+        currentCoroutineContext().ensureActive()
+        if (network == null || !joiner.bindProcess(network)) {
+            log("WIFI: 无匹配的车机 Wi-Fi 或 bindProcessToNetwork=false；不使用蜂窝兜底")
+            return null
         }
-        val effective = network ?: currentDefaultNetwork(context)
-        if (effective != null) {
-            joiner.bindProcess(effective)
-            boundNetwork = effective
-            if (!ssid.isNullOrBlank() && network != null) {
-                joinedSsid = ssid
-                joinedNetwork = effective
-            }
-            // 绑定后把「实际拿到的网络长什么样」打全：IP/网关/DNS/接口名。
-            // 真车排查最常缺的就是这几个值（例如 DIRECT- 链路没有网关、拿到 169.254 自分配）
-            log(
-                "WIFI +${stageMs()}ms ✓ 已绑定网络（进程级）：${describeNetwork(context, effective)}" +
-                    if (network == null) "——注意：这是兜底网络，不一定是车机热点" else "",
-            )
-        } else {
-            log("WIFI +${stageMs()}ms 没有可绑定的网络（Wi-Fi 未连接/未授权）")
-        }
-        return effective
+        boundNetwork = network
+        joinedSsid = ssid
+        joinedNetwork = network
+        log("WIFI +${stageMs()}ms ✓ bindProcessToNetwork=true：${describeNetwork(context, network)}")
+        return network
     }
 
     /** 把某个 [Network] 的链路属性压成一行（IP/前缀/网关/DNS/接口），供日志排查。 */
@@ -1087,10 +1094,6 @@ object HyperCarRepo {
     }.getOrElse { "网络属性读取失败（${it.message}）" }
 
     /** 兜底：拿当前默认网络（连上车机热点但静默路径失败时，Android 可能仍选蜂窝）。 */
-    private fun currentDefaultNetwork(context: Context): Network? = runCatching {
-        context.getSystemService(ConnectivityManager::class.java)?.activeNetwork
-    }.getOrNull()
-
     /**
      * 「网关兜底」：iAP2 没给出可连的 AirPlay 地址时，拿当前 Wi-Fi 的默认网关 + 7000 端口当端点。
      *
@@ -1104,6 +1107,7 @@ object HyperCarRepo {
         context: Context,
         seen: CarPlayEndpoint?,
     ): CarPlayEndpoint? {
+        if (boundNetwork == null || joinedSsid.isNullOrBlank()) return null
         val gateway = wifiGateway(context) ?: return null
         log(
             "SESSION: 车机未给可用 AirPlay 地址" +
@@ -1111,7 +1115,7 @@ object HyperCarRepo {
                 "——尝试网关兜底 $gateway:7000",
         )
         return CarPlayEndpoint(
-            ssid = seen?.ssid,
+            ssid = seen?.ssid ?: joinedSsid,
             passphrase = seen?.passphrase,
             airPlayPort = 7000,
             deviceIdentifier = seen?.deviceIdentifier,
@@ -1126,7 +1130,7 @@ object HyperCarRepo {
     private fun wifiGateway(context: Context): String? {
         val cm = context.getSystemService(ConnectivityManager::class.java) ?: return null
         return runCatching {
-            cm.allNetworks
+            listOfNotNull(boundNetwork)
                 .asSequence()
                 .filter { cm.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true }
                 .mapNotNull { network -> cm.getLinkProperties(network)?.routes?.firstOrNull { it.isDefaultRoute }?.gateway }
@@ -1339,8 +1343,7 @@ object HyperCarRepo {
         ssid: String,
     ): CarPlayEndpoint? {
         val cm = context.getSystemService(ConnectivityManager::class.java) ?: return null
-        val previous = boundNetwork
-        for (network in wifiNetworks(context)) {
+        for (network in listOfNotNull(boundNetwork)) {
             val gateway =
                 cm.getLinkProperties(network)
                     ?.routes
@@ -1351,8 +1354,8 @@ object HyperCarRepo {
             if (!gateway.contains('.') || gateway.contains(':')) continue
             val reachable =
                 runCatching {
-                    cm.bindProcessToNetwork(network)
                     java.net.Socket().use { socket ->
+                        network.bindSocket(socket)
                         socket.connect(
                             java.net.InetSocketAddress(gateway, GATEWAY_FALLBACK_PORT),
                             GATEWAY_PROBE_TIMEOUT_MILLIS.toInt(),
@@ -1376,7 +1379,6 @@ object HyperCarRepo {
             log("WIFI: \"$ssid\" 的网关 $gateway:$GATEWAY_FALLBACK_PORT 无响应——继续等车机 0x4301")
         }
         // 全部失败：把进程网络恢复原状（别一直绑在一块无外网的 WiFi 上）
-        runCatching { cm.bindProcessToNetwork(previous) }
         return null
     }
 
@@ -1386,7 +1388,7 @@ object HyperCarRepo {
      * 为什么不能「绑定默认网络后连一次」：手机手动连上热点后，系统默认网络仍可能是
      * 移动数据（热点无外网，HyperOS 会主动切走），这时连 192.168.137.1 必然超时
      * （2026-10-23 20:06、20:08 两次现场都是 5s 超时）。这里把
-     * 「已绑定的网络 → 手机上所有 Wi-Fi 网络 → 进程默认网络」都试一遍，哪条通走哪条。
+     * 先匹配并绑定目标 Wi-Fi，再将控制 socket 绑定同一 Network，避免切回蜂窝或第二个 Wi-Fi。
      */
     private suspend fun openControlFd(
         context: Context,
@@ -1394,40 +1396,25 @@ object HyperCarRepo {
         port: Int,
         timeoutMillis: Int = CONTROL_CONNECT_TIMEOUT_MILLIS.toInt(),
     ): Int? = withContext(Dispatchers.IO) {
-        val cm = context.getSystemService(ConnectivityManager::class.java)
-        val candidates = buildList<Network?> {
-            boundNetwork?.let { add(it) }
-            addAll(wifiNetworks(context))
-            add(null)
-        }.distinct()
-        for (network in candidates) {
-            val label = if (network == null) "进程默认网络" else "Wi-Fi 网络 #$network"
-            if (network != null) runCatching { cm?.bindProcessToNetwork(network) }
-            val startedAt = System.currentTimeMillis()
-            var lastError: String? = null
-            val fd = runCatching {
-                val socket = Socket()
-                socket.tcpNoDelay = true
-                socket.connect(resolveEndpoint(host, port), timeoutMillis)
-                keepAliveForRust(socket)
-                ParcelFileDescriptor.fromSocket(socket).detachFd()
-            }.onFailure { lastError = it.javaClass.simpleName + ": " + it.message }.getOrNull()
-            val cost = System.currentTimeMillis() - startedAt
-            if (fd != null && fd >= 0) {
-                if (network != null) {
-                    boundNetwork = network
-                    // 同步给 joiner：它的 onLost 只认自己记录的网络，不同步就解不掉绑定
-                    wifiJoiner?.bindProcess(network)
-                }
-                log("NET +${stageMs()}ms ✓ $host:$port 已连通（$label，耗时 ${cost}ms，fd=$fd）")
-                return@withContext fd
-            }
-            log("NET +${stageMs()}ms ✗ 经 $label 连 $host:$port 失败（${cost}ms，${lastError ?: "未知原因"}）")
+        val network = boundNetwork ?: return@withContext null
+        currentCoroutineContext().ensureActive()
+        val socket = Socket()
+        val startedAt = System.currentTimeMillis()
+        try {
+            network.bindSocket(socket)
+            socket.tcpNoDelay = true
+            socket.connect(resolveEndpoint(host, port), timeoutMillis)
+            currentCoroutineContext().ensureActive()
+            val fd = ParcelFileDescriptor.fromSocket(socket).detachFd()
+            keepAliveForRust(socket)
+            log("NET +${stageMs()}ms ✓ $host:$port 已连通（Wi-Fi #$network，耗时 ${System.currentTimeMillis() - startedAt}ms）")
+            fd
+        } catch (error: Exception) {
+            runCatching { socket.close() }
+            if (error is CancellationException) throw error
+            log("NET +${stageMs()}ms ✗ $host:$port：${error.message}")
+            null
         }
-        // 全败：恢复默认绑定，别让进程一直卡在一块无外网的网络上
-        runCatching { cm?.bindProcessToNetwork(null) }
-        boundNetwork = null
-        null
     }
 
     /** 手机当前挂着的 Wi-Fi 网络（很可能就是用户手动连上的车机热点）。 */
@@ -1545,6 +1532,9 @@ object HyperCarRepo {
             when (state) {
                 "negotiating" -> push(link = LinkState.Negotiating(detail))
                 "connected" -> {
+                    if (!sessionLive.get()) return
+                    // Rust emits connected only after AirPlay RECORD, not merely an open TCP port.
+                    SettingsStore.rememberCarSsid(SettingsStore.targetCarMac ?: aclCarMac, joinedSsid)
                     streaming = true
                     sessionHadLink = true
                     reconnectAttempts = 0
@@ -1572,11 +1562,13 @@ object HyperCarRepo {
                 "carlife_active" -> {
                     push(carLife = CarLifeState.Active())
                     carLifeActiveAt = SystemClock.uptimeMillis()
+                    log("CARLIFE: ${carLifeSession?.source?.enginePackage} 协议握手完成；仍需真实视频帧确认取源成功")
                     // CarWith 用 ICarLifeManager.register + IDisplayController.startDisplay 让
                     // CarLife 真正开始投屏（见 startCarLifeDisplay）；我们也调一次试试。
-                    scope.launch {
-                        kotlinx.coroutines.delay(600)
-                        startCarLifeDisplay()
+                    val owner = carLifeSession
+                    if (owner?.source?.enginePackage == CarLifeSource.XIAOMI) scope.launch {
+                        delay(600)
+                        if (carLifeSession === owner && owner.isOpen) startCarLifeDisplay()
                     }
                     // CarLife 有 ~35 秒的空闲看门狗：Activity 一旦不在前台，它自己的
                     // `ProcessUtil.killAllProcess` 就把整进程干掉（2026-10-26 00:45/00:48 两次
@@ -1588,11 +1580,12 @@ object HyperCarRepo {
                     val sinceLaunch = SystemClock.uptimeMillis() - carLifeLaunchedAt
                     if (sinceLaunch < 25_000L) {
                         log("CARLIFE: ${sinceLaunch}ms 前刚拉起过——跳过重复 am start（防止单实例重启）")
-                    } else {
-                        scope.launch {
+                    } else if (owner?.source?.enginePackage == CarLifeSource.XIAOMI) {
+                        wakeJob = scope.launch {
+                            if (carLifeSession !== owner || !owner.isOpen) return@launch
                             val r = runCatching {
                                 ShizukuTools.exec(
-                                    "am start -n com.baidu.carlife.xiaomi/com.baidu.carlife.CarlifeActivity",
+                                    "am start -n ${owner.source.activity}",
                                     8_000,
                                 )
                             }.getOrNull()
@@ -1614,6 +1607,9 @@ object HyperCarRepo {
         override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {
             // 用 update（CAS）而不是读-改-写：每秒一次，与 log() 的读-改-写并发会吞掉日志行。
             lastVideoFrames = frames
+            if (frames > 0 && carLifeSession?.isOpen == true && sourceVideoConfirmed.compareAndSet(false, true)) {
+                log("CARLIFE: ✓ 真实视频已进入 AirPlay（frames=$frames，不含待机画面；所选来源=${carLifeSession?.source?.enginePackage}，须结合端口 UID 核对）")
+            }
             _snapshots.update { s ->
                 s.copy(
                     video = s.video.copy(fps = fps, frames = frames, kbps = kbps),
@@ -1623,43 +1619,28 @@ object HyperCarRepo {
         }
     }
 
-    /**
-     * CarLife 系 app 的候选包名（按唤醒优先级）。
-     *
-     * `com.baidu.carlife.xiaomi` 是 HyperOS 预装的**小米定制版 CarLife**——现场
-     * 2026-10-23 实测：手机上只有它和 CarWith，设置里默认的 `com.baidu.carlife`
-     * 根本没装，于是广播静默丢弃、7240 永远等不到接入。
-     */
-    private val carLifePackageCandidates = listOf(
-        "com.baidu.carlife",
-        "com.baidu.carlife.xiaomi",
-        "com.miui.carlink",
-        "com.xiaomi.carlink",
-        "com.hihonor.carlink",
-    )
+    /** Resolve only the configured source (or auto candidates when the field is empty). */
+    private fun resolveCarLifeSource(): CarLifeSource? {
+        val ctx = appContext() ?: return null
+        return CarLifeSource.resolve(SettingsStore.carlifePackage) { pkg ->
+            runCatching { ctx.packageManager.getApplicationInfo(pkg, 0).enabled }.getOrDefault(false)
+        }.also { source ->
+            log(if (source == null) "WAKE: 所选组件未安装/不可用，不切换其他来源" else
+                "WAKE: 本轮来源 ${source.wakePackage} → 引擎 ${source.enginePackage}")
+        }
+    }
 
-    /** 实际可用的唤醒包名：设置里配的优先；没装就自动换一个装了的，并把换的结果写进日志。 */
-    private fun resolveCarLifePackage(): String {
-        val configured = SettingsStore.carlifePackage
-        val ctx = appContext() ?: return configured
-        fun installed(p: String) = runCatching { ctx.packageManager.getPackageInfo(p, 0) }.isSuccess
-        // 小米这套的角色分工（2026-10-26 00:36 实测）：
-        //   com.miui.carlink（CarWith）  = 有界面、能拉起，负责"CarLife 连接"入口；
-        //   com.baidu.carlife.xiaomi     = 真正的 CarLife 引擎，**没有 Launcher 界面**，
-        //                                  `monkey -p` 拉它什么都不会发生。
-        // 所以即使设置里填的是引擎包，只要同时装了 CarWith，就优先用 CarWith。
-        if (installed("com.miui.carlink") && configured != "com.miui.carlink") {
-            log("WAKE: 配置的是 $configured（引擎包，无界面），改用它上层的 CarWith（com.miui.carlink）来拉起")
-            return "com.miui.carlink"
-        }
-        if (installed(configured)) return configured
-        val fallback = carLifePackageCandidates.firstOrNull { it != configured && installed(it) }
-        if (fallback != null) {
-            log("WAKE: ⚠ 唤醒包名 $configured 未安装，自动改用 $fallback（建议到设置里改过来）")
-            return fallback
-        }
-        log("WAKE: ⚠ 设备上没有 CarLife 系 app（候选：${carLifePackageCandidates.joinToString(", ")}）")
-        return configured
+    private fun selectedEnginePackage(): String? = carLifeSession?.source?.enginePackage
+        ?: resolveCarLifeSource()?.enginePackage
+
+    private suspend fun ownedCarLifePort(port: Int): Boolean {
+        if (!isLocalPortListening(port)) return false
+        val owner = carLifeSession ?: return false
+        if (!owner.isOpen || !ShizukuTools.isReady) return false
+        val uid = runCatching { appContext()?.packageManager?.getApplicationInfo(owner.source.enginePackage, 0)?.uid }
+            .getOrNull() ?: return false
+        val table = runCatching { ShizukuTools.exec("cat /proc/net/tcp /proc/net/tcp6", 4_000).out }.getOrNull() ?: return false
+        return CarLifePorts.owned(CarLifePorts.parse(table), port, uid).also { if (it) owner.markUsed() }
     }
 
     /**
@@ -1699,154 +1680,58 @@ object HyperCarRepo {
         }
 
     /** 单次零接触探测 127.0.0.1:7240 是否在监听（唤醒流程里用，不要阻塞）。 */
-    private fun probeCarLifeOnce(): Boolean = isLocalPortListening(CARLIFE_CMD_PORT)
+    private suspend fun probeCarLifeOnce(): Boolean = ownedCarLifePort(CARLIFE_CMD_PORT)
 
-    private fun probeLocalCarLifeMd(
+    private suspend fun probeLocalCarLifeMd(
         timeoutMillis: Long = CARLIFE_PROBE_TIMEOUT_MILLIS,
-        onAttempt: ((Int) -> Unit)? = null,
+        onAttempt: (suspend (Int) -> Unit)? = null,
     ): String? {
         val deadline = SystemClock.uptimeMillis() + timeoutMillis
         var attempts = 0
-        while (SystemClock.uptimeMillis() < deadline) {
+        while (SystemClock.uptimeMillis() < deadline && sessionLive.get() && carLifeSession?.isOpen == true) {
             attempts++
             onAttempt?.invoke(attempts)
-            if (isLocalPortListening(CARLIFE_CMD_PORT)) {
+            if (probeCarLifeOnce()) {
                 log("CARLIFE: 第 $attempts 次零接触探测命中 127.0.0.1:$CARLIFE_CMD_PORT（CarLife 在监听）")
                 return "127.0.0.1"
             }
-            try {
-                Thread.sleep(200)
-            } catch (_: InterruptedException) {
-                return null
-            }
+            currentCoroutineContext().ensureActive()
+            delay(200)
         }
         return null
     }
 
-    /**
-     * 唤醒本机 CarLife / CarWith·CarLife / 荣耀车联，令其连 127.0.0.1 回环网关。
-     *
-     * 三级递进（现场 2026-10-23 22:00：应用内广播发出去后，7240 一个连接都没有）：
-     *  ① 应用内广播 `com.baidu.carlife.Action.StartWireless`——最轻，但 Android 14+
-     *     对「非导出接收器」会静默丢弃，且包名不对时也毫无反馈；
-     *  ② Shizuku 已就绪时用 shell 再广播一次（`am broadcast` 以 shell 身份投递，
-     *     不受导出限制）；
-     *  ③ 仍未接入就把 app 直接拉起来（`monkey -c LAUNCHER`），让它自己走无线连接。
-     * 顺带把设备上「CarLife/CarLink 系」的包名列进日志——包名配错时一眼可见。
-     */
+    /** One activity per selected engine, followed by a cancellable service fallback. */
     private fun wakeLocalCarLife() {
-        // 用户默认关掉 CarLife 联动：CarLife 一激活就会抢蓝牙，把 CarPlay 的 ACL 顶断。
-        // （实验开关 carlifeFirst 打开时允许拉起：那正是我们要验证的场景。）
-        if (!SettingsStore.carlifeEnabled && !SettingsStore.carlifeFirst) {
-            log("CARLIFE: 联动已关闭（设置里关着）——不拉起 CarLife，避免它抢蓝牙顶掉 CarPlay")
-            return
-        }
-        val pkg = resolveCarLifePackage()
+        if (!SettingsStore.carlifeEnabled && !SettingsStore.carlifeFirst) return
+        val owner = carLifeSession ?: return
+        if (!owner.isOpen || !sessionLive.get() || wakeJob?.isActive == true) return
         _snapshots.value = _snapshots.value.copy(carLife = CarLifeState.Waiting())
-
-        // 小米这套有两个进程会互相打架：CarWith（com.miui.carlink）收到唤醒广播后会自己
-        // 启动一份 CarLife，而 CarLife 有"单实例"逻辑（ProcessUtil.killAllProcess）。
-        // 2026-10-26 00:45 现场：我们用 `am start` 拉起的那份已经握手到 Phase 7，
-        // 35 秒后 CarWith 又起了一份，直接把**我们正连着的那份杀掉**
-        // （ActivityManager: Process com.baidu.carlife.xiaomi … has died: fg）——
-        // 于是"握手成功但一会儿就断、视频一帧都收不到"。
-        //
-        // 结论：**只走一条路**。能直接拉起引擎页（实测有效）就不要再发唤醒广播，
-        // 否则等于自己制造双实例。
-        val directLaunch = "com.baidu.carlife.xiaomi/com.baidu.carlife.CarlifeActivity"
-        if (ShizukuTools.isReady && pkg == "com.miui.carlink") {
-            wakeJob?.cancel()
-            wakeJob = scope.launch {
-                // 只拉主屏：副屏（--display N）方案随「CarLife 启动屏」设置一起删了。
-                val started = runCatching {
-                    ShizukuTools.exec("am start -n $directLaunch", 8_000)
-                }.getOrNull()
-                log(
-                    "WAKE: 拉起 CarLife 引擎页 exit=${started?.code} " +
-                        started?.out?.lineSequence()?.firstOrNull().orEmpty().take(120),
-                )
-                carLifeLaunchedAt = SystemClock.uptimeMillis()
-                kotlinx.coroutines.delay(3_000)
-                // 会话可能在这 3s 里就失败了（AirPlay 端口连不上 → releaseSessionResources
-                // 会 force-stop CarLife）。此时继续拉起只会留下"7240 在听但不回 Phase 1"的空壳。
-                if (!sessionLive.get()) {
-                    log("WAKE: 会话已结束——放弃继续拉起 CarLife（避免留下空壳进程）")
-                    return@launch
+        wakeJob = scope.launch {
+            if (!ShizukuTools.isReady) {
+                val ctx = appContext() ?: return@launch
+                val component = owner.source.activity
+                if (owner.isOpen && sessionLive.get()) runCatching {
+                    owner.markUsed()
+                    if (component != null) {
+                        ctx.startActivity(android.content.Intent().setComponent(
+                            android.content.ComponentName.unflattenFromString(component))
+                            .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+                    } else {
+                        ctx.sendBroadcast(android.content.Intent("com.baidu.carlife.Action.StartWireless")
+                            .setPackage(owner.source.wakePackage))
+                    }
+                }.onFailure { log("WAKE: 启动失败：${it.message}；可授权 Shizuku 后重试") }
+                return@launch
+            }
+            owner.wake(exec = { command ->
+                currentCoroutineContext().ensureActive()
+                if (owner.isOpen && carLifeSession === owner && sessionLive.get()) {
+                    val result = ShizukuTools.exec(command, 8_000)
+                    carLifeLaunchedAt = SystemClock.uptimeMillis()
+                    log("WAKE: ${owner.source.enginePackage} exit=${result.code} ${result.out.lineSequence().firstOrNull().orEmpty().take(160)}")
                 }
-                if (!probeCarLifeOnce() && sessionLive.get()) {
-                    val svc = runCatching {
-                        ShizukuTools.exec(
-                            "am start-foreground-service -n com.baidu.carlife.xiaomi/" +
-                                "com.baidu.carlife.service.CarlifeConnectService",
-                            8_000,
-                        )
-                    }.getOrNull()
-                    log("WAKE: 引擎页没让 7240 起来——退回无界面服务 exit=${svc?.code}")
-                }
-            }
-            return
-        }
-
-        runCatching {
-            val intent = android.content.Intent("com.baidu.carlife.Action.StartWireless").apply {
-                setPackage(pkg)
-                addFlags(android.content.Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
-            }
-            runCatching { appContext()?.sendBroadcast(intent) }
-                .onFailure { log("WAKE: 广播发送失败 - ${it.message}") }
-            log("WAKE: ① 应用内广播 StartWireless → $pkg")
-        }
-        if (!ShizukuTools.isReady) {
-            log("WAKE: 无 Shizuku，跳过 shell 兜底（②③）——若一直 Waiting，检查设置里的唤醒包名")
-            return
-        }
-        scope.launch {
-            // 包名到底存不存在、还有哪些 CarLife 系 app
-            val listed = runCatching {
-                ShizukuTools.exec(
-                    "pm list packages | grep -iE 'carlife|carlink|carwith|carlife'",
-                    6_000,
-                )
-            }.getOrNull()
-            val packages = listed?.out
-                ?.lineSequence()
-                ?.map { it.removePrefix("package:").trim() }
-                ?.filter { it.isNotEmpty() }
-                ?.distinct()
-                ?.toList()
-                .orEmpty()
-            log("WAKE: 设备上 CarLife 系包 = ${if (packages.isEmpty()) "（没找到）" else packages.joinToString(", ")}")
-            if (packages.isNotEmpty() && pkg !in packages) {
-                log("WAKE: ⚠ 设置里的 $pkg 不在上面列表里——很可能是包名不对（改成实际那个）")
-            }
-
-            // ② shell 广播：以 shell 身份投递，绕开 Android 14+ 非导出接收器限制
-            val bcast = runCatching {
-                ShizukuTools.exec(
-                    "am broadcast -a com.baidu.carlife.Action.StartWireless -p $pkg --user 0",
-                    6_000,
-                )
-            }.getOrNull()
-            log("WAKE: ② shell 广播 exit=${bcast?.code} ${bcast?.out?.replace("\n", " ")?.take(160).orEmpty()}")
-
-            // ③ 直接拉起 CarLife：**实测有效的组件是引擎包的 CarlifeActivity**
-            //    （2026-10-26 00:41 adb 实测：`am start -n com.baidu.carlife.xiaomi/
-            //     com.baidu.carlife.CarlifeActivity` 之后 6 秒内 7240/8240/9240/9241/9242/9340
-            //     全部开始 LISTEN）。
-            //    对比：CarWith 的 `CarlifeDialogActivity` **未导出**（SecurityException），
-            //    `monkey -p com.miui.carlink` 只会停在首页、不启动 CarLife 引擎。
-            val deepLink = "com.baidu.carlife.xiaomi/com.baidu.carlife.CarlifeActivity"
-            val launched = runCatching {
-                ShizukuTools.exec("am start -n $deepLink", 8_000)
-            }.getOrNull()
-            log("WAKE: ③ 拉起 CarLife 引擎页 $deepLink exit=${launched?.code} " +
-                launched?.out?.lineSequence()?.firstOrNull().orEmpty().take(120))
-            if (launched == null || launched.code != 0) {
-                val launch = runCatching {
-                    ShizukuTools.exec("monkey -p $pkg -c android.intent.category.LAUNCHER 1", 8_000)
-                }.getOrNull()
-                log("WAKE: ③ 退回拉起 $pkg exit=${launch?.code} ${launch?.out?.lineSequence()?.firstOrNull().orEmpty().take(160)}")
-            }
+            }, listening = ::probeCarLifeOnce)
         }
     }
 
@@ -1855,37 +1740,22 @@ object HyperCarRepo {
 
     private fun appContext(): android.content.Context? = appCtx
 
-    /**
-     * 下车/断开会话时清理本机 CarLife。
-     *
-     * 为什么必须清：小米 CarLife 断开后经常只关掉 8240 视频端口、却留着 `CarlifeConnectService`
-     * 继续占住 7240，内部状态机也不重置——下次上车连入 7240 它永远不回 Phase 1
-     * （2026-10-26 的"空壳"现场）。所以断链后：
-     *  ① 先发无线断开广播（无 Shizuku 的降级模式也能让 CarLife 自己收尾）；
-     *  ② 有 Shizuku 时再 `am force-stop` 掉 **CarLife 引擎包**（`com.baidu.carlife.xiaomi` /
-     *     `com.baidu.carlife`），**绝不杀 `com.miui.carlink`（CarWith 外壳）**——
-     *     它管着系统级蓝牙/连接状态，杀了反而要在车机上重新配对。
-     * @param wasDialMode 本轮是否走主动拨号（是则给 Rust 的 FIN 留 250ms 再强杀）。
-     */
+    /** Stop only the engine used by this connection; the next connection waits for cleanup. */
     private fun stopLocalCarLife(wasDialMode: Boolean) {
-        val ctx = appContext() ?: return
-        val configured = SettingsStore.carlifePackage
-        for (action in listOf(
-            "com.baidu.carlife.Action.StopWireless",
-            "com.baidu.carlife.Action.Disconnect",
-        )) {
-            runCatching {
-                ctx.sendBroadcast(android.content.Intent(action).setPackage(configured))
-            }
+        val owner = carLifeSession ?: return
+        owner.close()
+        carLifeSession = null
+        if (!owner.wasUsed) return
+        val pkg = owner.source.enginePackage
+        val ctx = appContext()
+        for (action in listOf("com.baidu.carlife.Action.StopWireless", "com.baidu.carlife.Action.Disconnect")) {
+            runCatching { ctx?.sendBroadcast(android.content.Intent(action).setPackage(pkg)) }
         }
         if (!ShizukuTools.isReady) return
-        scope.launch {
-            if (wasDialMode) kotlinx.coroutines.delay(250) // 让 Rust 的 PAUSE+FIN 先送到
-            for (pkg in listOf("com.baidu.carlife.xiaomi", "com.baidu.carlife")) {
-                if (pkg == "com.miui.carlink") continue
-                runCatching { ShizukuTools.exec("am force-stop $pkg", 4_000) }
-            }
-            log("CARLIFE: 已清理后台 CarLife 引擎进程（释放 7240~9340），下次上车重新拉起")
+        carLifeCleanupJob = scope.launch {
+            if (wasDialMode) delay(250)
+            runCatching { ShizukuTools.exec("am force-stop $pkg", 4_000) }
+            log("CARLIFE: 仅清理本轮引擎 $pkg")
         }
     }
 
@@ -1898,15 +1768,16 @@ object HyperCarRepo {
      * 处置：force-stop 后重新拉起一次（每轮会话最多一次，避免反复杀）。
      */
     private fun watchCarLifeHandshake() {
+        val owner = carLifeSession ?: return
         val startedAt = SystemClock.uptimeMillis()
         carLifeActiveAt = 0L
         scope.launch {
-            while (sessionLive.get()) {
+            while (sessionLive.get() && carLifeSession === owner && owner.isOpen) {
                 kotlinx.coroutines.delay(1_000)
                 if (carLifeActiveAt >= startedAt) return@launch
                 if (SystemClock.uptimeMillis() - startedAt >= 12_000L) break
             }
-            if (!sessionLive.get() || carLifeActiveAt >= startedAt) return@launch
+            if (!sessionLive.get() || carLifeSession !== owner || !owner.isOpen || carLifeActiveAt >= startedAt) return@launch
             log("CARLIFE: 12s 内没走完握手（Phase 1 无回应）——判定空壳，force-stop 后重拉一次")
             restartLocalCarLife()
         }
@@ -1921,10 +1792,11 @@ object HyperCarRepo {
      * 取证动作本身把现场破坏了。这里在"用户还没动手机"的时间点自动采一次。
      */
     private fun armVideoDiag() {
+        val owner = carLifeSession ?: return
         lastVideoFrames = 0L
         scope.launch {
             kotlinx.coroutines.delay(12_000)
-            if (!sessionLive.get() || !streaming) return@launch
+            if (!sessionLive.get() || !streaming || carLifeSession !== owner || !owner.isOpen) return@launch
             if (lastVideoFrames > 0) {
                 log("DIAG: 12s 内已出帧（frames=$lastVideoFrames）——不需要取证")
                 return@launch
@@ -1936,7 +1808,7 @@ object HyperCarRepo {
             log(
                 "DIAG: 提示——CarLife 视频依赖录屏授权（MediaProjection）。若手机上刚弹过" +
                     "「开始录制/投放」请点允许；没有弹窗时可在 Shizuku 里执行 " +
-                    "`appops set com.baidu.carlife.xiaomi PROJECT_MEDIA allow`",
+                    "`appops set ${selectedEnginePackage()} PROJECT_MEDIA allow`",
             )
             dumpCarLifeDiag()
         }
@@ -1944,13 +1816,19 @@ object HyperCarRepo {
 
     /** 强杀本机 CarLife 后重新拉起（只用于空壳自愈）。 */
     private fun restartLocalCarLife() {
-        if (!SettingsStore.carlifeEnabled) return
-        scope.launch {
-            for (pkg in listOf("com.baidu.carlife.xiaomi", "com.baidu.carlife")) {
-                runCatching { ShizukuTools.exec("am force-stop $pkg", 4_000) }
-            }
-            kotlinx.coroutines.delay(600)
-            wakeLocalCarLife()
+        val owner = carLifeSession ?: return
+        if (!SettingsStore.carlifeEnabled || !owner.isOpen || !sessionLive.get()) return
+        wakeJob?.cancel()
+        wakeJob = scope.launch {
+            currentCoroutineContext().ensureActive()
+            if (carLifeSession !== owner || !owner.isOpen) return@launch
+            ShizukuTools.exec("am force-stop ${owner.source.enginePackage}", 4_000)
+            delay(600)
+            if (carLifeSession !== owner || !owner.isOpen || !sessionLive.get()) return@launch
+            owner.wake(exec = { command ->
+                currentCoroutineContext().ensureActive()
+                if (owner.isOpen && carLifeSession === owner && sessionLive.get()) ShizukuTools.exec(command, 8_000)
+            }, listening = ::probeCarLifeOnce)
         }
     }
 
@@ -1978,6 +1856,35 @@ object HyperCarRepo {
      * 用无界 Channel 收集回调而不是首个回调 resume：0x5703/0x4301 可能连续到达，一条都不能丢；
      * 等待结束（或超时）后 close，晚到的回调 trySend 失败即静默丢弃。
      */
+    private suspend fun discoverOnCarWifi(
+        context: Context, seen: CarPlayEndpoint?, advertiser: CarPlayCtrlAdvertiser,
+    ): CarPlayEndpoint? {
+        currentCoroutineContext().ensureActive()
+        val ssid = currentWifiSsid(context) ?: return null
+        val targetMac = SettingsStore.targetCarMac ?: aclCarMac
+        if (!CarHotspotPolicy.matches(ssid, targetBluetoothName(), seen?.ssid, SettingsStore.trustedCarSsid(targetMac))) return null
+        val base = seen ?: CarPlayEndpoint(ssid, null, 0, null, null, null, emptyList(), null)
+        return CarWifiBootstrap<String, CarPlayEndpoint>(
+            bind = { joinAndBind(context, base.copy(ssid = it)) != null },
+            advertise = { advertiser.ensureForNetwork(it, network = boundNetwork) },
+            discover = {
+                val network = boundNetwork ?: return@CarWifiBootstrap null
+                val mdns = AirplayServiceProbe(context, ::log).browse(network, timeoutMillis = 1_500)
+                currentCoroutineContext().ensureActive()
+                if (mdns != null) {
+                    log("MDNS: 车机热点已绑定并公告控制服务 → ${mdns.host}:${mdns.port}，直接推进（无需 0x4301）")
+                    base.copy(ssid = ssid, ipAddresses = listOf(mdns.host), airPlayPort = mdns.port, gateway = mdns.host)
+                } else {
+                    probeGatewayAsCarHotspot(context, ssid)?.let { mergeEndpoint(base, it) }
+                        ?: if ((ssid == seen?.ssid || ssid == SettingsStore.trustedCarSsid(targetMac)) && scannedCarSubnets.add(ssid)) {
+                            // Preserve the BMW DIRECT-* fallback when DHCP has no gateway and mDNS is absent.
+                            discoverAirplayOnLocalSubnet(context, ssid)?.let { mergeEndpoint(base, it) }
+                        } else null
+                }
+            },
+        ).resolve(ssid)
+    }
+
     private suspend fun awaitUsableEndpoint(
         context: Context,
         coordinator: Iap2Coordinator,
@@ -2003,11 +1910,15 @@ object HyperCarRepo {
             val host = if (hostUsable) hostCandidate else ""
             val port = parts.getOrNull(1)?.trim()?.toIntOrNull() ?: 0
             val currentSsid = currentWifiSsid(context)
-            val ssidMatches = ssidPart.isBlank() || (currentSsid != null && currentSsid == ssidPart)
+            val ssidMatches = ssidPart.isNotBlank() && currentSsid == ssidPart &&
+                CarHotspotPolicy.matches(currentSsid, targetBluetoothName(), lastSeen.get()?.ssid,
+                    SettingsStore.trustedCarSsid(SettingsStore.targetCarMac ?: aclCarMac))
             if (host.isNotEmpty() && port in 1..65535 && ssidMatches) {
+                val rememberedNetwork = joinAndBind(context, CarPlayEndpoint(ssidPart, null, port, null, null, null, listOf(host), host))
+                if (rememberedNetwork != null) advertiser.ensureForNetwork(ssidPart, network = rememberedNetwork)
                 val alive = withContext(Dispatchers.IO) {
-                    runCatching {
-                        Socket().use { s -> s.connect(InetSocketAddress(host, port), REMEMBERED_PROBE_TIMEOUT_MILLIS.toInt()) }
+                    rememberedNetwork != null && runCatching {
+                        Socket().use { s -> rememberedNetwork.bindSocket(s); s.connect(InetSocketAddress(host, port), REMEMBERED_PROBE_TIMEOUT_MILLIS.toInt()) }
                     }.isSuccess
                 }
                 if (alive) {
@@ -2057,16 +1968,10 @@ object HyperCarRepo {
             }
         }
         try {
-            var usable: CarPlayEndpoint? = null
+            var usable: CarPlayEndpoint? = discoverOnCarWifi(context, lastSeen.get(), advertiser)
             var ticks = 0
             var partialKey: String? = null
             var wifiJoined = false
-            // 静默网关试探：只在「等待期间出现新 WiFi」或「当前 WiFi 正是 iAP2 给的车机热点」
-            // 时各试一次（每个 SSID 一次），避免对家里已有的 WiFi（可能有 Apple TV 占着 7000）误连。
-            var observedSsid: String? = null
-            val probedSsid = HashSet<String>()
-            // 网段主动扫描也只在「当前 SSID 就是车机热点」且还没扫过时做一次
-            val localScanned = HashSet<String>()
             while (usable == null) {
                 val next = withTimeoutOrNull(ENDPOINT_TICK_MILLIS) { callbacks.receive() }
                 if (next == null) {
@@ -2091,49 +1996,8 @@ object HyperCarRepo {
                         )
                         continue
                     }
-                    // ① 静默网关试探：手机刚连上（或本来就该连）车机热点时，不用等 0x4301——
-                    //    车机的 AirPlay 控制面通常就在热点网关的 7000 端口。
-                    val ssid = currentWifiSsid(context)
-                    if (!ssid.isNullOrBlank() && ssid !in probedSsid) {
-                        val changed = observedSsid != null && observedSsid != ssid
-                        val isCarHotspot = ssid == lastSeen.get()?.ssid
-                        if (changed || isCarHotspot) {
-                            probedSsid.add(ssid)
-                            log("WIFI: 检测到 Wi-Fi \"$ssid\"——静默试一次「把网关当车机热点」（:7000）")
-                            val probed = probeGatewayAsCarHotspot(context, ssid)
-                            if (probed != null) {
-                                usable = probed
-                                continue
-                            }
-                            // 网关拿不到（宝马 DIRECT 热点 gw=0.0.0.0）时，改在网段里主动找 —— 这是唯一出路
-                            if (ssid == lastSeen.get()?.ssid && localScanned.add(ssid)) {
-                                // 先试 mDNS（车机若广播 _airplay._tcp，这一步就能定端点，比扫网段快）
-                                val mdnsHere = runCatching {
-                                    AirplayServiceProbe(context, ::log).browse(boundNetwork)
-                                }.getOrNull()
-                                if (mdnsHere != null) {
-                                    log("MDNS: ✓ 等待期间直接查到 _airplay._tcp → ${mdnsHere.host}:${mdnsHere.port}")
-                                    usable = CarPlayEndpoint(
-                                        ssid = ssid,
-                                        passphrase = null,
-                                        airPlayPort = mdnsHere.port,
-                                        deviceIdentifier = null,
-                                        publicKeyHex = null,
-                                        sourceVersion = null,
-                                        ipAddresses = listOf(mdnsHere.host),
-                                        gateway = mdnsHere.host,
-                                    )
-                                    continue
-                                }
-                                val found = discoverAirplayOnLocalSubnet(context, ssid)
-                                if (found != null) {
-                                    usable = found
-                                    continue
-                                }
-                            }
-                        }
-                    }
-                    if (ssid != null) observedSsid = ssid
+                    usable = discoverOnCarWifi(context, lastSeen.get(), advertiser)
+                    if (usable != null) continue
                     // ② 每 15s 报一次进度（tick 是 5s，探测要跟得上换网速度）
                     if (ticks % TICKS_PER_PROGRESS == 0) {
                         val seen = lastSeen.get()
@@ -2164,13 +2028,10 @@ object HyperCarRepo {
                 lastSeen.set(merged)
                 // 0x5703 只给 ssid/psk：先入网 + 广播，车机才可能邀请并下发 0x4301
                 if (!wifiJoined && !merged.ssid.isNullOrBlank()) {
-                    wifiJoined = true
-                    log("SESSION: 先拿到热点凭据（0x5703）——立即入网 + 广播 _carplay-ctrl，再等 0x4301")
-                    joinAndBind(context, merged)
-                    val ssid = merged.ssid
-                    if (ssid != null) {
-                        advertiser.ensureForNetwork(ssid, force = true, network = boundNetwork)
-                    }
+                    log("SESSION: 收到热点凭据（0x5703）——先绑定、公告，再发现 AirPlay")
+                    wifiJoined = joinAndBind(context, merged) != null
+                    if (wifiJoined) usable = discoverOnCarWifi(context, merged, advertiser)
+                    if (usable != null) continue
                 }
                 if (pickHost(merged) != null) {
                     usable = merged
@@ -2208,6 +2069,7 @@ object HyperCarRepo {
     }
 
     private fun fail(reason: String) {
+        sessionLive.set(false)
         log("SESSION 失败: $reason")
         val hadLink = sessionHadLink
         // 失败即停蓝牙/WiFi 侧（保留 Failed 状态给 UI）：否则 iAP2 出站循环会继续每 3s
@@ -2626,7 +2488,8 @@ object HyperCarRepo {
     }
 
     private fun startCarLifeDisplay() {
-        if (!SettingsStore.carlifeEnabled) return
+        if (!SettingsStore.carlifeEnabled || selectedEnginePackage() != CarLifeSource.XIAOMI) return
+        val owner = carLifeSession
         val ctx = appContext() ?: return
         // register(tag) 的 tag 不一定是任意字符串：CarLife 很可能拿它当"客户端标识"校验。
         // 先按最可能的值逐个试，命中（返回 1）才继续 getDisplayController/startDisplay。
@@ -2691,7 +2554,7 @@ object HyperCarRepo {
         runCatching {
             val intent = android.content.Intent().setComponent(
                 android.content.ComponentName(
-                    "com.baidu.carlife.xiaomi",
+                    selectedEnginePackage() ?: return,
                     "com.baidu.carlife.complex.RemotePresentationService",
                 ),
             )
@@ -2702,6 +2565,10 @@ object HyperCarRepo {
                         name: android.content.ComponentName?,
                         service: android.os.IBinder?,
                     ) {
+                        if (owner != null && (carLifeSession !== owner || !owner.isOpen)) {
+                            runCatching { ctx.unbindService(this) }
+                            return
+                        }
                         if (service == null) {
                             log("CAST: RemotePresentationService 绑定成功但 binder 为 null")
                             return
@@ -2762,7 +2629,7 @@ object HyperCarRepo {
         val ctx = appContext() ?: return
         val pm = ctx.packageManager
         val services = runCatching {
-            pm.getPackageInfo("com.baidu.carlife.xiaomi", android.content.pm.PackageManager.GET_SERVICES)
+            pm.getPackageInfo(selectedEnginePackage() ?: return, android.content.pm.PackageManager.GET_SERVICES)
                 .services
         }.getOrNull().orEmpty()
         log("CAST-SVC: CarLife 共 ${services.size} 个 service，导出中…")
@@ -2788,7 +2655,7 @@ object HyperCarRepo {
                     }
                 }
                 val intent = android.content.Intent().setComponent(
-                    android.content.ComponentName("com.baidu.carlife.xiaomi", cls),
+                    android.content.ComponentName(selectedEnginePackage() ?: return, cls),
                 )
                 ctx.bindService(intent, conn, android.content.Context.BIND_AUTO_CREATE)
             }.onFailure { log("CAST-SVC: 绑定 $cls 失败 ${it.message}") }
@@ -2804,7 +2671,7 @@ object HyperCarRepo {
         for (cls in components) {
             runCatching {
                 val intent = android.content.Intent().setComponent(
-                    android.content.ComponentName("com.baidu.carlife.xiaomi", cls),
+                    android.content.ComponentName(selectedEnginePackage() ?: return, cls),
                 )
                 val conn = object : android.content.ServiceConnection {
                     override fun onServiceConnected(

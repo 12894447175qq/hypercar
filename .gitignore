@@ -1,7 +1,8 @@
-﻿# Android
+# Android
 /local.properties
 /.idea/
 /.gradle/
+/.kotlin/
 *.iml
 /app/build/
 /app/release/

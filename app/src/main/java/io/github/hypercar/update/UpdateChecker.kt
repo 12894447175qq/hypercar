@@ -15,10 +15,10 @@ import java.net.URL
  * 自动更新：读 GitHub Releases API 比较版本。
  *
  * 版本约定（见 app/build.gradle.kts 与 .github/workflows/android-ci.yml）：
- *  - CI 每次推送 `versionName = 0.1.0.<run_number>`、`versionCode = 10000 + run`
- *  - Release tag = `v0.1.0.<run_number>`，资产名 `HyperCar-<版本>-release.apk`
+ *  - CI 每次推送 `versionName = 0.1.1.<run_number>`、`versionCode = 20000 + run`
+ *  - Release tag = `v0.1.1.<run_number>`，资产名 `HyperCar-<版本>-release.apk`
  * 所以「本地版本 < 最新 tag」即视为有新版本；本地 develop 构建没有 run_number
- * （`0.1.0`），因此永远会被判定为"可更新"——这是期望行为。
+ * （`0.1.1`），因此永远会被判定为"可更新"——这是期望行为。
  *
  * 不引第三方 HTTP/JSON 依赖：`HttpURLConnection` + `org.json` 足够，
  * 也避免为了一个检查功能把 APK 撑大（本项目刚把体积压到 3.3MB）。
@@ -43,7 +43,7 @@ sealed interface UpdateUiState {
 
 object UpdateCenter {
 
-    private const val API = "https://api.github.com/repos/fw867/hypercar/releases/latest"
+    private const val API = io.github.hypercar.core.ProjectLinks.RELEASE_API
     private const val PREFS = "hypercar_update"
     private const val KEY_LAST_CHECK = "last_check_at"
     private const val KEY_DISMISSED = "dismissed_tag"
@@ -54,7 +54,7 @@ object UpdateCenter {
     private val _state = MutableStateFlow<UpdateUiState>(UpdateUiState.Idle)
     val state: StateFlow<UpdateUiState> = _state
 
-    /** 当前安装版本（带 run_number 的形式，如 0.1.0.42）。 */
+    /** 当前安装版本（带 run_number 的形式，如 0.1.1.42）。 */
     val currentVersion: String get() = BuildConfig.VERSION_NAME
 
     val currentBuild: Int get() = BuildConfig.VERSION_CODE
@@ -137,7 +137,7 @@ object UpdateCenter {
     }
 
     /**
-     * 版本比较：按 `.` 拆段做数值比较，缺失段按 0 处理（`0.1.0` < `0.1.0.42`）。
+     * 版本比较：按 `.` 拆段做数值比较，缺失段按 0 处理（`0.1.1` < `0.1.1.42`）。
      * 非数字后缀（如 `-beta`）忽略，只比较数字段。
      */
     fun isNewer(latest: String, current: String): Boolean {

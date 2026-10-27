@@ -36,6 +36,27 @@ object MfiLengthMemory {
     private const val KEY_OK = "ok_"
     private const val KEY_SILENT = "silent_"
     private const val KEY_REJECTED = "rejected_"
+    private val appliedPreferences = HashSet<String>()
+
+    fun baseline(preferred: Int): List<Int> =
+        (listOf(preferred.takeIf { it in setOf(16, 20, 32) } ?: 32) + listOf(32, 20, 16)).distinct()
+
+    /** A new profile preference can retry poisoned all-silent history once; never erase success/rejection. */
+    fun forPreference(context: Context?, identity: String, preferred: Int): Entry = synchronized(memory) {
+        val key = "preference_${receiverKey(identity)}_$preferred"
+        val store = prefs(context)
+        val applied = store?.getBoolean(key, false) ?: (key in appliedPreferences)
+        if (preferred != 32 && !applied) {
+            update(context, identity) { entry ->
+                if (entry.succeeded == null && entry.silent.containsAll(baseline(preferred))) {
+                    entry.copy(silent = emptySet())
+                } else entry
+            }
+            store?.edit()?.putBoolean(key, true)?.apply()
+            appliedPreferences.add(key)
+        }
+        load(context, identity)
+    }
 
     /** 车机身份 → 存储键。只用稳定字段，避免蓝牙名里的可变后缀影响命中。 */
     fun receiverKey(identityText: String): String =

@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.ui.screens
+package io.github.hypercar.ui.screens
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -340,7 +340,7 @@ internal fun FirstConnectGuideCard(modifier: Modifier = Modifier) {
                         android.content.Intent(
                             android.content.Intent.ACTION_VIEW,
                             android.net.Uri.parse(
-                                "https://github.com/fw867/hypercar/blob/main/docs/HEADUNIT-PROFILES.md",
+                                "${io.github.hypercar.core.ProjectLinks.PROJECT}/blob/main/docs/HEADUNIT-PROFILES.md",
                             ),
                         ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
                     )

@@ -1,9 +1,10 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
     <!-- 网络：车机热点（无外网）+ AirPlay/CarLife 回环 -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
@@ -60,6 +61,7 @@
              （2026-10-26 00:34 现场：com.baidu.carlife.xiaomi 明明在 pm list 里，
              我们却判成未安装，唤醒一路退回 com.miui.carlink）。 -->
         <package android:name="com.baidu.carlife" />
+        <package android:name="com.baidu.carlife.vivo" />
         <package android:name="com.baidu.carlife.xiaomi" />
         <package android:name="com.miui.carlink" />
         <package android:name="com.xiaomi.carlink" />

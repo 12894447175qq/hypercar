@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.headunit
+package io.github.hypercar.headunit
 
 import io.github.hypercar.settings.SettingsStore
 
@@ -89,6 +89,9 @@ data class HeadUnitProfile(
 
     /** 首次连接引导里这个车机额外要提示的一句；null = 不提。 */
     val pairingHint: String? = null,
+
+    /** First MFi challenge length; a successful per-receiver memory still wins. */
+    val mfiPreferredChallengeBytes: Int = 32,
 )
 
 /**
@@ -176,23 +179,16 @@ object HeadUnitProfiles {
     )
 
     /**
-     * 奥迪 MIB3 / MIB3 3315 —— **未实车验证**（只有 cardeck 与历史日志的二手结论）。
-     *
-     * 已知（均来自代码注释里的实测记录）：
-     *  - 车机**会发** 0x4301，但可能晚到 2 分 35 秒（MIB3 3310 实测）；
-     *  - 控制消息会话 id = 1；0x4E0E 接受但从不 ACK；
-     *  - 触摸报告是 5 字节单指（Rust 侧已按长度自适应，无需配置）；
-     *  - 0x1D01 可收清单可能只有 5 项、不含 0x5702（清单只能证明"有"）。
-     *
-     * 未知：是否需要 EA 会话、`/info` 是否只认 POST、AirPlay 端口、
-     * 是否校验 deviceID、是否广播 `_airplay._tcp`。首次上车请按
-     * `docs/HEADUNIT-PROFILES.md` 的「症状 → 字段」表逐项校准后把 verified 改 true。
+     * Audi MIB3: AUDI3260 / DELPHI successful CarDeck trace uses a first 20B challenge and
+     * mDNS before ctrl invitation, without 0x4301. Hypercar's real-car path remains unverified.
+     * Per-receiver successes still override this profile preference for other MMI firmware.
      */
     val AUDI_MIB3 = HeadUnitProfile(
         id = "audi_mib3",
+        mfiPreferredChallengeBytes = 20,
         label = "Audi MIB3",
-        model = "MIB3 / 3315",
-        notes = "未实车验证：车机会发 0x4301（可能晚到 2 分钟以上），控制会话 id=1，触摸为 5 字节单指。",
+        model = "MIB3 / AUDI3260 (DELPHI)",
+        notes = "CarDeck 成功日志：AUDI3260 首试 20B MFi；绑定热点后由 mDNS 发现 7000，不依赖 0x4301。Hypercar 待实车验证。",
         verified = false,
         validatesDeviceId = false,
         sendCarPlayAvailability = false,

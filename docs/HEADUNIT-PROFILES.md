@@ -25,6 +25,7 @@ app/src/main/java/io/github/hypercar/headunit/HeadUnitProfile.kt   ← 档案定
 | `dropProfilesBeforeIap2` | 发 iAP2 前是否主动断开该车机的 HFP/A2DP（「只配对、不连接」） | 奥迪那种「已连接就不开 iAP2 窗口」的车机要 `true`；**宝马要 `false`**——它的 HFP/A2DP 在线时本来就会主动连入 iAP2，主动断开反而把 ACL 一起拽掉，车机反而不发起 CarPlay；`通用（0.27）` 取 `true`（0.27 与 cardeck 都这么做） |
 | `abortWhenCarPlayWindowClosed` | 0x1D01 判为「档案 A」（车机没开无线 CarPlay 窗口）时是否主动结束会话 | **一律 `false`**：2026-10-25 现场 A/B——0.27 保持链路时车机显示 CarPlay 图标，0.28 加了「档案 A 立即结束」后图标消失、车机不再发起 iAP2（拆链会让车机收起图标）。空转轮次改由「车机新连入顶替」处理，不靠拆链 |
 | `preferMdnsAirplay` | 端口策略：`true` = 先查 mDNS `_airplay._tcp` | 车机广播该服务（抓包/Bonjour 浏览可见）→ `true`；普通接收端（WinPlay）→ `false` |
+| `mfiPreferredChallengeBytes` | 首个 MFi 挑战长度（16/20/32） | Audi MIB3 默认 20，其他默认 32；按车机保存的成功长度优先，旧缓存缺字段沿用内置值 |
 | `fallbackAirplayPorts` | mDNS 拿不到时的试连顺序 | AirPlay 惯例 `7000`，其次 `7001` / `7100` |
 | `touchDisplay` | 接收端 HID 像素空间（`"WxH"`） | 车机 `/info` 报 `0x0` 而坐标总是偏 → 填接收端真实像素 |
 | `pairingHint` | 首次连接引导里这台车额外的提示 | 例如"首次要在 iDrive 里选成 CarPlay 手机" |
@@ -216,7 +217,7 @@ HeadUnitProfiles.all = 内置 ∪ 远程（同 id 覆盖，远程独有追加）
 ### 5.4 注意事项
 
 - 下载地址可在 `SettingsStore.remoteProfilesUrl` 覆盖（镜像、私有分支、内网 HTTP 测试都行）；
-  空值 = `https://raw.githubusercontent.com/fw867/hypercar/main/profiles/headunits.json`。
+  空值 = `https://raw.githubusercontent.com/12894447175qq/hypercar/main/profiles/headunits.json`。
 - **只认配置，不执行代码**：远程档案只是布尔/端口/字符串，不含任何可执行内容。
 - `profiles/headunits.json` 里的 `updated` 字段供人看，App 不解析（避免时钟不准导致误判）。
 - 远程档案同样写进设置页的下拉列表，顺序：内置优先（保持稳定），远程独有在后。

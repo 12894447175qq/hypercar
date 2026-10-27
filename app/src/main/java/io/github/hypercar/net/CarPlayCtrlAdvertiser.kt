@@ -2,6 +2,7 @@ package io.github.hypercar.net
 
 import android.content.Context
 import android.net.Network
+import android.os.Build
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.os.SystemClock
@@ -27,9 +28,8 @@ import java.net.Socket
  *     都不再发、0x4301 永不到达（奥迪 MMI 3315 对照：950.7.1 时 0.65s 就下发）。
  *  2. **TXT `id` 必须是本机真实蓝牙 MAC**：车机按它匹配「待邀请的手机」，占位值
  *     （02:00:…）会导致永不邀请。
- *  3. **注册必须发生在 `bindProcessToNetwork` 之后**：`NsdManager.registerService` 没有
- *     Network 参数（API 36 的 `AdvertisingRequest` 才有），组播跟随进程默认网络；
- *     不绑就从蜂窝发出去，车机看不到。
+ *  3. 注册发生在 Wi-Fi 绑定之后；API 33+ 还在 NsdServiceInfo 显式指定 Network，
+ *     保证服务公告与控制 socket 都使用同一个车机热点。
  *
  * 服务名沿用 cardeck 验证过的 `sender`（改 `iPhone` 与 srcvers 同时变更时无法单次归因）。
  */
@@ -157,6 +157,7 @@ class CarPlayCtrlAdvertiser(
                     serviceName = SERVICE_NAME
                     serviceType = SERVICE_TYPE
                     setPort(socket.localPort)
+                    if (Build.VERSION.SDK_INT >= 33) setNetwork(registeredNetwork)
                     // 车机在 WiFi 上唯一能看到的手机身份就是这两个 TXT 字段
                     setAttribute("id", mac)
                     setAttribute("srcvers", SRCVERS)
@@ -166,6 +167,7 @@ class CarPlayCtrlAdvertiser(
             val listener =
                 object : NsdManager.RegistrationListener {
                     override fun onServiceRegistered(serviceInfo: NsdServiceInfo) {
+                        if (registrationListener !== this) return
                         log("$TAG: mDNS 注册成功 ${serviceInfo.serviceName}")
                     }
 
@@ -173,6 +175,7 @@ class CarPlayCtrlAdvertiser(
                         serviceInfo: NsdServiceInfo,
                         errorCode: Int,
                     ) {
+                        if (registrationListener !== this) return
                         registered = false
                         log("$TAG: mDNS 注册失败 code=$errorCode（下次拿到 0x5703 会重试）")
                     }
@@ -190,7 +193,7 @@ class CarPlayCtrlAdvertiser(
             registeredAtMillis = SystemClock.uptimeMillis()
             registeredMac = mac
             log(
-                "$TAG: 已监听 :${socket.localPort}，广播 $SERVICE_TYPE " +
+                "$TAG: 已监听 :${socket.localPort}，已请求广播 $SERVICE_TYPE " +
                     "name=$SERVICE_NAME id=$mac srcvers=$SRCVERS" +
                     if (mac == PLACEHOLDER_MAC) "（⚠ 占位 MAC：车机不会邀请）" else "",
             )

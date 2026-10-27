@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.ui.screens
+package io.github.hypercar.ui.screens
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -99,6 +99,7 @@ private val FpsOptions = listOf(30, 60)
 
 private val CarLifePackagePresets = listOf(
     "百度 CarLife" to "com.baidu.carlife",
+    "vivo CarLife（内置定制）" to "com.baidu.carlife.vivo",
     // 小米定制版 CarLife（HyperOS 预装，包名带 .xiaomi；现场 2026-10-23 实测就是它）
     "小米 CarLife（定制）" to "com.baidu.carlife.xiaomi",
     "小米 CarWith" to "com.miui.carlink",

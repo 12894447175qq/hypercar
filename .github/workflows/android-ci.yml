@@ -1,4 +1,4 @@
-﻿# HyperCar —— 每次 push 自动构建**正式签名**的 Release APK；
+# HyperCar —— 每次 push 运行测试、Lint 和 arm64 打包检查；配置签名后另出正式 APK。
 # **提交信息带 `[release]`（或 `[publish]`）时才发布 GitHub Release**，其余 push 只进 Artifacts。
 # **提交信息带 `[skip ci]` 时整条流水线不跑**（只改文档/注释时用）。
 #
@@ -7,7 +7,7 @@
 # 版本累计机制同款。
 #
 # 版本号自动累计：`appVersionName` + 本次 run_number
-#   例：0.1.0 → APK 0.1.0.42（versionCode = 1_0042），每次推送 +1，可直接覆盖安装。
+#   例：0.1.1 → APK 0.1.1.42（versionCode = 2_0042），每次推送 +1，可直接覆盖安装。
 #   基础版本仍只手改 app/build.gradle.kts 的 appVersionName。
 #
 # 发布规则（两种触发）：
@@ -25,10 +25,10 @@
 #   EXPECTED_CERT_SHA256  期望的签名证书 SHA-256（带不带冒号都行）——配了就会逐字比对，
 #                         防止误用别的 keystore 签出「正式版」。
 #
-# **没有 KEYSTORE_BASE64 会直接失败**，绝不退回 debug 签名：
+# 正式构建缺少签名即失败；未配置签名的 fork 普通推送只提供独立标识的测试 APK。
 # debug 证书签出去的包，日后换正式证书时所有用户必须卸载重装（签名是不可逆决定）。
 # Gradle 侧还有第二道闸：传了 -Phypercar.buildNumber 却没有 keystore.properties 就构建失败。
-name: Build Release APK
+name: Validate and Build APK
 
 on:
   push:
@@ -50,7 +50,7 @@ concurrency:
 
 jobs:
   build:
-    name: 构建正式签名 APK
+    name: 验证与 APK 构建
     # 提交信息里带 [skip ci] 就整条流水线不跑（只改文档/注释时省 CI 时间）
     if: "!contains(github.event.head_commit.message, '[skip ci]')"
     runs-on: ubuntu-latest
@@ -82,6 +82,29 @@ jobs:
           fi
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
           echo "本次是否发布 Release：$publish"
+
+      - name: 检查正式签名是否配置
+        id: signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          PUBLISH: ${{ steps.meta.outputs.publish }}
+        run: |
+          set -eu
+          ready=true
+          for v in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!v:-}" ]; then ready=false; fi
+          done
+          echo "ready=$ready" >> "$GITHUB_OUTPUT"
+          if [ "$ready" = false ]; then
+            if [ "$PUBLISH" = true ]; then
+              echo "::error::正式发布需要完整签名 Secrets，不允许使用 debug 证书替代。"
+              exit 1
+            fi
+            echo "未配置正式签名；本轮仅验证并输出 test-debug APK，不发布 Release。"
+          fi
 
       # AGP 8.5 要求 JDK 17，且与 app/build.gradle.kts 的 jvmTarget 一致
       - name: 安装 JDK 17
@@ -117,8 +140,12 @@ jobs:
         with:
           path: |
             rust-core/target
-          key: rust-core-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.toml') }}
+          key: rust-core-${{ runner.os }}-${{ hashFiles('rust-core/Cargo.toml', 'rust-core/Cargo.lock') }}
           restore-keys: rust-core-${{ runner.os }}-
+
+      - name: Rust 检查
+        working-directory: rust-core
+        run: cargo check --locked && cargo test --locked
 
       - name: 编译 Rust 核心层 → jniLibs
         env:
@@ -126,16 +153,36 @@ jobs:
         run: |
           set -eu
           cd rust-core
-          cargo ndk -t arm64-v8a -o ../app/src/main/jniLibs build --release
+          cargo ndk -t arm64-v8a -o ../app/src/main/jniLibs build --release --locked
           ls -la ../app/src/main/jniLibs/arm64-v8a/
           test -f ../app/src/main/jniLibs/arm64-v8a/libhypercar_core.so
 
       - name: 配置 Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: 单元测试、Lint 与测试 APK
+        run: |
+          set -eu
+          bash ./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleDebug --stacktrace
+          unzip -l app/build/outputs/apk/debug/app-debug.apk | grep -q 'lib/arm64-v8a/libhypercar_core.so'
+          sha256sum app/build/outputs/apk/debug/app-debug.apk > test-debug-sha256.txt
+
+      - name: 上传测试产物（非正式签名）
+        uses: actions/upload-artifact@v4
+        with:
+          name: HyperCar-test-debug-${{ github.run_number }}
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            test-debug-sha256.txt
+            app/build/reports/tests/**
+            app/build/reports/lint-results-debug.*
+          if-no-files-found: error
+          retention-days: 14
+
       # build.gradle.kts 用 rootProject.file(storeFile) 解析，所以 .jks 与
       # keystore.properties 都放仓库根（两者都已 gitignore，不会被提交）
       - name: 写入签名配置
+        if: steps.signing.outputs.ready == 'true'
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
@@ -163,6 +210,7 @@ jobs:
           echo "签名材料已就绪（release.jks + keystore.properties）"
 
       - name: 计算版本号
+        if: steps.signing.outputs.ready == 'true'
         id: version
         run: |
           set -eu
@@ -178,6 +226,7 @@ jobs:
       # Windows 上生成的 gradlew 在 git 里可能没有执行位（core.fileMode=false），
       # checkout 到 Linux runner 后补一次 chmod
       - name: 构建 Release APK
+        if: steps.signing.outputs.ready == 'true'
         env:
           BUILD_NUMBER: ${{ github.run_number }}
         run: |
@@ -186,6 +235,7 @@ jobs:
           ./gradlew :app:assembleRelease "-Phypercar.buildNumber=$BUILD_NUMBER" --stacktrace
 
       - name: 校验签名并打包
+        if: steps.signing.outputs.ready == 'true'
         id: package
         env:
           VERSION: ${{ steps.version.outputs.name }}
@@ -238,6 +288,7 @@ jobs:
           echo "已生成 $NAME（$SIZE）"
 
       - name: 上传 APK
+        if: steps.signing.outputs.ready == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.package.outputs.name }}
@@ -247,6 +298,7 @@ jobs:
           overwrite: 'true' # 重跑同一 run 时版本号不变，覆盖旧产物而不是失败
 
       - name: 写入运行摘要
+        if: steps.signing.outputs.ready == 'true'
         env:
           VERSION: ${{ steps.version.outputs.name }}
           NAME: ${{ steps.package.outputs.name }}
@@ -273,17 +325,9 @@ jobs:
             echo "> 解压后的 APK 体积见上表。"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # 放在出包之后：单测挂了本次运行标红，但 APK 仍可下载
-      - name: 单元测试
-        run: |
-          set -eu
-          chmod +x gradlew
-          ./gradlew :app:testDebugUnitTest --stacktrace
-
-      # 发布放在单测**之后**：测试红了就不该产出「正式版」Release
-      # （补发历史构建时可用 workflow_dispatch + publish=true 跳过测试失败的影响）
+      # 发布只在测试与正式签名校验通过后执行，手动发布同样受这些检查约束。
       - name: 发布 GitHub Release
-        if: steps.meta.outputs.publish == 'true'
+        if: steps.meta.outputs.publish == 'true' && steps.signing.outputs.ready == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.name }}
@@ -347,6 +391,7 @@ jobs:
           path: |
             app/build/reports/tests/**
             app/build/test-results/**
+            app/build/reports/lint-results-debug.*
           if-no-files-found: ignore
           retention-days: 7
 
