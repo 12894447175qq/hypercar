@@ -18,3 +18,4 @@
 -dontwarn org.jetbrains.annotations.**
 -keep class kotlin.Metadata { *; }
 -keepattributes Signature,InnerClasses,EnclosingMethod
+-keepattributes SourceFile,LineNumberTable

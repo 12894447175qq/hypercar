@@ -15,6 +15,9 @@ import io.github.hypercar.core.LinkState
 import io.github.hypercar.core.RustCoreBridge
 import io.github.hypercar.core.SessionSnapshot
 import io.github.hypercar.core.VideoStats
+import io.github.hypercar.diagnostics.ConnectionTrace
+import io.github.hypercar.diagnostics.LogSanitizer
+import io.github.hypercar.diagnostics.RollingLogFile
 import io.github.hypercar.iap2.CarPlayEndpoint
 import io.github.hypercar.iap2.Iap2Coordinator
 import io.github.hypercar.net.BluetoothMac
@@ -68,6 +71,9 @@ object HyperCarRepo {
     val snapshots: StateFlow<SessionSnapshot> = _snapshots.asStateFlow()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    @Volatile private var connectionTrace: ConnectionTrace? = null
+    @Volatile private var sourceCheckTrace: ConnectionTrace? = null
+    @Volatile private var lastFrameProgressAt = 0L
 
     @Volatile
     private var initialized = false
@@ -252,6 +258,10 @@ object HyperCarRepo {
 
     @Volatile private var carLifeSession: CarLifeWakeSession? = null
     private var carLifeCleanupJob: Job? = null
+    @Volatile private var sourceCheckOwner: CarLifeWakeSession? = null
+    private var sourceCheckJob: Job? = null
+    private val _sourceCheckStatus = MutableStateFlow("尚未检查 vivo 来源")
+    val sourceCheckStatus: StateFlow<String> = _sourceCheckStatus.asStateFlow()
 
     /** 上一次 `am start` 拉起 CarLife 的时间（uptimeMillis），用于避免 300ms 内重复拉起。 */
     @Volatile
@@ -414,6 +424,7 @@ object HyperCarRepo {
             log("CONNECT: 已在连接/已连接，忽略重复触发")
             return
         }
+        stopVivoSourceCheck()
         // 手动/自动发起连接都算"用户想要连"，清掉断开标记与重连倒计时
         userDisconnectRequested = false
         reconnectJob?.cancel()
@@ -421,6 +432,9 @@ object HyperCarRepo {
         sessionHadLink = false
         connecting = true
         sessionLive.set(true)
+        connectionTrace = ConnectionTrace("connect", ::log, SystemClock::elapsedRealtime).also {
+            it.event("connect.request", "profile=${headUnitProfile.id} source=${SettingsStore.carlifePackage} carlife=${SettingsStore.carlifeEnabled} carlifeFirst=${SettingsStore.carlifeFirst} shizuku=${ShizukuTools.isReady}")
+        }
         // 阶段计时基准：之后每条 CONNECT 日志都带 +Nms，一眼看出卡在哪一步
         sessionStageStart = System.currentTimeMillis()
         push(link = LinkState.Negotiating("检查 Shizuku"))
@@ -429,6 +443,8 @@ object HyperCarRepo {
     }
 
     fun disconnect() {
+        connectionTrace?.event("disconnect.request", "connecting=$connecting streaming=$streaming live=${sessionLive.get()}")
+        stopVivoSourceCheck()
         carLifeSession?.close()
         wakeJob?.cancel()
         // 用户主动断开：不再自动重连
@@ -450,6 +466,7 @@ object HyperCarRepo {
 
     fun clearLogs() {
         _snapshots.value = _snapshots.value.copy(recentLogs = emptyList())
+        runCatching { diskLog()?.clear() }.onFailure { log("LOG: 清空磁盘日志失败：${it.message}") }
         // **清空后立刻补回环境自述**：否则用户点一下"清空"，后面的日志就再也没有
         // 设备/系统/SDK/App 版本了（反馈出去的日志无法定位版本，2026-10-25 实测踩到）。
         // 不走 log()：它在「记录已暂停」时会直接丢弃，而这一行恰恰是最该保留的。
@@ -465,6 +482,8 @@ object HyperCarRepo {
     private suspend fun runConnect(context: Context) {
         try {
             sourceVideoConfirmed.set(false)
+            lastFrameProgressAt = 0L
+            connectionTrace?.event("preflight.begin", "waitingPreviousCleanup=${carLifeCleanupJob?.isActive == true}")
             scannedCarSubnets.clear()
             carLifeCleanupJob?.join()
             currentCoroutineContext().ensureActive()
@@ -475,6 +494,14 @@ object HyperCarRepo {
                 fail("所选 CarLife 或厂商投屏组件未安装：${SettingsStore.carlifePackage}；vivo 来源还需要原厂 Jovi")
                 return
             }
+            carLifeSession?.source?.let { source ->
+                val error = rendererPermissionError(context, source)
+                if (error != null) {
+                    fail(error)
+                    return
+                }
+            }
+            connectionTrace?.event("preflight.end", "source=${carLifeSession?.source?.enginePackage ?: "disabled"} shizuku=${ShizukuTools.isReady}")
             // Shizuku 从「必须」降级为「可选增强」：没有它照样能连，只是两条路径降级——
             //  WiFi 走 WifiNetworkSpecifier（热点首连弹一次系统确认框）+ deviceID 用稳定伪 MAC。
             if (!ShizukuTools.isReady) {
@@ -691,6 +718,10 @@ object HyperCarRepo {
             } else {
                 wakeLocalCarLife()
             }
+            if (carLifeSession?.source?.usesBoundRenderer == true) {
+                wakeJob?.join()
+                if (!sessionLive.get() || carLifeSession?.hasRenderer != true) return
+            }
 
             // ---- 连 AirPlay 控制端口并移交 FD ----
             push(link = LinkState.Negotiating("连接车机 AirPlay 端口"))
@@ -845,9 +876,11 @@ object HyperCarRepo {
             watchCarLifeHandshake()
             armVideoDiag()
         } catch (cancelled: CancellationException) {
+            connectionTrace?.event("connect.cancelled", "reason=${cancelled.message}")
             // disconnect() 掐掉在途连接：正常取消，不算失败（也不要把 Failed 写进快照）
             throw cancelled
         } catch (t: Throwable) {
+            connectionTrace?.failure("connect", t)
             fail("会话异常: ${t.message}")
         } finally {
             connecting = false
@@ -945,13 +978,15 @@ object HyperCarRepo {
      * 既打扰车机，也会不断制造「ACL 断开」事件。
      */
     private fun releaseSessionResources() {
+        val trace = connectionTrace
+        trace?.event("cleanup.begin", "nativeStreaming=$streaming binding=${carLifeSession?.hasRenderer} wifi=$boundNetwork iap2=${iap2 != null}")
         carLifeSession?.close()
         val wasDialMode = carLifeDialMode
         carLifeDialMode = false
         sessionMdHost = null
         streaming = false
         stopVoiceMic()
-        runCatching { RustCoreBridge.nativeStop() }
+        runCatching { RustCoreBridge.nativeStop() }.onFailure { trace?.failure("cleanup.native", it) }
         // 先掐掉"正在拉起 CarLife"的协程，再清理进程：
         // 否则它会在 3s 等待结束后把无界面服务重新拉起来，留下 7240 空壳（2026-10-26 12:47 现场）。
         wakeJob?.cancel()
@@ -961,15 +996,16 @@ object HyperCarRepo {
         // Rust 引擎停了之后清理本机 CarLife：否则它会留下"半死空壳"（7240 还占着、
         // 内部状态机停在上一轮 Phase 7），下次上车连上去永远不回 Phase 1。
         stopLocalCarLife(wasDialMode)
-        runCatching { iap2?.stop() }
+        runCatching { iap2?.stop() }.onFailure { trace?.failure("cleanup.iap2", it) }
         iap2 = null
-        runCatching { ctrlAdvertiser?.stop() }
+        runCatching { ctrlAdvertiser?.stop() }.onFailure { trace?.failure("cleanup.advertiser", it) }
         ctrlAdvertiser = null
-        runCatching { wifiJoiner?.release() }
+        runCatching { wifiJoiner?.release() }.onFailure { trace?.failure("cleanup.wifi", it) }
         wifiJoiner = null
         joinedSsid = null
         joinedNetwork = null
         boundNetwork = null
+        trace?.event("cleanup.app_refs_released", "vendorShutdownNotAssumed=true")
     }
 
     // ---------------------------------------------------------------- 语音助手麦克风
@@ -1048,10 +1084,12 @@ object HyperCarRepo {
     // ---------------------------------------------------------------- WiFi
 
     private suspend fun joinAndBind(context: Context, endpoint: CarPlayEndpoint): Network? {
+        connectionTrace?.event("wifi.join.begin", "ssidPresent=${!endpoint.ssid.isNullOrBlank()} credentialPresent=${!endpoint.passphrase.isNullOrBlank()} previousNetwork=$boundNetwork")
         val ssid = endpoint.ssid
         val psk = endpoint.passphrase
         val cm = context.getSystemService(ConnectivityManager::class.java)
         if (ssid != null && joinedSsid == ssid && joinedNetwork != null && cm?.getNetworkCapabilities(joinedNetwork!!) != null && boundNetwork == joinedNetwork && wifiJoiner?.currentNetwork == joinedNetwork) {
+            connectionTrace?.event("wifi.join.reuse", "network=$joinedNetwork")
             return joinedNetwork
         }
         val joiner = wifiJoiner ?: WifiJoiner(context) {
@@ -1068,12 +1106,14 @@ object HyperCarRepo {
         } else if (ssid == null) wifiNetworks(context).singleOrNull() else null
         currentCoroutineContext().ensureActive()
         if (network == null || !joiner.bindProcess(network)) {
+            connectionTrace?.event("wifi.join.failed", "matchedNetwork=$network reason=${joiner.lastFailureReason}")
             log("WIFI: 无匹配的车机 Wi-Fi 或 bindProcessToNetwork=false；不使用蜂窝兜底")
             return null
         }
         boundNetwork = network
         joinedSsid = ssid
         joinedNetwork = network
+        connectionTrace?.event("wifi.bound", "network=$network reusedExisting=${existing != null}")
         log("WIFI +${stageMs()}ms ✓ bindProcessToNetwork=true：${describeNetwork(context, network)}")
         return network
     }
@@ -1414,6 +1454,7 @@ object HyperCarRepo {
             runCatching { socket.close() }
             if (error is CancellationException) throw error
             log("NET +${stageMs()}ms ✗ $host:$port：${error.message}")
+            connectionTrace?.sample("airplay.socket.failed") { "host=$host port=$port network=$network timeoutMs=$timeoutMillis elapsedMs=${System.currentTimeMillis() - startedAt} error=${error.javaClass.name}:${error.message}" }
             null
         }
     }
@@ -1529,7 +1570,7 @@ object HyperCarRepo {
 
     private val rustListener = object : RustCoreBridge.EventListener {
         override fun onState(state: String, detail: String) {
-            log("CORE: [$state] $detail")
+            connectionTrace?.event("native.$state", detail) ?: log("CORE: [$state] $detail")
             when (state) {
                 "negotiating" -> push(link = LinkState.Negotiating(detail))
                 "connected" -> {
@@ -1607,9 +1648,14 @@ object HyperCarRepo {
 
         override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {
             // 用 update（CAS）而不是读-改-写：每秒一次，与 log() 的读-改-写并发会吞掉日志行。
+            if (frames > lastVideoFrames) lastFrameProgressAt = SystemClock.elapsedRealtime()
             lastVideoFrames = frames
             if (frames > 0 && carLifeSession?.isOpen == true && sourceVideoConfirmed.compareAndSet(false, true)) {
-                log("CARLIFE: ✓ 真实视频已进入 AirPlay（frames=$frames，不含待机画面；所选来源=${carLifeSession?.source?.enginePackage}，须结合端口 UID 核对）")
+                log("CARLIFE: 首批来源编码帧已提交发送（frames=$frames；来源=${carLifeSession?.source?.enginePackage}；原厂提示页也属于编码帧，须核对实际画面和车机显示）")
+            }
+            connectionTrace?.sample("stream.stats") {
+                val idle = lastFrameProgressAt.takeIf { it > 0 }?.let { SystemClock.elapsedRealtime() - it }
+                "frames=$frames fps=$fps kbps=$kbps frameIdleMs=$idle audio=$audioPlaying ducking=$ducking boundNetwork=$boundNetwork sourceBinding=${carLifeSession?.hasRenderer}"
             }
             _snapshots.update { s ->
                 s.copy(
@@ -1635,13 +1681,20 @@ object HyperCarRepo {
         ?: resolveCarLifeSource()?.enginePackage
 
     private suspend fun ownedCarLifePort(port: Int): Boolean {
-        if (!isLocalPortListening(port)) return false
+        if (!isLocalPortListening(port)) {
+            connectionTrace?.sample("source.port.$port.closed") { "listening=false" }
+            return false
+        }
         val owner = carLifeSession ?: return false
         if (!owner.isOpen || !ShizukuTools.isReady) return false
         val uid = runCatching { appContext()?.packageManager?.getApplicationInfo(owner.source.enginePackage, 0)?.uid }
             .getOrNull() ?: return false
         val table = runCatching { ShizukuTools.exec("cat /proc/net/tcp /proc/net/tcp6", 4_000).out }.getOrNull() ?: return false
-        return CarLifePorts.owned(CarLifePorts.parse(table), port, uid).also { if (it) owner.markUsed() }
+        val listeners = CarLifePorts.parse(table)
+        return CarLifePorts.owned(listeners, port, uid).also {
+            connectionTrace?.sample("source.port.$port.${if (it) "owned" else "foreign"}") { "listening=true expectedUid=$uid owners=${listeners.filter { row -> row.port == port }.take(4)} accepted=$it" }
+            if (it) owner.markUsed()
+        }
     }
 
     /**
@@ -1704,33 +1757,117 @@ object HyperCarRepo {
 
     private fun prepareLocalCarLifeRenderer() {
         val owner = carLifeSession ?: return
-        if (owner.source.rendererInitialization == null || !owner.isOpen || !sessionLive.get()) return
+        if (!owner.source.usesBoundRenderer || !owner.isOpen || !sessionLive.get()) return
         if (wakeJob?.isActive == true) return
-        wakeJob = scope.launch {
-            if (ShizukuTools.isReady) {
-                owner.prepareRenderer { command ->
-                    currentCoroutineContext().ensureActive()
-                    if (carLifeSession === owner && owner.isOpen && sessionLive.get()) {
-                        val r = ShizukuTools.exec(command, 8_000)
-                        log("WAKE: 初始化 vivo/Jovi 投屏来源 exit=${r.code} ${r.err.take(160)}")
-                    }
+        wakeJob = scope.launch { bindVivoRenderer(owner) }
+    }
+
+    private suspend fun bindVivoRenderer(owner: CarLifeWakeSession) {
+        if (carLifeSession !== owner || !owner.isOpen || !sessionLive.get()) return
+        val ctx = appContext() ?: return
+        try {
+            val accepted = owner.bindRenderer {
+                VivoCarLifeBinding.connect(ctx, owner.source, ::log, connectionTrace?.id) {
+                    carLifeSession === owner && owner.isOpen && sessionLive.get()
                 }
-            } else startVivoRendererWithoutShell(owner)
+            }
+            if (!accepted && owner.isOpen && sessionLive.get()) fail("vivo CarLife 服务绑定未完成")
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            if (carLifeSession === owner && owner.isOpen && sessionLive.get()) {
+                connectionTrace?.failure("source.initialize", error)
+                fail("vivo CarLife 初始化失败：${error.message}；请打开来源应用权限检查，原厂服务未就绪时不会继续假装取源成功")
+            }
         }
     }
 
-    private fun startVivoRendererWithoutShell(owner: CarLifeWakeSession) {
-        if (owner.source.enginePackage != CarLifeSource.VIVO || carLifeSession !== owner || !owner.isOpen || !sessionLive.get()) return
-        val ctx = appContext() ?: return
-        owner.markUsed()
+    fun openCarLifeSourceSettings(context: Context, packageName: String = SettingsStore.carlifePackage) {
+        val source = CarLifeSource.resolve(packageName) { pkg ->
+            runCatching { context.packageManager.getApplicationInfo(pkg, 0) }.isSuccess
+        }
+        if (source == null) { log("所选 CarLife 来源或厂商组件未安装"); return }
         runCatching {
-            ctx.startForegroundService(android.content.Intent().setComponent(
-                android.content.ComponentName.unflattenFromString(owner.source.service!!))
-                .putExtra("bindPackageName", CarLifeSource.JOVI)
-                .putExtra("bindClassName", CarLifeSource.JOVI_CAST_SERVICE)
-                .putExtra("usb_type", 13)
-                .putExtra("mix_manual", true))
-        }.onFailure { log("WAKE: vivo/Jovi 投屏初始化失败：${it.message}") }
+            context.startActivity(android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                android.net.Uri.parse("package:${source.enginePackage}"))
+                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+        }.onFailure { log("打开来源应用权限失败：${it.message}") }
+    }
+
+    private fun rendererPermissionError(context: Context, source: CarLifeSource): String? {
+        val missing = source.missingRendererPermissions {
+            context.packageManager.checkPermission(it, source.enginePackage) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+        (sourceCheckTrace ?: connectionTrace)?.event("source.permissions", "package=${source.enginePackage} missing=$missing")
+        if (missing.isEmpty()) return null
+        val labels = missing.joinToString("、") { if (it == CarLifeSource.FINE_LOCATION) "精确定位" else "后台定位" }
+        return "vivo CarLife 缺少原厂要求的${labels}授权；请在设置中的“来源应用权限”里检查定位是否始终允许。Hypercar 不会自动授予这些权限。"
+    }
+
+    /** Runs the same source binding without a car; never changes the experimental startup setting. */
+    fun startVivoSourceCheck(context: Context) {
+        init(context)
+        if (connecting || streaming) {
+            _sourceCheckStatus.value = "请先停止车机连接，再检查来源"
+            return
+        }
+        stopVivoSourceCheck()
+        val source = resolveCarLifeSource()
+        if (source?.usesBoundRenderer != true) {
+            _sourceCheckStatus.value = "请先选择已安装的 vivo CarLife 来源，并确认原厂 Jovi 已安装"
+            return
+        }
+        val owner = CarLifeWakeSession(source)
+        val trace = ConnectionTrace("source-check", ::log, SystemClock::elapsedRealtime)
+        sourceCheckTrace = trace
+        trace.event("source_check.begin", "source=${source.enginePackage} durationMs=45000")
+        sourceCheckOwner = owner
+        _sourceCheckStatus.value = "正在检查 vivo 来源"
+        sourceCheckJob = scope.launch {
+            try {
+                val error = rendererPermissionError(context, source)
+                if (error != null) {
+                    _sourceCheckStatus.value = error
+                    log("SOURCE-CHECK: $error")
+                    return@launch
+                }
+                val accepted = owner.bindRenderer {
+                    VivoCarLifeBinding.connect(context, source, ::log, trace.id) { sourceCheckOwner === owner && owner.isOpen }
+                }
+                if (!accepted || sourceCheckOwner !== owner) return@launch
+                trace.event("source_check.bound", "bindingReady=true videoAndDesktopNotVerified=true")
+                _sourceCheckStatus.value = "原厂来源服务已就绪，45 秒后自动释放；此检查只验证初始化"
+                log("SOURCE-CHECK: 原厂服务绑定就绪（未连接车机，不代表画面或实车验收通过）")
+                delay(45_000)
+                _sourceCheckStatus.value = "检查结束，已释放本轮原厂服务绑定"
+            } catch (cancelled: CancellationException) {
+                trace.event("source_check.cancelled", "reason=${cancelled.message}")
+                throw cancelled
+            } catch (error: Exception) {
+                trace.failure("source_check", error)
+                if (sourceCheckOwner === owner) {
+                    _sourceCheckStatus.value = "vivo 来源初始化失败：${error.message}"
+                    log("SOURCE-CHECK: ${error.message}")
+                }
+            } finally {
+                owner.close()
+                trace.event("source_check.binding_release_requested")
+                if (sourceCheckOwner === owner) sourceCheckOwner = null
+                if (sourceCheckTrace === trace) sourceCheckTrace = null
+            }
+        }
+    }
+
+    fun stopVivoSourceCheck() {
+        val trace = sourceCheckTrace
+        sourceCheckTrace = null
+        trace?.event("source_check.stop_requested")
+        val owner = sourceCheckOwner
+        sourceCheckOwner = null
+        owner?.close()
+        sourceCheckJob?.cancel()
+        sourceCheckJob = null
+        if (owner != null) _sourceCheckStatus.value = "已停止来源检查并释放绑定"
     }
 
     /** One activity per selected engine, followed by a cancellable service fallback. */
@@ -1740,6 +1877,10 @@ object HyperCarRepo {
         if (!owner.isOpen || !sessionLive.get() || wakeJob?.isActive == true) return
         _snapshots.value = _snapshots.value.copy(carLife = CarLifeState.Waiting())
         wakeJob = scope.launch {
+            if (owner.source.usesBoundRenderer) {
+                bindVivoRenderer(owner)
+                return@launch
+            }
             if (!ShizukuTools.isReady) {
                 val ctx = appContext() ?: return@launch
                 val component = owner.source.activity
@@ -1754,11 +1895,6 @@ object HyperCarRepo {
                             .setPackage(owner.source.wakePackage))
                     }
                 }.onFailure { log("WAKE: 启动失败：${it.message}；可授权 Shizuku 后重试") }
-                if (owner.source.rendererInitialization != null) {
-                    delay(3_000)
-                    currentCoroutineContext().ensureActive()
-                    startVivoRendererWithoutShell(owner)
-                }
                 return@launch
             }
             owner.wake(exec = { command ->
@@ -1784,6 +1920,14 @@ object HyperCarRepo {
         carLifeSession = null
         if (!owner.wasUsed) return
         val pkg = owner.source.enginePackage
+        if (owner.source.usesBoundRenderer) {
+            carLifeCleanupJob = scope.launch {
+                // Drain the main-thread unbind posted by the session-owned lease before reuse.
+                withContext(Dispatchers.Main) { }
+                log("CARLIFE: 已释放本轮 vivo 服务绑定；由原厂 SDK 正常结束渲染")
+            }
+            return
+        }
         val ctx = appContext()
         for (action in listOf("com.baidu.carlife.Action.StopWireless", "com.baidu.carlife.Action.Disconnect")) {
             runCatching { ctx?.sendBroadcast(android.content.Intent(action).setPackage(pkg)) }
@@ -1802,7 +1946,7 @@ object HyperCarRepo {
      * 握手看门狗：引擎起来后 12s 内没收到 `carlife_active`（14 步握手完成），
      * 就判定本机 CarLife 是"空壳"——7240 在听、但新的 CMD 会话永远不回 Phase 1
      * （2026-10-26 13:13 现场：CarLife 被重复拉起后单实例重启，新实例不回握手）。
-     * 处置：force-stop 后重新拉起一次（每轮会话最多一次，避免反复杀）。
+     * 处置：vivo 释放并重建本轮绑定；其他来源强停后重拉一次（每轮最多一次）。
      */
     private fun watchCarLifeHandshake() {
         val owner = carLifeSession ?: return
@@ -1815,7 +1959,7 @@ object HyperCarRepo {
                 if (SystemClock.uptimeMillis() - startedAt >= 12_000L) break
             }
             if (!sessionLive.get() || carLifeSession !== owner || !owner.isOpen || carLifeActiveAt >= startedAt) return@launch
-            log("CARLIFE: 12s 内没走完握手（Phase 1 无回应）——判定空壳，force-stop 后重拉一次")
+            log("CARLIFE: 12s 内没走完握手（Phase 1 无回应）——重建本轮来源连接一次")
             restartLocalCarLife()
         }
     }
@@ -1839,6 +1983,7 @@ object HyperCarRepo {
                 return@launch
             }
             log("DIAG: 12s 内视频帧仍为 0——自动取证（不用碰手机）")
+            connectionTrace?.event("video.first_frame.timeout", "waitMs=12000 handshakeAt=$carLifeActiveAt rendererBound=${owner.hasRenderer} source=${owner.source.enginePackage}")
             // CarLife 的 APK 里有 MediaProjection/createVirtualDisplay/createInputSurface：
             // 它的视频很可能是"录屏 → 编码"。Android 13+ 每次都要系统授权（或 PROJECT_MEDIA appop），
             // 没授权就只会出现"编码器 STARTED 但 Qin:0"。
@@ -1859,6 +2004,12 @@ object HyperCarRepo {
         wakeJob = scope.launch {
             currentCoroutineContext().ensureActive()
             if (carLifeSession !== owner || !owner.isOpen) return@launch
+            if (owner.source.usesBoundRenderer) {
+                owner.releaseRenderer()
+                withContext(Dispatchers.Main) { }
+                if (owner.isOpen && sessionLive.get()) bindVivoRenderer(owner)
+                return@launch
+            }
             ShizukuTools.exec("am force-stop ${owner.source.enginePackage}", 4_000)
             delay(600)
             if (carLifeSession !== owner || !owner.isOpen || !sessionLive.get()) return@launch
@@ -2106,6 +2257,7 @@ object HyperCarRepo {
     }
 
     private fun fail(reason: String) {
+        connectionTrace?.event("connect.failed", "reason=$reason sourceBinding=${carLifeSession?.hasRenderer} videoFrames=$lastVideoFrames boundNetwork=$boundNetwork")
         sessionLive.set(false)
         log("SESSION 失败: $reason")
         val hadLink = sessionHadLink
@@ -2122,6 +2274,9 @@ object HyperCarRepo {
     }
 
     private fun push(link: LinkState? = null, carLife: CarLifeState? = null) {
+        val previous = _snapshots.value
+        if (link != null && link != previous.link) connectionTrace?.event("link.state", "from=${previous.link} to=$link")
+        if (carLife != null && carLife != previous.carLife) connectionTrace?.event("source.state", "from=${previous.carLife} to=$carLife")
         _snapshots.update { s ->
             s.copy(
                 link = link ?: s.link,
@@ -2200,7 +2355,8 @@ object HyperCarRepo {
      * （logcat 也一起省掉），等下一次有非重复行进来时补一条「已折叠 N 条」。事件回环的历史
      * 故障就是 0.6s 灌了 300 行；有了限流，环形缓冲能把真正的上下文留下来。
      */
-    fun log(line: String) {
+    fun log(message: String) {
+        val line = LogSanitizer.clean(message)
         val now = SystemClock.elapsedRealtime()
         var folded = 0
         var overBudget = false
@@ -2221,10 +2377,13 @@ object HyperCarRepo {
             }
         }
         if (overBudget) return
-        android.util.Log.i("HyperCar", line)
+        // Rate limiting uses the original message; changing elapsed time must not bypass it.
+        val trace = sourceCheckTrace ?: connectionTrace?.takeIf { sessionLive.get() || connecting || streaming }
+        val rendered = if (line.startsWith("TRACE[")) line else trace?.decorate(line) ?: line
+        android.util.Log.i("HyperCar", rendered)
         if (!logRecording) return // 记录开关关闭：丢弃（logcat 仍写，adb 可查）
         val stamp = logTimeFormat.get().format(java.util.Date())
-        appendDiskLog("$stamp  $line")
+        appendDiskLog("$stamp  $rendered")
         _snapshots.update { s ->
             val extra =
                 if (folded > 0) {
@@ -2232,7 +2391,7 @@ object HyperCarRepo {
                 } else {
                     emptyList()
                 }
-            s.copy(recentLogs = (s.recentLogs + extra + "$stamp  $line").takeLast(LOG_KEEP_LINES))
+            s.copy(recentLogs = (s.recentLogs + extra + "$stamp  $rendered").takeLast(LOG_KEEP_LINES))
         }
     }
 
@@ -2245,46 +2404,35 @@ object HyperCarRepo {
      * 的崩溃现场（连上 AirPlay 端口之后）就是这么丢的——用户「崩溃前快速点了导出」，
      * 导出的也只是崩溃前的旧内容。落盘后重启会把上一轮的尾部带回环形缓冲。
      */
-    private var diskLogWriter: java.io.BufferedWriter? = null
+    private var diskLogStore: RollingLogFile? = null
     private val diskLogLock = Any()
+    private val diskLogFailureCount = java.util.concurrent.atomic.AtomicLong()
 
     /** 打开（必要时先把上一份转成 .1）内部日志文件；失败返回 null，不影响界面日志。 */
-    private fun diskLog(): java.io.BufferedWriter? {
+    private fun diskLog(): RollingLogFile? {
         synchronized(diskLogLock) {
-            diskLogWriter?.let { return it }
+            diskLogStore?.let { return it }
             val dir = appCtx?.filesDir ?: return null
-            val writer = runCatching {
-                val file = java.io.File(dir, DISK_LOG_NAME)
-                if (file.length() > DISK_LOG_MAX_BYTES) {
-                    val old = java.io.File(dir, "$DISK_LOG_NAME.1")
-                    old.delete()
-                    file.renameTo(old)
-                }
-                java.io.FileOutputStream(file, true).bufferedWriter()
-            }.getOrNull() ?: return null
-            diskLogWriter = writer
-            return writer
+            return RollingLogFile(java.io.File(dir, DISK_LOG_NAME), DISK_LOG_MAX_BYTES).also { diskLogStore = it }
         }
     }
 
     /** 追加一行到磁盘日志并立即 flush：原生崩溃（SIGSEGV/SIGABRT）时最后几行也不会丢。 */
     private fun appendDiskLog(line: String) {
-        val writer = diskLog() ?: return
-        synchronized(diskLogLock) {
-            runCatching {
-                writer.write(line)
-                writer.newLine()
-                writer.flush()
+        runCatching { diskLog()?.append(LogSanitizer.clean(line)) }.onFailure {
+            val count = diskLogFailureCount.incrementAndGet()
+            // Do not recurse through log() when storage itself is failing.
+            if (count == 1L || count % 100L == 0L) {
+                val warning = "LOG: 文件写入失败（次数=$count）：${LogSanitizer.clean(it.toString())}"
+                android.util.Log.e("HyperCar", warning)
+                _snapshots.update { state -> state.copy(recentLogs = (state.recentLogs + warning).takeLast(LOG_KEEP_LINES)) }
             }
         }
     }
 
     /** 把上一次运行（崩溃/被系统杀）的最后若干行带回环形缓冲，供崩溃后导出。 */
     private fun restoreDiskLogTail() {
-        val dir = appCtx?.filesDir ?: return
-        val file = java.io.File(dir, DISK_LOG_NAME)
-        if (!file.exists() || file.length() == 0L) return
-        val tail = runCatching { file.readLines().takeLast(DISK_LOG_TAIL_LINES) }.getOrDefault(emptyList())
+        val tail = runCatching { diskLog()?.snapshotLines().orEmpty().takeLast(DISK_LOG_TAIL_LINES).map(LogSanitizer::clean) }.getOrDefault(emptyList())
         if (tail.isEmpty()) return
         _snapshots.update { s ->
             val header = "===== 上次运行（进程重启/崩溃前）最后 ${tail.size} 行 ====="
@@ -2445,9 +2593,19 @@ object HyperCarRepo {
                 }
                 val lines = r.out.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
                 log("$prefix: exit=${r.code}，${lines.size} 行")
+                if (r.err.isNotBlank()) log("$prefix: stderr=${r.err.take(500)}")
                 lines.take(maxLines).forEach { log("$prefix ${it.take(200)}") }
             }
             log("DIAG: ==== CarLife 现场开始 ====")
+            val pkg = selectedEnginePackage() ?: SettingsStore.carlifePackage
+            if (Regex("[a-zA-Z][a-zA-Z0-9_]*(\\.[a-zA-Z0-9_]+)+").matches(pkg)) {
+                run("DIAG-PKG", "dumpsys package ${io.github.hypercar.shizuku.shellQuote(pkg)} | grep -E 'versionCode=|versionName=|User 0:|ACCESS_FINE_LOCATION:|ACCESS_COARSE_LOCATION:|ACCESS_BACKGROUND_LOCATION:' | head -10", 10)
+                run("DIAG-SVC", "dumpsys activity services ${io.github.hypercar.shizuku.shellQuote(pkg)} | grep -E 'ServiceRecord|intent=|ConnectionRecord|startRequested|recentCalling' | head -14", 14)
+                if (pkg == CarLifeSource.VIVO) {
+                    run("DIAG-JOVI", "dumpsys activity services com.vivo.car.networking | grep -E 'ServiceRecord|intent=|ConnectionRecord|startRequested|recentCalling' | head -12", 12)
+                }
+            }
+            run("DIAG-POWER", "dumpsys window policy | grep -E 'mInputRestricted=|showing=' | head -4", 4)
             run(
                 "DIAG-ACT",
                 "dumpsys activity activities | grep -iE 'carlife|mResumedActivity|topResumedActivity' | head -6",
@@ -2469,11 +2627,8 @@ object HyperCarRepo {
                 30,
             )
             log("DIAG: ==== CarLife 现场结束 ====")
-            // 顺手探一下 CarLife 的投屏 AIDL（CarWith 就是靠它驱动投屏的）
-            probeCarLifeCastBinder()
-            // 顺便把 register/getDisplayController/startDisplay 这套也跑一遍：
-            // 不需要先连车机，点一次「CarLife」就能看到结果。
-            startCarLifeDisplay()
+            // Diagnostic collection must not create bindings or start a display.
+            // The explicit Xiaomi startup/probe entry retains its own behavior.
         }
     }
 
@@ -2737,19 +2892,26 @@ object HyperCarRepo {
      * 完成后路径写进快照 [SessionSnapshot.lastExportPath] 并落一条日志（诊断页最上方可见）。
      * 必须在后台线程调用（内部已切 IO）。
      */
-    fun exportLogs() {
+    fun exportLogs(onFinished: (() -> Unit)? = null) {
         scope.launch {
-            val logs = _snapshots.value.recentLogs
-            if (logs.isEmpty()) {
-                log("LOG: 无日志可导出")
-                return@launch
-            }
-            val result = withContext(Dispatchers.IO) { writeDownloadsFile(logs) }
-            result.onSuccess { path ->
-                _snapshots.value = _snapshots.value.copy(lastExportPath = path)
-                log("LOG: ✓ 日志已导出 $path（${logs.size} 行）")
-            }.onFailure { e ->
-                log("LOG: 导出失败 - ${e.message}")
+            try {
+                val logs = runCatching { diskLog()?.snapshotLines().orEmpty().map(LogSanitizer::clean) }.getOrElse {
+                    log("LOG: 读取保留日志文件失败，改用界面尾部：${it.message}")
+                    emptyList()
+                }.ifEmpty { _snapshots.value.recentLogs }
+                if (logs.isEmpty()) {
+                    log("LOG: 无日志可导出")
+                    return@launch
+                }
+                val result = withContext(Dispatchers.IO) { writeDownloadsFile(logs) }
+                result.onSuccess { path ->
+                    _snapshots.update { it.copy(lastExportPath = path) }
+                    log("LOG: ✓ 日志已导出 $path（${logs.size} 行）")
+                }.onFailure { e ->
+                    log("LOG: 导出失败 - ${e.message}")
+                }
+            } finally {
+                onFinished?.invoke()
             }
         }
     }
@@ -2757,7 +2919,7 @@ object HyperCarRepo {
     /** 写 `Download/HyperCar/hypercar-log-<时间戳>.txt`；Android 10+ 走 MediaStore 免权限。 */
     private fun writeDownloadsFile(logs: List<String>): Result<String> = runCatching {
         val ctx = requireNotNull(appCtx) { "Repo 未初始化" }
-        val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
+        val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss-SSS", java.util.Locale.US)
             .format(java.util.Date())
         val name = "hypercar-log-$stamp.txt"
         val text = buildString {
@@ -2765,6 +2927,8 @@ object HyperCarRepo {
             appendLine("# 应用 ${DeviceInfo.appVersion(ctx)}")
             appendLine("# 设备 ${DeviceInfo.systemSummary()}")
             appendLine("# 说明：以下时间戳为本机时间；日志共 ${logs.size} 行")
+            appendLine("# 包含保留的当前与上一份日志；TRACE 编号用于关联连接，+Nms 为单调时钟耗时")
+            appendLine("# 文件写入失败计数=${diskLogFailureCount.get()}；高频状态每 5 秒采样，重复日志有折叠")
             appendLine()
             logs.forEach { appendLine(it) }
         }

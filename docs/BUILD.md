@@ -95,8 +95,8 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 测试产物名为 `HyperCar-test-debug-<run>`，只保存在 Actions Artifacts，不作为正式版本发布。
 
 - 配置四项签名 Secrets 后，继续构建并验证正式签名 APK；缺少签名的 fork 普通推送只完成验证。
-- 正式版本由 `appVersionName` + run_number 组成：`0.1.1.<N>`，`versionCode = 2*10000 + N`。
-  本地不传构建号时为 `0.1.1 / 20000`，高于旧版 `10050`。
+- 正式版本由 `appVersionName` + run_number 组成：`0.1.1.<N>`，`versionCode = 5*10000 + N`。
+  本地不传构建号时为 `0.1.1 / 50000`，高于旧版 `10050`、`20000`、`30000` 和 `40000`。
 - 发布仍需提交标题末尾的发布标记或手动勾选 publish；普通修复推送不会创建 Release。
 - 必需 Secrets：`KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD`；可选
   `EXPECTED_CERT_SHA256`。显式发布时缺任一材料即失败，绝不以 debug 签名替代正式版。
@@ -106,6 +106,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 ## 6. 排查
 
+- 日志文件保留、完整导出、ADB 无界面导出及真机复现方法见[真机日志说明](DIAGNOSTIC-LOGGING.md)。
 - App 内「诊断」页有 Rust/iAP2/WiFi 全量日志（等价于 cardeck 的 main_debug.log）。
 - 「诊断」页有 **反馈到 GitHub**：预填 issues/new 标题/环境/日志尾部并打开浏览器，完整日志同时进剪贴板（不内嵌 token；用户点 Submit 才发布）。
 - 导出的日志头与启动第一行都带 **设备型号 / 系统版本（ROM 显示号 + 编译号）/ SDK / HyperCar 版本号**（ENV: 行），反馈问题请连同这几行一起贴。

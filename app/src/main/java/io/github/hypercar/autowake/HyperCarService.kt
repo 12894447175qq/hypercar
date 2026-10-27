@@ -15,6 +15,8 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import io.github.hypercar.HyperCarApp
 import io.github.hypercar.R
+import io.github.hypercar.diagnostics.ConnectionTrace
+import io.github.hypercar.session.HyperCarRepo
 
 /**
  * 秒连链路的前台保活服务（foregroundServiceType=connectedDevice，manifest 已配）。
@@ -37,6 +39,7 @@ import io.github.hypercar.R
  * startService 刷屏（历史 bug）。
  */
 class HyperCarService : Service() {
+    private val trace = ConnectionTrace("fgs", HyperCarRepo::log, android.os.SystemClock::elapsedRealtime)
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
 
@@ -44,6 +47,7 @@ class HyperCarService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val device = deviceOf(intent)
+        trace.event("service.command", "action=${intent?.action} startId=$startId flags=$flags devicePresent=${device != null} running=$isRunning")
         when (intent?.action) {
             ACTION_STOP -> {
                 // 只在「服务确实在跑」的这一次停止里转交会话层收尾。
@@ -56,7 +60,7 @@ class HyperCarService : Service() {
                 isRunning = false
                 if (device != null && wasRunning) {
                     runCatching { AutoStart.handler?.invoke(applicationContext, device, false) }
-                        .onFailure { Log.e(TAG, "转交停止失败", it) }
+                        .onFailure { trace.failure("service.stop.handoff", it); Log.e(TAG, "转交停止失败", it) }
                 }
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 releaseLocks()
@@ -73,7 +77,7 @@ class HyperCarService : Service() {
                 // startForegroundService 过；这里 service 已前台，handler 见 isRunning=true 直接做会话。
                 if (intent?.action == ACTION_START && device != null) {
                     runCatching { AutoStart.handler?.invoke(applicationContext, device, true) }
-                        .onFailure { Log.e(TAG, "触发会话失败", it) }
+                        .onFailure { trace.failure("service.start.handoff", it); Log.e(TAG, "触发会话失败", it) }
                 }
             }
         }
@@ -81,6 +85,7 @@ class HyperCarService : Service() {
     }
 
     override fun onDestroy() {
+        trace.event("service.destroy", "running=$isRunning")
         isRunning = false
         releaseLocks()
         super.onDestroy()
@@ -109,8 +114,11 @@ class HyperCarService : Service() {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
             }
         try {
+            trace.event("foreground.request", "types=$types micGranted=$micGranted")
             ServiceCompat.startForeground(this, NOTIFICATION_ID, buildNotification(), types)
+            trace.event("foreground.promoted", "types=$types")
         } catch (t: Throwable) {
+            trace.failure("foreground.promote", t)
             Log.e(TAG, "startForeground（含 microphone 类型）失败：${t.message}，退回 connectedDevice")
             try {
                 ServiceCompat.startForeground(
@@ -119,7 +127,9 @@ class HyperCarService : Service() {
                     buildNotification(),
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
                 )
+                trace.event("foreground.fallback_promoted", "types=connectedDevice")
             } catch (t2: Throwable) {
+                trace.failure("foreground.fallback", t2)
                 Log.e(TAG, "startForeground 失败：${t2.message}")
             }
         }
@@ -138,12 +148,16 @@ class HyperCarService : Service() {
             setReferenceCounted(false)
             acquire()
         }
+        trace.event("locks.acquired", "cpu=${wakeLock?.isHeld} wifi=${wifiLock?.isHeld}")
     }
 
     private fun releaseLocks() {
-        runCatching { wakeLock?.release() }
+        trace.event("locks.release_requested", "cpu=${wakeLock?.isHeld} wifi=${wifiLock?.isHeld}")
+        runCatching { wakeLock?.release() }.onFailure { trace.failure("locks.cpu.release", it) }
+        trace.event("locks.cpu.after_release", "held=${wakeLock?.isHeld}")
         wakeLock = null
-        runCatching { wifiLock?.release() }
+        runCatching { wifiLock?.release() }.onFailure { trace.failure("locks.wifi.release", it) }
+        trace.event("locks.wifi.after_release", "held=${wifiLock?.isHeld}")
         wifiLock = null
     }
 

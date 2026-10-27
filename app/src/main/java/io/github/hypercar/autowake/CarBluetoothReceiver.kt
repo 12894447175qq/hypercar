@@ -9,6 +9,8 @@ import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 import io.github.hypercar.bluetooth.BtProfiles
+import io.github.hypercar.diagnostics.ConnectionTrace
+import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.settings.SettingsStore
 
 /**
@@ -37,23 +39,25 @@ class CarBluetoothReceiver : BroadcastReceiver() {
             else -> return
         }
         val app = context.applicationContext
+        val trace = ConnectionTrace("acl", HyperCarRepo::log, SystemClock::elapsedRealtime)
+        trace.event("acl.received", "connected=$connected autoConnect=${SettingsStore.autoConnect} targetConfigured=${!SettingsStore.targetCarMac.isNullOrBlank()}")
         // 每次都读开关：进程可能刚被广播冷启动，无内存缓存可依赖
-        if (!SettingsStore.autoConnect) return
+        if (!SettingsStore.autoConnect) { trace.event("acl.ignored", "reason=auto_connect_disabled"); return }
 
         val device = deviceOf(intent)
         if (device == null) {
-            Log.i(TAG, "ACL 广播缺少 EXTRA_DEVICE——放弃")
+            trace.event("acl.ignored", "reason=missing_extra_device")
             return
         }
         // address/name 都要 BLUETOOTH_CONNECT；拿不到（或拿到占位 MAC）无法判断是否目标车机
         val address = runCatching { device.address }.getOrNull()
         val name = runCatching { device.name }.getOrNull()
         if (address == null || address.equals(PLACEHOLDER_MAC, ignoreCase = true) || name == null) {
-            Log.i(TAG, "拿不到蓝牙 name/address（缺 BLUETOOTH_CONNECT？）——放弃")
+            trace.event("acl.ignored", "reason=identity_unavailable namePresent=${name != null} addressPresent=${address != null}")
             return
         }
         if (!isTargetCar(app, address, name)) {
-            Log.i(TAG, "忽略非车机蓝牙 $name（$address）")
+            trace.event("acl.ignored", "reason=target_filter policy=${if (SettingsStore.targetCarMac.isNullOrBlank()) "brand_keywords" else "explicit_mac"} deviceTail=${address.takeLast(5)} fallbackKeywords=$CAR_KEYWORDS")
             return
         }
         // iAP2 的「只配对、不连接」会主动断车机音频配置文件（个别 ROM 退到设备级断开），
@@ -63,20 +67,23 @@ class CarBluetoothReceiver : BroadcastReceiver() {
             val now = SystemClock.elapsedRealtime()
             if (now - lastSelfDropLogAt > SELF_DROP_LOG_THROTTLE_MILLIS) {
                 lastSelfDropLogAt = now
-                Log.i(TAG, "忽略 ACL 断开（$name）：iAP2 建链主动断开音频配置文件所致，不按「下车」处理")
+                trace.event("acl.ignored", "reason=self_profile_drop deviceTail=${address.takeLast(5)}")
             }
             return
         }
         val handler = AutoStart.handler
         if (handler == null) {
-            Log.i(TAG, "AutoStart.handler 未注入——放弃")
+            trace.event("acl.ignored", "reason=handler_missing")
             return
         }
         // 转交会话层：connected 区分上车/下车。handler 内部决定 startForegroundService/stop，
         // 并做会话重活。这里只兜底捕获异常（如 ForegroundServiceStartNotAllowedException——
         // Android 12+ 后台 FGS 豁免靠 SYSTEM_ALERT_WINDOW，用户没授悬浮窗时会被拦，只记日志不崩）。
+        trace.event("acl.handoff.begin", "connected=$connected serviceRunning=${HyperCarService.isRunning} deviceTail=${address.takeLast(5)}")
         runCatching { handler(app, device, connected) }
+            .onSuccess { trace.event("acl.handoff.return", "serviceRunning=${HyperCarService.isRunning} foregroundServiceCallbackMayBePending=true") }
             .onFailure { t ->
+                trace.failure("acl.handoff", t)
                 Log.e(
                     TAG,
                     "转交会话层失败（${t.javaClass.simpleName}: ${t.message}）——" +

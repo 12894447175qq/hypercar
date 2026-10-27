@@ -178,6 +178,12 @@ private fun Header(
             }
         }
         Spacer(modifier = Modifier.height(10.dp))
+        Text(
+            text = "界面显示最近 300 行；导出包含保留的日志文件，重启后仍可读取。",
+            style = MaterialTheme.typography.bodySmall,
+            color = TextSecondary,
+        )
+        Spacer(modifier = Modifier.height(8.dp))
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp),

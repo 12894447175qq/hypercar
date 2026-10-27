@@ -9,10 +9,11 @@ import java.util.concurrent.atomic.AtomicBoolean
 data class CarLifeSource(val wakePackage: String, val enginePackage: String = wakePackage) {
     val activity: String? get() = enginePackage.takeIf { it in engines }?.let { "$it/com.baidu.carlife.CarlifeActivity" }
     val service: String? get() = enginePackage.takeIf { it in engines }?.let { "$it/com.baidu.carlife.service.CarlifeConnectService" }
-    val rendererInitialization: String? get() = if (enginePackage == VIVO) {
-        "am start-foreground-service -n $service --es bindPackageName $JOVI" +
-            " --es bindClassName $JOVI_CAST_SERVICE --ei usb_type 13 --ez mix_manual true"
-    } else null
+    val usesBoundRenderer: Boolean get() = enginePackage == VIVO
+
+    /** Jovi's complete CarLife boot flow requires these source permissions. */
+    fun missingRendererPermissions(granted: (String) -> Boolean): List<String> =
+        if (usesBoundRenderer) listOf(FINE_LOCATION, BACKGROUND_LOCATION).filterNot(granted) else emptyList()
 
     companion object {
         const val VIVO = "com.baidu.carlife.vivo"
@@ -20,6 +21,8 @@ data class CarLifeSource(val wakePackage: String, val enginePackage: String = wa
         const val PUBLIC = "com.baidu.carlife"
         const val JOVI = "com.vivo.car.networking"
         const val JOVI_CAST_SERVICE = "com.vivo.vivo_car_service.CarLifeMixingService"
+        const val FINE_LOCATION = "android.permission.ACCESS_FINE_LOCATION"
+        const val BACKGROUND_LOCATION = "android.permission.ACCESS_BACKGROUND_LOCATION"
         private val engines = setOf(PUBLIC, VIVO, XIAOMI)
         val candidates = listOf(PUBLIC, VIVO, XIAOMI, "com.miui.carlink", "com.xiaomi.carlink", "com.hihonor.carlink")
         fun resolve(configured: String, installed: (String) -> Boolean): CarLifeSource? {
@@ -33,26 +36,75 @@ data class CarLifeSource(val wakePackage: String, val enginePackage: String = wa
     }
 }
 
+/** A real renderer connection, owned and released by exactly one session. */
+interface CarLifeRendererLease : AutoCloseable {
+    val isActive: Boolean
+}
+
+/** A cold vendor component can require its own Activity to initialize before binding. */
+internal suspend fun acquireVivoRenderer(
+    acquire: suspend () -> CarLifeRendererLease?,
+    bootstrap: suspend () -> Unit,
+): CarLifeRendererLease {
+    currentCoroutineContext().ensureActive()
+    acquire()?.let { return it }
+    currentCoroutineContext().ensureActive()
+    bootstrap()
+    // The original SDK ignores connectStart calls less than three seconds apart.
+    delay(3_100)
+    currentCoroutineContext().ensureActive()
+    return checkNotNull(acquire()) {
+        "系统仍未接受 vivo CarLife 服务绑定；请先打开来源应用完成初始化，并检查系统的应用启动限制"
+    }
+}
+
 /** Delayed service fallback belongs to this connection, including cancellation and cleanup. */
 class CarLifeWakeSession(val source: CarLifeSource) {
     private val open = AtomicBoolean(true)
     private val used = AtomicBoolean(false)
+    private val rendererLock = Any()
+    private var renderer: CarLifeRendererLease? = null
     val isOpen: Boolean get() = open.get()
     val wasUsed: Boolean get() = used.get()
+    val hasRenderer: Boolean get() = synchronized(rendererLock) { renderer?.isActive == true }
     fun markUsed() { if (isOpen) used.set(true) }
-    fun close() { open.set(false) }
+    fun close() {
+        synchronized(rendererLock) { open.set(false) }
+        releaseRenderer()
+    }
 
-    suspend fun prepareRenderer(exec: suspend (String) -> Unit) {
+    fun releaseRenderer() {
+        val old = synchronized(rendererLock) { renderer.also { renderer = null } }
+        old?.close()
+    }
+
+    suspend fun bindRenderer(acquire: suspend () -> CarLifeRendererLease?): Boolean {
         currentCoroutineContext().ensureActive()
-        if (isOpen) source.rendererInitialization?.let {
-            markUsed()
-            exec(it)
+        if (!isOpen || !source.usesBoundRenderer) return false
+        if (hasRenderer) return true
+        releaseRenderer()
+        val lease = acquire() ?: return false
+        var retained = false
+        try {
+            currentCoroutineContext().ensureActive()
+            synchronized(rendererLock) {
+                if (isOpen && renderer == null) {
+                    renderer = lease
+                    used.set(true)
+                    retained = true
+                }
+            }
+            return isOpen && hasRenderer
+        } finally {
+            // Includes cancellation or close while bindService was completing.
+            if (!retained) lease.close()
         }
     }
 
     suspend fun wake(exec: suspend (String) -> Unit, listening: suspend () -> Boolean) {
         currentCoroutineContext().ensureActive()
         if (!isOpen) return
+        check(!source.usesBoundRenderer) { "vivo CarLife requires a bound renderer, not an Activity/FGS shell launch" }
         markUsed()
         val activity = source.activity
         if (activity == null) {
@@ -63,9 +115,7 @@ class CarLifeWakeSession(val source: CarLifeSource) {
         delay(3_000)
         currentCoroutineContext().ensureActive()
         if (!isOpen) return
-        // vivo opens sockets before its renderer is bound. A listening 7240 is not sufficient.
-        if (source.rendererInitialization != null) prepareRenderer(exec)
-        else if (!listening()) source.service?.let { exec("am start-foreground-service -n $it") }
+        if (!listening()) source.service?.let { exec("am start-foreground-service -n $it") }
     }
 }
 

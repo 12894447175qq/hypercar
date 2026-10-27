@@ -1,6 +1,9 @@
 package io.github.hypercar.session
 
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -9,6 +12,12 @@ import org.junit.Test
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class CarLifeSourceTest {
+    private class Lease : CarLifeRendererLease {
+        var active = true
+        var closes = 0
+        override val isActive: Boolean get() = active
+        override fun close() { closes++; active = false }
+    }
     @Test fun explicitVivoWinsEvenWithCarWithInstalled() {
         val source = CarLifeSource.resolve(CarLifeSource.VIVO) { true }!!
         assertEquals(CarLifeSource.VIVO, source.enginePackage)
@@ -33,34 +42,134 @@ class CarLifeSourceTest {
         assertNull(CarLifeSource.resolve("com.miui.carlink") { it != CarLifeSource.XIAOMI })
         assertNull(CarLifeSource.resolve("com.foo; reboot") { true })
     }
-    @Test fun vivoWakeAndFallbackUseOnlyVivo() = runTest {
-        val commands = mutableListOf<String>()
-        CarLifeWakeSession(CarLifeSource(CarLifeSource.VIVO)).wake({ commands.add(it) }, { false })
-        assertEquals(listOf(
-            "am start -n com.baidu.carlife.vivo/com.baidu.carlife.CarlifeActivity",
-            "am start-foreground-service -n com.baidu.carlife.vivo/com.baidu.carlife.service.CarlifeConnectService" +
-                " --es bindPackageName com.vivo.car.networking" +
-                " --es bindClassName com.vivo.vivo_car_service.CarLifeMixingService --ei usb_type 13 --ez mix_manual true",
-        ), commands)
-    }
-    @Test fun vivoInitializesRendererEvenWhenItsPortsAreAlreadyOpen() = runTest {
-        val commands = mutableListOf<String>()
-        CarLifeWakeSession(CarLifeSource(CarLifeSource.VIVO)).wake({ commands.add(it) }, { true })
-        assertEquals(2, commands.size)
-        assertTrue(commands.last().contains("CarLifeMixingService"))
-        assertFalse(commands.any { it.contains("xiaomi") })
-    }
-    @Test fun existingVivoSocketPreparationDoesNotRestartActivity() = runTest {
+    @Test fun vivoCannotAccidentallyUseTheShellActivityOrFgsPath() = runTest {
         val commands = mutableListOf<String>()
         val session = CarLifeWakeSession(CarLifeSource(CarLifeSource.VIVO))
-        session.prepareRenderer { commands.add(it) }
-        assertEquals(1, commands.size)
-        assertTrue(commands.single().startsWith("am start-foreground-service"))
+        val error = runCatching { session.wake({ commands.add(it) }, { false }) }.exceptionOrNull()
+        assertTrue(error is IllegalStateException)
+        assertTrue(commands.isEmpty())
+        assertFalse(session.wasUsed)
+    }
+    @Test fun vivoBindingIsRetainedUntilDisconnectAndReleasedOnce() = runTest {
+        val session = CarLifeWakeSession(CarLifeSource(CarLifeSource.VIVO))
+        val lease = Lease()
+        assertTrue(session.bindRenderer { lease })
+        assertTrue(session.wasUsed)
+        assertTrue(session.hasRenderer)
+        session.close()
+        session.close()
+        assertEquals(1, lease.closes)
+        assertFalse(session.hasRenderer)
+    }
+    @Test fun existingVivoRendererIsNotBoundTwice() = runTest {
+        val session = CarLifeWakeSession(CarLifeSource(CarLifeSource.VIVO))
+        val lease = Lease()
+        assertTrue(session.bindRenderer { lease })
+        assertTrue(session.bindRenderer { error("must reuse this session's connection") })
+        assertEquals(0, lease.closes)
     }
     @Test fun closedSessionCannotInitializeRenderer() = runTest {
         val session = CarLifeWakeSession(CarLifeSource(CarLifeSource.VIVO))
         session.close()
-        session.prepareRenderer { error("closed connection must not launch Jovi") }
+        assertFalse(session.bindRenderer { error("closed connection must not launch Jovi") })
+    }
+    @Test fun closeWhileBindingCannotRetainALateConnection() = runTest {
+        val session = CarLifeWakeSession(CarLifeSource(CarLifeSource.VIVO))
+        val pending = CompletableDeferred<CarLifeRendererLease?>()
+        val lease = Lease()
+        var accepted = true
+        launch { accepted = session.bindRenderer { pending.await() } }
+        runCurrent()
+        session.close()
+        pending.complete(lease)
+        runCurrent()
+        assertFalse(accepted)
+        assertFalse(session.wasUsed)
+        assertEquals(1, lease.closes)
+    }
+    @Test fun cancellationAfterAcquireStillReleasesTheConnection() = runTest {
+        val session = CarLifeWakeSession(CarLifeSource(CarLifeSource.VIVO))
+        val lease = Lease()
+        val job = launch {
+            session.bindRenderer {
+                currentCoroutineContext().cancel()
+                lease
+            }
+        }
+        runCurrent()
+        assertTrue(job.isCancelled)
+        assertFalse(session.hasRenderer)
+        assertEquals(1, lease.closes)
+    }
+    @Test fun unavailableBindingIsNotReportedAsInitialized() = runTest {
+        val session = CarLifeWakeSession(CarLifeSource(CarLifeSource.VIVO))
+        assertFalse(session.bindRenderer { null })
+        assertFalse(session.hasRenderer)
+        assertFalse(session.wasUsed)
+    }
+    @Test fun warmRendererDoesNotLaunchTheSourceActivity() = runTest {
+        val lease = Lease()
+        assertSame(lease, acquireVivoRenderer({ lease }, { error("warm binding must not relaunch the source") }))
+    }
+    @Test fun coldRendererBootstrapsOnceAndWaitsForTheOriginalSdkThrottle() = runTest {
+        val lease = Lease()
+        val events = mutableListOf<String>()
+        var attempts = 0
+        launch {
+            assertSame(lease, acquireVivoRenderer(
+                { events.add("bind"); if (++attempts == 1) null else lease },
+                { events.add("bootstrap") },
+            ))
+        }
+        runCurrent()
+        assertEquals(listOf("bind", "bootstrap"), events)
+        advanceTimeBy(3_099)
+        assertEquals(1, attempts)
+        advanceTimeBy(1)
+        runCurrent()
+        assertEquals(listOf("bind", "bootstrap", "bind"), events)
+    }
+    @Test fun cancellingBootstrapNeverRetriesTheBinding() = runTest {
+        var attempts = 0
+        var bootstraps = 0
+        val job = launch { acquireVivoRenderer({ attempts++; null }, { bootstraps++ }) }
+        runCurrent()
+        job.cancel()
+        advanceTimeBy(5_000)
+        assertEquals(1, attempts)
+        assertEquals(1, bootstraps)
+    }
+    @Test fun rejectedBootstrapDoesNotLoopOrClaimSuccess() = runTest {
+        var attempts = 0
+        var bootstraps = 0
+        val error = runCatching { acquireVivoRenderer({ attempts++; null }, { bootstraps++ }) }.exceptionOrNull()
+        assertTrue(error is IllegalStateException)
+        assertEquals(2, attempts)
+        assertEquals(1, bootstraps)
+    }
+    @Test fun deadBindingCanBeReplacedWithoutKillingTheEngine() = runTest {
+        val session = CarLifeWakeSession(CarLifeSource(CarLifeSource.VIVO))
+        val old = Lease()
+        assertTrue(session.bindRenderer { old })
+        old.active = false
+        val next = Lease()
+        assertTrue(session.bindRenderer { next })
+        assertEquals(1, old.closes)
+        assertEquals(0, next.closes)
+        session.releaseRenderer()
+        assertEquals(1, next.closes)
+        assertTrue(session.isOpen)
+    }
+    @Test fun vivoPermissionGateNamesOnlyMissingOriginalComponentGrants() {
+        val source = CarLifeSource(CarLifeSource.VIVO)
+        assertEquals(listOf(CarLifeSource.FINE_LOCATION, CarLifeSource.BACKGROUND_LOCATION),
+            source.missingRendererPermissions { false })
+        assertEquals(listOf(CarLifeSource.BACKGROUND_LOCATION),
+            source.missingRendererPermissions { it == CarLifeSource.FINE_LOCATION })
+        assertTrue(source.missingRendererPermissions { true }.isEmpty())
+        for (pkg in listOf(CarLifeSource.PUBLIC, CarLifeSource.XIAOMI)) {
+            assertTrue(CarLifeSource(pkg).missingRendererPermissions { false }.isEmpty())
+        }
     }
     @Test fun listenerAvoidsRestartAndFallback() = runTest {
         val commands = mutableListOf<String>()
@@ -68,7 +177,7 @@ class CarLifeSourceTest {
         assertEquals(1, commands.size)
     }
     @Test fun cancelledWakeNeverStartsServiceOrRelaunchesClosedSession() = runTest {
-        val session = CarLifeWakeSession(CarLifeSource(CarLifeSource.VIVO))
+        val session = CarLifeWakeSession(CarLifeSource(CarLifeSource.PUBLIC))
         val commands = mutableListOf<String>()
         val job = launch { session.wake({ commands.add(it) }, { false }) }
         runCurrent()
@@ -79,7 +188,7 @@ class CarLifeSourceTest {
         assertEquals(1, commands.size)
     }
     @Test fun closedOldSessionNeverRunsItsFallbackEvenIfJobWasNotCancelled() = runTest {
-        val session = CarLifeWakeSession(CarLifeSource(CarLifeSource.VIVO))
+        val session = CarLifeWakeSession(CarLifeSource(CarLifeSource.PUBLIC))
         val commands = mutableListOf<String>()
         launch { session.wake({ commands.add(it) }, { false }) }
         runCurrent()

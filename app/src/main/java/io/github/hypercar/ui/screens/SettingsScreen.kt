@@ -72,6 +72,7 @@ import kotlinx.coroutines.launch
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.hypercar.net.BluetoothMac
 import io.github.hypercar.perm.AppPermissions
 import io.github.hypercar.session.HyperCarRepo
@@ -1105,6 +1106,8 @@ private fun SwitchRow(
 
 @Composable
 private fun WakePackageSection() {
+    val context = LocalContext.current
+    val sourceCheckStatus by HyperCarRepo.sourceCheckStatus.collectAsStateWithLifecycle()
     var pkg by rememberSaveable { mutableStateOf(SettingsStore.carlifePackage) }
     var menuExpanded by remember { mutableStateOf(false) }
     val isPreset = CarLifePackagePresets.any { it.second == pkg }
@@ -1228,6 +1231,25 @@ private fun WakePackageSection() {
                 )
             }
             Spacer(modifier = Modifier.height(6.dp))
+            if (pkg == io.github.hypercar.session.CarLifeSource.VIVO) {
+                Text(
+                    text = "此原厂来源要求精确定位及后台定位。缺少时可能只显示协议提示画面；是否授权由你在系统设置中决定。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextSecondary,
+                )
+                Row {
+                    TextButton(onClick = { HyperCarRepo.startVivoSourceCheck(context) }) {
+                        Text("检查 vivo 来源", color = ElectricCyan)
+                    }
+                    TextButton(onClick = { HyperCarRepo.stopVivoSourceCheck() }) {
+                        Text("停止检查", color = TextSecondary)
+                    }
+                }
+                Text(sourceCheckStatus, style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+            }
+            TextButton(onClick = { HyperCarRepo.openCarLifeSourceSettings(context, pkg) }) {
+                Text("来源应用权限", color = ElectricCyan)
+            }
         }
     }
 }
