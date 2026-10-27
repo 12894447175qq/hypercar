@@ -70,7 +70,12 @@ class HyperCarService : Service() {
             else -> {
                 // 必须用显式 connectedDevice 类型：2 参 startForeground 会拾取 manifest 声明的
                 // 全部类型，Android 14 对 mediaProjection 校验 AppOps 会直接崩（本服务无投影）。
-                startForegroundSafe()
+                if (!startForegroundSafe()) {
+                    isRunning = false
+                    releaseLocks()
+                    stopSelf(startId)
+                    return START_NOT_STICKY
+                }
                 acquireLocks()
                 isRunning = true
                 // 转交 handler 触发会话（重活在 handler 内）。receiver 路径已在 handler 里
@@ -91,50 +96,20 @@ class HyperCarService : Service() {
         super.onDestroy()
     }
 
-    /**
-     * 5s 内进入前台。
-     *
-     * **必须带上 microphone 类型**（权限已授权时）：语音助手要手机供麦（AudioRecord），
-     * 而 Android 14+ 禁止「只有 connectedDevice 类型的 FGS」在后台录音——表现为
-     * AudioRecord 静默返回 0 或直接 SecurityException（2026-10-25 定谳）。
-     * 类型与 manifest 的 `connectedDevice|microphone` 对应；失败时退回纯 connectedDevice，
-     * 至少保证会话能进前台（麦克风随后会在 AudioRecord 处再报一次原因）。
-     */
-    private fun startForegroundSafe() {
-        val micGranted =
-            androidx.core.content.ContextCompat.checkSelfPermission(
-                this,
-                android.Manifest.permission.RECORD_AUDIO,
-            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-        val types =
-            if (android.os.Build.VERSION.SDK_INT >= 30 && micGranted) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-            } else {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-            }
-        try {
-            trace.event("foreground.request", "types=$types micGranted=$micGranted")
+    /** voice=0，由原厂 CarLife 使用手机麦克风；仅申请连接保活类型。 */
+    private fun startForegroundSafe(): Boolean {
+        val types = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+        return try {
+            trace.event("foreground.request", "types=$types microphoneRelay=false")
             ServiceCompat.startForeground(this, NOTIFICATION_ID, buildNotification(), types)
             trace.event("foreground.promoted", "types=$types")
-        } catch (t: Throwable) {
-            trace.failure("foreground.promote", t)
-            Log.e(TAG, "startForeground（含 microphone 类型）失败：${t.message}，退回 connectedDevice")
-            try {
-                ServiceCompat.startForeground(
-                    this,
-                    NOTIFICATION_ID,
-                    buildNotification(),
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
-                )
-                trace.event("foreground.fallback_promoted", "types=connectedDevice")
-            } catch (t2: Throwable) {
-                trace.failure("foreground.fallback", t2)
-                Log.e(TAG, "startForeground 失败：${t2.message}")
-            }
+            true
+        } catch (error: Throwable) {
+            trace.failure("foreground.promote", error)
+            Log.e(TAG, "连接保活服务未能进入前台，停止本轮启动", error)
+            false
         }
     }
-
     /** 息屏/WiFi 保活锁：CPU 唤醒锁维持会话线程与心跳；WiFi 低延迟锁避免激进省电断流。 */
     private fun acquireLocks() {
         if (wakeLock?.isHeld == true && wifiLock?.isHeld == true) return

@@ -278,6 +278,8 @@ object SettingsStore {
             append("\"height\":").append(carlifeHeight.coerceAtLeast(2) / 2 * 2).append(",")
             append("\"fps\":").append(carlifeFps).append(",")
             append("\"enable_audio\":").append(enableAudio).append(",")
+            // voice=0：由原厂 CarLife 使用手机麦克风，Hypercar 不重复采集。
+            append("\"voice\":0,")
             append("\"keep_alive_stats\":").append(keepAliveStats).append(",")
             // 主动拨号模式：探测到本机 CarLife（MD）自己在 7240 监听时传 "127.0.0.1"，
             // Rust 就会逐个拨这 6 条通道，而不是去 bind（两边抢端口必有一边 EADDRINUSE）。

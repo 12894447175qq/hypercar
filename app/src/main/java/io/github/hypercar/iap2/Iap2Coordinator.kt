@@ -27,6 +27,7 @@ data class CarPlayEndpoint(
     val ipAddresses: List<String>,
     val gateway: String?,
     val fromInvite: Boolean = false,
+    val securityType: Int? = null,
 )
 
 /**

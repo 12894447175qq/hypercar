@@ -1,18 +1,20 @@
 # 真机日志保存、导出与排查
 
-本轮日志增强版本基线为 `0.1.1 / 50000`。记录的是实际执行的步骤、返回值和异常，
+本轮车测包为 `0.1.1.2 / 50002`，已于 2026-10-28 自动安装到 vivo 手机。记录的是实际执行的步骤、返回值和异常，
 不会仅凭服务绑定或编码帧数量把 Jovi 桌面、车机显示标记为成功。
 
 ## 安装与交付文件
 
-本地交付目录为 `release/v50000/`，其中的
-`HyperCar-0.1.1-v50000-diagnostic-test.apk` 就是供手机手动安装的最终测试包。
+本机交付目录为 `F:\project\artifacts\hypercar-release\20261027-v50002\`，其中的
+`HyperCar-0.1.1.2-v50002-vivo-MIB3-test.apk` 为已安装的同一测试包。
 APK 通过聊天文件链接交付，不写入 Git 历史，也未自动发布 Release。
-版本、签名和校验值见[构建信息](artifacts/v50000.json)。
+版本、签名和校验值见[构建信息](artifacts/v50002.json)，三轮复核及完成/阻塞清单见[修复清单](V50002-CHECKLIST.md)。
 
-此包与此前手机安装的本机测试版签名一致，可直接覆盖升级，保留设置和日志，无需先清数据。
-安装后在诊断/版本信息中确认版本码为 `50000`。如果系统提示签名冲突，应保留现有数据并反馈提示，
-不要为了安装而直接卸载。手机安装与实车测试由用户自行执行。
+此包使用本机保存的新测试签名，与原 Mac 包不同。用户已同意重新初始化 Hypercar 数据：
+已备份原 50000 APK 和六份旧导出，仅卸载重装 `io.github.hypercar`；未卸载或清除
+vivo CarLife / Jovi。安装后版本码已确认是 `50002`，已恢复 Audi MIB3、已配对车机、vivo 来源和诊断记录。
+只恢复此前已允许的权限。vivo/Jovi 的版本、UID、启用状态和数据目录标识与安装前一致。
+冷启动、应用环境的连接服务启停和新版本日志导出均通过，实车显示仍待验收。
 
 对应的 R8 映射压缩保留为 `mapping.txt.gz`，供后续分析异常栈，不需要安装到手机。
 vivo / Jovi 的已知阻塞和验收顺序见[测试状态](VIVO-MIB3.md)。
@@ -40,7 +42,7 @@ vivo / Jovi 的已知阻塞和验收顺序见[测试状态](VIVO-MIB3.md)。
 | 优先级 | 场景 | 新增信息及用途 |
 | --- | --- | --- |
 | P0 | 蓝牙连上但 Hypercar 无反应 | `acl.received/ignored/handoff`：是否收到广播、自动连接开关、目标过滤方式、缺少设备信息、是否成功转交；蓝牙地址仅保留尾部 |
-| P0 | 后台启动被系统拒绝 | `foreground.*`：服务 action、startId、前台类型、录音权限状态、失败栈、回退结果 |
+| P0 | 后台启动被系统拒绝 | `foreground.*`：服务 action、startId、前台类型、失败栈和结果；50002 使用 connectedDevice，原厂取麦，Hypercar 不再重复请求 microphone 类型 |
 | P0 | vivo 来源初始化失败或重复绑定 | `initialize/bind/wake/unbind`：来源/Jovi 版本和 UID、启用/停止状态、屏幕/锁屏、进程重要性、定位授权、绑定 action、回调、8 秒超时、Shizuku 返回及 3.1 秒重试 |
 | P0 | 原厂提示页一直不消失 | 明确记录仅初始化了渲染服务、原厂完整授权/设备会话状态不可经此公共入口观察；需要结合原厂日志和实际画面，不能伪造授权成功 |
 | P1 | 手机已连接热点但车机无显示 | `wifi.*`、端口归属、网络句柄、绑定结果和失败类型；原有 iAP2/MFi、公告、发现、配对、SETUP、RECORD 日志保留并带本轮连接编号 |
@@ -76,17 +78,18 @@ Jovi 原厂进程没有重新打包或修改，无法在保持原签名的同时
 新增 `LogExportReceiver` 由 `android.permission.DUMP` 保护，只允许具备该权限的调用方
 （如 ADB shell）触发，普通第三方应用不能借此导出日志。该入口不启动或重建车载连接。
 
-先运行 `adb -P 5038 devices -l` 获取当前 `transport_id`，替换以下 `TRANSPORT_ID`：
+先运行 `adb devices -l` 获取当前 `transport_id`，替换以下 `TRANSPORT_ID`：
 
 ```bash
-adb -P 5038 -t TRANSPORT_ID shell am broadcast --user 0 --include-stopped-packages \
+adb -t TRANSPORT_ID shell am broadcast --receiver-foreground --user 0 --include-stopped-packages \
   -a io.github.hypercar.EXPORT_LOGS \
   -n io.github.hypercar/.session.LogExportReceiver
-adb -P 5038 -t TRANSPORT_ID shell ls -lt /sdcard/Download/HyperCar/
-adb -P 5038 -t TRANSPORT_ID pull /sdcard/Download/HyperCar/实际文件名.txt .
+adb -t TRANSPORT_ID shell ls -lt /sdcard/Download/HyperCar/
+adb -t TRANSPORT_ID pull /sdcard/Download/HyperCar/实际文件名.txt .
 ```
 
-本机使用 5038 是为了避开其他软件占用的 ADB 服务；不应沿用旧的手机 IP、配对端口或配对码。
+本轮 ADB 使用默认端口 5037；若使用另一台电脑的自定义 ADB 服务，按该电脑配置处理。
+不应沿用旧的手机 IP、配对端口或配对码。
 示例显式包含停止状态的目标包，避免刚安装或被强行停止的应用漏收广播；参见
 [Android Intent 标志说明](https://developer.android.com/reference/android/content/Intent#FLAG_INCLUDE_STOPPED_PACKAGES)。
 导出包含保留的历史记录，文件头记录应用版本、设备系统、行数和文件写入失败计数。
@@ -94,10 +97,14 @@ ADB 连通不代表已完成车机测试；导出成功也不代表 Jovi 桌面�
 
 ## 验证边界
 
-本地 45 项单元测试已通过，覆盖文件保留、完整读取、轮转、UTF-8 边界、清空、采样、编号和脱敏。
-Lint 为 0 Error / Fatal，仍有 31 Warning、2 Information。最终 APK 的版本码、签名、SHA-256
-和 arm64 库均已核对；构建源码为 `30cff45f68b736b86f7485c60a3045dd5bf0565f`。
+v50002 的 54 项应用单元测试、12 项 Rust 回归均通过，正式压缩构建通过；Lint 为 0 errors / 27 warnings。
+手机独立进程完成 100 次 TCP/100 次 UDP 描述符交接（句柄数 69→69）和 10 轮 JNI 启停。
+最终 APK 的版本、签名及内含 arm64 库均核对，见[本次构建信息](artifacts/v50002.json)。
 
-本版手机安装、日志导出回读及实车效果尚未验证。收到车测文件后，必须确认它是本次新生成，
-版本头为 `50000`，并包含本次 TRACE；旧文件存在或广播返回成功不能代替这一核对。
-旧测试包、临时采样、下载和构建缓存已清理，只保留最终交付物、匹配映射及必要恢复备份。
+已安装本版 APK，并在应用自身环境验证 connectedDevice 服务提升成功、停止后 CPU/Wi-Fi 锁释放。
+冷启动成功，测试采样未见 FATAL/JNI 错误。安装后导出文件头为 `50002`、文件写入失败数为 0；
+该导出只覆盖无车环境的服务验证，不能代替原厂完整初始化或实车桌面、音频、触控和重连验收。
+
+收到车测文件后，必须确认它是新生成，版本头为 `50002`，并包含本次 TRACE。
+Android 16 曾将后台导出广播标为 DEFERRED；示例加入前台广播标志，仍应核对新文件，不能只看广播返回值。
+v50000、v50001 的历史构建记录保留在各自构建信息中，不代表本轮验证结果。

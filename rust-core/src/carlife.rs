@@ -1,4 +1,4 @@
-﻿//! CarLife HU（车机）侧网关——严格按 CarLifeWirelessBox / apollo-DuerOS 的 HU 实现重构。
+//! CarLife HU（车机）侧网关——严格按 CarLifeWirelessBox / apollo-DuerOS 的 HU 实现重构。
 //!
 //! 我们扮演「车机」，本机 CarLife / CarWith(CarLife 兼容) / 荣耀车联 作为「手机(MD)」连回
 //! 127.0.0.1 的一组标准端口。
@@ -34,7 +34,8 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
+use crate::session::{spawn_scoped, SessionStop};
 
 use crate::engine::CarLifeEvent;
 use crate::{emit_log, emit_state};
@@ -158,12 +159,13 @@ pub struct CarLifeHub {
 impl CarLifeHub {
     pub fn start(
         cfg: CarLifeConfig,
-        stop: Arc<Notify>,
+        stop: Arc<SessionStop>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<CarLifeEvent>), String> {
         let (events, event_rx) = mpsc::unbounded_channel();
         let (touch_tx, touch_rx) = mpsc::unbounded_channel();
-        let (mic_tx, mut mic_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (mic_tx, mic_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let voice = cfg.voice;
+        let first_frame = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // 初始值取设置；AirPlay 的 /info 报到车机真实尺寸后会覆盖它，
         // 手机在 INIT_DONE 里回报实际编码尺寸后再次覆盖。
         let encoder_size: Arc<Mutex<(u32, u32)>> =
@@ -179,6 +181,7 @@ impl CarLifeHub {
             let bt_name = cfg.bt_name.clone();
             let size = encoder_size.clone();
             let stop_c = stop.clone();
+            let frame_c = first_frame.clone();
             move |stream| {
                 handle_cmd_client(
                     stream,
@@ -189,16 +192,17 @@ impl CarLifeHub {
                     bt_address.clone(),
                     bt_name.clone(),
                     stop_c.clone(),
+                    frame_c.clone(),
                 )
             }
         });
 
         // ---- VIDEO 8240 ----
-        spawn_media_channel(PORT_VIDEO, "VIDEO", events.clone(), stop.clone(), MediaKind::Video);
+        spawn_media_channel(PORT_VIDEO, "VIDEO", events.clone(), stop.clone(), MediaKind::Video, first_frame.clone());
         // ---- MEDIA 9240 ----
-        spawn_media_channel(PORT_MEDIA, "MEDIA", events.clone(), stop.clone(), MediaKind::Media);
+        spawn_media_channel(PORT_MEDIA, "MEDIA", events.clone(), stop.clone(), MediaKind::Media, first_frame.clone());
         // ---- TTS 9241 ----
-        spawn_media_channel(PORT_TTS, "TTS", events.clone(), stop.clone(), MediaKind::Tts);
+        spawn_media_channel(PORT_TTS, "TTS", events.clone(), stop.clone(), MediaKind::Tts, first_frame.clone());
         // ---- VR 9242：只读保活，不消费 ----
         spawn_vr_listener(PORT_VR, "VR", mic_rx, stop.clone());
 
@@ -243,12 +247,13 @@ impl CarLifeHub {
     pub fn connect(
         cfg: CarLifeConfig,
         md_host: String,
-        stop: Arc<Notify>,
+        stop: Arc<SessionStop>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<CarLifeEvent>), String> {
         let (events, event_rx) = mpsc::unbounded_channel();
         let (touch_tx, touch_rx) = mpsc::unbounded_channel();
         let (mic_tx, mut mic_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let voice = cfg.voice;
+        let first_frame = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let encoder_size: Arc<Mutex<(u32, u32)>> =
             Arc::new(Mutex::new((cfg.width.max(2), cfg.height.max(2))));
 
@@ -261,7 +266,8 @@ impl CarLifeHub {
             let fps = cfg.fps;
             let bt_address = cfg.bt_address.clone();
             let bt_name = cfg.bt_name.clone();
-            tokio::spawn(async move {
+            let frame_c = first_frame.clone();
+            spawn_scoped(stop.clone(), async move {
                 let mut throttle = DialLogThrottle::new();
                 loop {
                     tokio::select! {
@@ -278,6 +284,7 @@ impl CarLifeHub {
                                     bt_address.clone(),
                                     bt_name.clone(),
                                     stop_c.clone(),
+                                    frame_c.clone(),
                                 )
                                 .await;
                                 emit_log("CARLIFE: CMD 通道断开，1s 后重连");
@@ -309,7 +316,8 @@ impl CarLifeHub {
             let events = events.clone();
             let stop_c = stop.clone();
             let host = md_host.clone();
-            tokio::spawn(async move {
+            let frame_c = first_frame.clone();
+            spawn_scoped(stop.clone(), async move {
                 // 官方实现（CConnectionSetupModule.cpp）是**握手前**就把 VIDEO 建好：
                 // CMD → VIDEO → MEDIA → TTS → VR → CTRL。所以这里不再延迟 VIDEO。
                 // 唯一保留的防护：连续被对端关闭时逐步退避（1.5s → 3s → 5s 封顶），
@@ -332,7 +340,7 @@ impl CarLifeHub {
                     };
                     emit_log(&format!("CARLIFE: ✓ {name} 已连上 MD {host}:{port}"));
                     match kind {
-                        Some(k) => handle_media_client(stream, events.clone(), k, name).await,
+                        Some(k) => handle_media_client(stream, events.clone(), k, name, frame_c.clone()).await,
                         None => drain_stream(stream).await,
                     }
                     let base_ms: u64 = if matches!(kind, Some(MediaKind::Video)) { 1_500 } else { 1_000 };
@@ -352,7 +360,7 @@ impl CarLifeHub {
         {
             let stop_c = stop.clone();
             let host = md_host.clone();
-            tokio::spawn(async move {
+            spawn_scoped(stop.clone(), async move {
                 let mut throttle = DialLogThrottle::new();
                 loop {
                     let stream = tokio::select! {
@@ -383,7 +391,7 @@ impl CarLifeHub {
             {
                 let queue = queue.clone();
                 let stop_fill = stop.clone();
-                tokio::spawn(async move {
+                spawn_scoped(stop.clone(), async move {
                     let mut touch_rx = touch_rx;
                     loop {
                         tokio::select! {
@@ -404,7 +412,7 @@ impl CarLifeHub {
             }
             let stop_c = stop.clone();
             let host = md_host.clone();
-            tokio::spawn(async move {
+            spawn_scoped(stop.clone(), async move {
                 let mut throttle = DialLogThrottle::new();
                 loop {
                     let stream = tokio::select! {
@@ -707,13 +715,14 @@ async fn handle_cmd_client(
     voice: u32,
     bt_address: String,
     bt_name: String,
-    stop: Arc<Notify>,
+    stop: Arc<SessionStop>,
+    first_frame: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let (mut rd, mut wr) = stream.into_split();
     let mut hs = Handshake::default();
     let mut start_retries: u32 = 0;
     // 本会话重新计"首帧"：上一轮的 true 不能让这一轮的补发逻辑失效
-    VIDEO_FIRST_FRAME_RECEIVED.store(false, std::sync::atomic::Ordering::Relaxed);
+    first_frame.store(false, std::sync::atomic::Ordering::Relaxed);
 
     // Phase 1：HU 主动发协议版本
     if !send_cmd(&mut wr, CMD_HU_PROTOCOL_VERSION, &proto_version_payload()).await {
@@ -745,7 +754,7 @@ async fn handle_cmd_client(
             _ = tick.tick() => {
                 if !hs.encoder_start_sent {
                     emit_log(&format!("CARLIFE: 握手进行中（{}）", hs.phase_name()));
-                } else if !VIDEO_FIRST_FRAME_RECEIVED.load(std::sync::atomic::Ordering::Relaxed)
+                } else if !first_frame.load(std::sync::atomic::Ordering::Relaxed)
                     && start_retries < 12
                 {
                     // START 可能发在"CarLife 还在后台、Surface 未就绪"的时刻被吞掉，
@@ -832,7 +841,7 @@ async fn handle_cmd_client(
                         // 依据：官方 HU 是 setFeature(key,value) 后回 listFeatures()，
                         // 如果 MD 请求里某些"能力位"是 0，原样回 0 等于告诉它"车机没有这个能力"，
                         // 它可能因此不建渲染源（Qin:0 的另一条候选解释）。
-                        let mut asked: Vec<(String, u32)> = asked_raw
+                        let asked: Vec<(String, u32)> = asked_raw
                             .into_iter()
                             .map(|(k, v)| (k, if v == 0 { 1 } else { v }))
                             .collect();
@@ -1251,8 +1260,9 @@ fn spawn_media_channel(
     port: u16,
     name: &'static str,
     events: mpsc::UnboundedSender<CarLifeEvent>,
-    stop: Arc<Notify>,
+    stop: Arc<SessionStop>,
     kind: MediaKind,
+    first_frame: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let listener = match bind_tcp(port) {
         Ok(l) => l,
@@ -1262,7 +1272,7 @@ fn spawn_media_channel(
         }
     };
     spawn_single_client_server(listener, stop, name, move |stream| {
-        handle_media_client(stream, events.clone(), kind, "VIDEO")
+        handle_media_client(stream, events.clone(), kind, name, first_frame.clone())
     });
 }
 
@@ -1272,6 +1282,7 @@ async fn handle_media_client(
     events: mpsc::UnboundedSender<CarLifeEvent>,
     kind: MediaKind,
     label: &'static str,
+    first_frame: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let (mut rd, mut wr) = stream.into_split();
     let is_video = matches!(kind, MediaKind::Video);
@@ -1295,7 +1306,9 @@ async fn handle_media_client(
         let read = tokio::select! {
             _ = hb.tick(), if is_video => {
                 let frame = build_media_frame(VIDEO_HEARTBEAT, now_ms(), &[]);
-                if wr.write_all(&frame).await.is_err() {
+                if let Err(e) = wr.write_all(&frame).await {
+                    emit_log(&format!("CARLIFE: {label} 心跳写失败 kind={:?} os={:?}: {e}", e.kind(), e.raw_os_error()));
+                    first_frame.store(false, std::sync::atomic::Ordering::Relaxed);
                     return;
                 }
                 hb_sent += 1;
@@ -1308,6 +1321,8 @@ async fn handle_media_client(
         };
         match read {
             Ok(0) => {
+                emit_log(&format!("CARLIFE: {label} TCP EOF"));
+                if is_video { first_frame.store(false, std::sync::atomic::Ordering::Relaxed); }
                 let _ = events.send(CarLifeEvent::ClientLeft { video: is_video });
                 return;
             }
@@ -1325,7 +1340,14 @@ async fn handle_media_client(
                 }
                 buf.extend_from_slice(&chunk[..n])
             }
-            Err(_) => return,
+            Err(e) => {
+                emit_log(&format!("CARLIFE: {label} 读取失败 kind={:?} os={:?}: {e}", e.kind(), e.raw_os_error()));
+                if is_video {
+                    first_frame.store(false, std::sync::atomic::Ordering::Relaxed);
+                    let _ = events.send(CarLifeEvent::ClientLeft { video: true });
+                }
+                return;
+            }
         }
         if buf.len() > 8 * 1024 * 1024 {
             buf.clear();
@@ -1337,10 +1359,12 @@ async fn handle_media_client(
                     VIDEO_DATA => {
                         if !payload.is_empty() {
                             // 首帧到达：CMD 侧的 START 补发逻辑据此停止
-                            VIDEO_FIRST_FRAME_RECEIVED
-                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            if crate::screen::annexb_nals(&payload).iter().any(|nal|
+                                matches!(crate::screen::nal_type(nal), 1 | 5)) {
+                                first_frame.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
                             let _ = events.send(CarLifeEvent::VideoFrame {
-                                pts_us: ts_ms as u64 * 1000,
+                                source_timestamp: ts_ms,
                                 data: payload,
                             });
                         }
@@ -1405,11 +1429,6 @@ async fn handle_media_client(
 fn even(v: u32) -> u32 {
     (v / 2) * 2
 }
-
-/// 是否已经从 8240 收到过至少一帧 H.264（没收到前，CMD 侧会周期性补发
-/// VIDEO_ENCODER_START，避免"START 发出时 CarLife 还在后台、Surface 未就绪"被吞掉）。
-pub(crate) static VIDEO_FIRST_FRAME_RECEIVED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 /// 把请求的编码分辨率规整成手机硬件编码器更稳的尺寸：
 ///  **宽高都向 16 取整**（H.264 宏块 16×16；744 这种 744/16=46.5 的非整数高度，
@@ -1535,14 +1554,14 @@ fn read_varint(bytes: &[u8]) -> (Option<u64>, usize) {
 fn spawn_ctrl_channel(
     port: u16,
     mut touch_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    stop: Arc<Notify>,
+    stop: Arc<SessionStop>,
 ) {
     // 注入帧先进队列，客户端在线时按 8ms 节拍刷出
     let queue: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     {
         let queue = queue.clone();
         let stop_fill = stop.clone();
-        tokio::spawn(async move {
+        spawn_scoped(stop.clone(), async move {
             loop {
                 tokio::select! {
                     _ = stop_fill.notified() => return,
@@ -1568,7 +1587,7 @@ fn spawn_ctrl_channel(
             return;
         }
     };
-    tokio::spawn(async move {
+    spawn_scoped(stop.clone(), async move {
         loop {
             tokio::select! {
                 _ = stop.notified() => return,
@@ -1641,7 +1660,7 @@ async fn drain_stream(mut stream: TcpStream) {
 async fn ctrl_write_loop(
     mut stream: TcpStream,
     queue: Arc<Mutex<Vec<Vec<u8>>>>,
-    stop: Arc<Notify>,
+    stop: Arc<SessionStop>,
 ) {
     loop {
         let frame = {
@@ -1679,8 +1698,8 @@ async fn ctrl_write_loop(
 ///    **可读文本** `127.0.0.1:7240`（含 NUL）。不认识它的版本只会丢弃 UDP 包，无害。
 ///  - 同时尝试 bind `0.0.0.0:7999` 收包：如果 MD 真的往这里广播，把前几包打成 hex
 ///    打进日志——真抓到包就能反推它到底要什么格式（到时候再按真实报文改）。
-fn spawn_discovery_beacon(stop: Arc<Notify>) {
-    tokio::spawn(async move {
+fn spawn_discovery_beacon(stop: Arc<SessionStop>) {
+    spawn_scoped(stop.clone(), async move {
         const DISCOVERY_PORT: u16 = 7999;
         // 广播里必须放**局域网 IP**，不能放 127.0.0.1：com.miui.carlink 拿到 127.0.0.1
         // 会认为主机就是自己、直接忽略（2026-10-26 00:04 现场：它只在 UDP 7999 反复问，
@@ -1849,14 +1868,14 @@ fn bind_tcp(port: u16) -> Result<TcpListener, std::io::Error> {
 
 fn spawn_single_client_server<F, Fut>(
     listener: TcpListener,
-    stop: Arc<Notify>,
+    stop: Arc<SessionStop>,
     name: &'static str,
     handler: F,
 ) where
     F: Fn(TcpStream) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(async move {
+    spawn_scoped(stop.clone(), async move {
         let handler = Arc::new(handler);
         let mut current: Option<tokio::task::JoinHandle<()>> = None;
         loop {
@@ -1871,7 +1890,7 @@ fn spawn_single_client_server<F, Fut>(
                         if let Some(h) = current.take() { h.abort(); }
                         emit_log(&format!("CARLIFE: {name} 客户端已接入"));
                         let handler = handler.clone();
-                        current = Some(tokio::spawn(async move { handler(stream).await }));
+                        current = Some(spawn_scoped(stop.clone(), async move { handler(stream).await }));
                     }
                     Err(_) => return,
                 },
@@ -1888,7 +1907,7 @@ async fn vr_loop(
     mut stream: TcpStream,
     mic_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
     name: &'static str,
-    stop: Arc<Notify>,
+    stop: Arc<SessionStop>,
 ) {
     let (mut rd, mut wr) = stream.split();
     let mut buf = [0u8; 2048];
@@ -1924,13 +1943,13 @@ fn spawn_vr_listener(
     port: u16,
     name: &'static str,
     mut mic_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    stop: Arc<Notify>,
+    stop: Arc<SessionStop>,
 ) {
     let listener = match bind_tcp(port) {
         Ok(l) => l,
         Err(_) => return,
     };
-    tokio::spawn(async move {
+    spawn_scoped(stop.clone(), async move {
         loop {
             tokio::select! {
                 _ = stop.notified() => return,

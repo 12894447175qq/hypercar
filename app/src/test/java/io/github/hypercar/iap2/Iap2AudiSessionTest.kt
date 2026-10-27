@@ -29,7 +29,7 @@ class Iap2AudiSessionTest {
                         respond(if (length == signatureLength) 0xaa03 else 0xaa04, byteArrayOf(1))
                     }
                     0x5702 -> if (emitWifi) respond(0x5703,
-                        Iap2Csm.string(1, "Audi-fixture") + Iap2Csm.string(2, "synthetic-only"))
+                        Iap2Csm.string(1, "Audi-fixture") + Iap2Csm.string(2, "synthetic-only") + Iap2Csm.u8(3, 2))
                 }
             }
             return true
@@ -48,6 +48,7 @@ class Iap2AudiSessionTest {
         assertEquals(listOf(20), receiver.challenges)
         assertTrue(logs.any { "rx=0xaa03" in it })
         assertEquals("Audi-fixture", result.ssid)
+        assertEquals(2, result.securityType)
         assertTrue(result.ipAddresses.isEmpty()) // Network discovery, rather than a fabricated 0x4301, supplies the IP.
     }
 

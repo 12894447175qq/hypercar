@@ -20,6 +20,7 @@ import io.github.hypercar.diagnostics.LogSanitizer
 import io.github.hypercar.diagnostics.RollingLogFile
 import io.github.hypercar.iap2.CarPlayEndpoint
 import io.github.hypercar.iap2.Iap2Coordinator
+import io.github.hypercar.iap2.VirtualIap2Session
 import io.github.hypercar.net.BluetoothMac
 import io.github.hypercar.net.AirplayServiceProbe
 import io.github.hypercar.net.CarPlayCtrlAdvertiser
@@ -71,6 +72,34 @@ object HyperCarRepo {
     val snapshots: StateFlow<SessionSnapshot> = _snapshots.asStateFlow()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val nativeGate = NativeSessionGate()
+    private var virtualIap: VirtualIap2Session? = null
+    private var virtualIapJob: Job? = null
+
+    private fun closeVirtualIap() {
+        virtualIapJob?.cancel()
+        virtualIapJob = null
+        virtualIap?.close()
+        virtualIap = null
+    }
+
+    private fun startNative(config: String, fd: Int, ownerTrace: ConnectionTrace? = connectionTrace): Boolean {
+        var transferred = false
+        return try {
+            nativeGate.startIf({ sessionLive.get() && connectionTrace === ownerTrace }) { generation ->
+                closeVirtualIap()
+                ownerTrace?.event("native.start", "generation=$generation")
+                transferred = true
+                RustCoreBridge.nativeStart(config, fd, socketProvider, generation)
+            }
+        } finally {
+            if (!transferred) runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
+        }
+    }
+
+    private fun stopNative() {
+        nativeGate.stop { closeVirtualIap(); RustCoreBridge.nativeStop() }
+    }
     @Volatile private var connectionTrace: ConnectionTrace? = null
     @Volatile private var sourceCheckTrace: ConnectionTrace? = null
     @Volatile private var lastFrameProgressAt = 0L
@@ -134,7 +163,8 @@ object HyperCarRepo {
         }
         log("EXPERIMENT: 开始启动 iAP2（若紧接着出现 BT: 启动… 说明共存尝试开始）")
     }
-    private fun retryAirplayOrFail(detail: String) {
+    private fun retryAirplayOrFail(detail: String, ownerTrace: ConnectionTrace? = connectionTrace) {
+        if (connectionTrace !== ownerTrace || !sessionLive.get()) return
         // 车机主动关掉控制通道时**不要重试同一个端点**：它紧接着会把 7000 的监听也关掉，
         // 之后每次重试都是 ECONNREFUSED（2026-10-25 22:32 现场：6 轮 × 2.5s 全是拒连，
         // 既没意义，还占着「等车机重新发起 iAP2」的时间窗）。
@@ -164,14 +194,18 @@ object HyperCarRepo {
                 "第 $attempt/$AIRPLAY_MAX_ATTEMPTS 次原地重试",
         )
         push(link = LinkState.Negotiating("AirPlay 重试 $attempt/$AIRPLAY_MAX_ATTEMPTS"))
+        runCatching { stopNative() }
         scope.launch {
-            runCatching { RustCoreBridge.nativeStop() }
             delay(AIRPLAY_RETRY_DELAY_MILLIS)
-            if (!sessionLive.get()) return@launch
+            if (!sessionLive.get() || connectionTrace !== ownerTrace) return@launch
             val context = appContext() ?: return@launch
             val fd = openControlFd(context, host!!, port)
             if (fd == null || fd < 0) {
-                retryAirplayOrFail("控制端口重连失败 $host:$port")
+                retryAirplayOrFail("控制端口重连失败 $host:$port", ownerTrace)
+                return@launch
+            }
+            if (!sessionLive.get() || connectionTrace !== ownerTrace) {
+                runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
                 return@launch
             }
             val identityFile = context.filesDir.resolve("controller_identity.txt")
@@ -179,9 +213,9 @@ object HyperCarRepo {
             val identityPath = identityFile.absolutePath
             val json = SettingsStore.engineConfigJson(host, port, sessionDeviceMac, identityPath, sessionMdHost)
             log("CORE: 重试 nativeStart（$host:$port fd=$fd，第 $attempt 次）")
-            val started = RustCoreBridge.nativeStart(json, fd, socketProvider)
+            val started = startNative(json, fd, ownerTrace)
             log("CORE: 重试 nativeStart 返回 $started")
-            if (!started) retryAirplayOrFail("核心层重启失败")
+            if (!started) retryAirplayOrFail("核心层重启失败", ownerTrace)
         }
     }
 
@@ -424,6 +458,7 @@ object HyperCarRepo {
             log("CONNECT: 已在连接/已连接，忽略重复触发")
             return
         }
+        runCatching { stopNative() }
         stopVivoSourceCheck()
         // 手动/自动发起连接都算"用户想要连"，清掉断开标记与重连倒计时
         userDisconnectRequested = false
@@ -443,9 +478,11 @@ object HyperCarRepo {
     }
 
     fun disconnect() {
+        val ownerTrace = connectionTrace
         connectionTrace?.event("disconnect.request", "connecting=$connecting streaming=$streaming live=${sessionLive.get()}")
         stopVivoSourceCheck()
         carLifeSession?.close()
+        runCatching { stopNative() }
         wakeJob?.cancel()
         // 用户主动断开：不再自动重连
         userDisconnectRequested = true
@@ -460,7 +497,7 @@ object HyperCarRepo {
         pending?.cancel()
         scope.launch {
             withTimeoutOrNull(JOIN_TIMEOUT_MILLIS) { pending?.join() }
-            runDisconnect("用户/系统断开")
+            runDisconnect("用户/系统断开", ownerTrace)
         }
     }
 
@@ -471,7 +508,7 @@ object HyperCarRepo {
         // 设备/系统/SDK/App 版本了（反馈出去的日志无法定位版本，2026-10-25 实测踩到）。
         // 不走 log()：它在「记录已暂停」时会直接丢弃，而这一行恰恰是最该保留的。
         val ctx = appCtx ?: return
-        val stamp = logTimeFormat.get().format(java.util.Date())
+        val stamp = requireNotNull(logTimeFormat.get()).format(java.util.Date())
         val env = "$stamp  ENV: ${DeviceInfo.fullSummary(ctx)}"
         appendDiskLog(env)
         _snapshots.update { it.copy(recentLogs = it.recentLogs + env) }
@@ -480,6 +517,8 @@ object HyperCarRepo {
     // ---------------------------------------------------------------- 连接主流程
 
     private suspend fun runConnect(context: Context) {
+        val ownerTrace = connectionTrace
+        var untransferredFd: Int? = null
         try {
             sourceVideoConfirmed.set(false)
             lastFrameProgressAt = 0L
@@ -752,6 +791,7 @@ object HyperCarRepo {
                     if (fd != null && fd >= 0) {
                         port = candidate
                         controlFd = fd
+                        untransferredFd = fd
                         break
                     }
                 }
@@ -857,16 +897,18 @@ object HyperCarRepo {
             // 前后各记一行：原生崩溃（Rust panic 越过 JNI → SIGABRT）会直接把进程带走，
             // 这两行能区分「崩在 nativeStart 里」还是「崩在引擎跑起来之后」。
             log("CORE: 调用 nativeStart（$apHost:$port fd=$controlFd）")
-            val started = RustCoreBridge.nativeStart(json, controlFd, socketProvider)
+            currentCoroutineContext().ensureActive()
+            untransferredFd = null // startNative 接管 FD（包括过期检查和启动失败）。
+            val started = startNative(json, controlFd, ownerTrace)
             log("CORE: nativeStart 返回 $started")
             if (!started) {
-                fail("核心层启动失败（查看日志）")
+                if (sessionLive.get() && connectionTrace === ownerTrace) fail("核心层启动失败（查看日志）")
                 return
             }
             // 拆除与新连接的竞争兜底：拆除已经把资源收走时（sessionLive=false）别再挂
             // streaming，并把刚起的引擎停掉——否则会留下没人管的僵尸会话。
             if (!sessionLive.get()) {
-                runCatching { RustCoreBridge.nativeStop() }
+                runCatching { stopNative() }
                 log("SESSION: 连接结果已过期（拆除途中），丢弃本次会话")
                 return
             }
@@ -880,10 +922,11 @@ object HyperCarRepo {
             // disconnect() 掐掉在途连接：正常取消，不算失败（也不要把 Failed 写进快照）
             throw cancelled
         } catch (t: Throwable) {
-            connectionTrace?.failure("connect", t)
-            fail("会话异常: ${t.message}")
+            ownerTrace?.failure("connect", t)
+            if (sessionLive.get() && connectionTrace === ownerTrace) fail("会话异常: ${t.message}")
         } finally {
-            connecting = false
+            untransferredFd?.let { fd -> runCatching { ParcelFileDescriptor.adoptFd(fd).close() } }
+            if (connectionTrace === ownerTrace) connecting = false
         }
     }
 
@@ -894,7 +937,8 @@ object HyperCarRepo {
      * 每调一次都 nativeStop + 重建快照 + 记一行日志，历史版本正是在这里配合
      * ACTION_STOP 回灌，把「断开」刷成了每秒几百条。
      */
-    private suspend fun runDisconnect(reason: String) {
+    private suspend fun runDisconnect(reason: String, ownerTrace: ConnectionTrace? = connectionTrace) {
+        if (connectionTrace !== ownerTrace) return
         // 幂等：重复的断开事件（ACL 断开广播 + 引擎 ended + service 转交）只真正拆一次。
         // 但**状态必须回 Idle**——曾经这里直接 return，导致链路已断、界面还显示"已连接"。
         if (!sessionLive.compareAndSet(true, false)) {
@@ -985,8 +1029,8 @@ object HyperCarRepo {
         carLifeDialMode = false
         sessionMdHost = null
         streaming = false
-        stopVoiceMic()
-        runCatching { RustCoreBridge.nativeStop() }.onFailure { trace?.failure("cleanup.native", it) }
+
+        runCatching { stopNative() }.onFailure { trace?.failure("cleanup.native", it) }
         // 先掐掉"正在拉起 CarLife"的协程，再清理进程：
         // 否则它会在 3s 等待结束后把无界面服务重新拉起来，留下 7240 空壳（2026-10-26 12:47 现场）。
         wakeJob?.cancel()
@@ -1008,83 +1052,10 @@ object HyperCarRepo {
         trace?.event("cleanup.app_refs_released", "vendorShutdownNotAssumed=true")
     }
 
-    // ---------------------------------------------------------------- 语音助手麦克风
-    //
-    // CarLife 的语音识别要求「车机」侧提供麦克风数据（VR 通道 VR_MIC_DATA 0x00058001）。
-    // 本机 HU 就用手机自己的麦克风：AudioRecord(16k mono) → nativeSendMic → carlife::inject_mic。
-    // 现场 2026-10-24：不给麦克风时手机端报「麦克风有问题」。
-
-    @Volatile
-    private var micRecord: android.media.AudioRecord? = null
-    private var micJob: Job? = null
-
-    private fun startVoiceMic() {
-        if (micRecord != null) return
-        val ctx = appContext() ?: return
-        if (androidx.core.content.ContextCompat.checkSelfPermission(
-                ctx,
-                android.Manifest.permission.RECORD_AUDIO,
-            ) != android.content.pm.PackageManager.PERMISSION_GRANTED
-        ) {
-            log("VOICE: 缺少录音权限（RECORD_AUDIO）——语音助手会报麦克风异常，去设置授权后重连")
-            return
-        }
-        val rate = 16_000
-        val minBuf = android.media.AudioRecord.getMinBufferSize(
-            rate,
-            android.media.AudioFormat.CHANNEL_IN_MONO,
-            android.media.AudioFormat.ENCODING_PCM_16BIT,
-        )
-        // 至少 80ms 缓冲：20ms 一帧读，留点余量防采集中断
-        val bufSize = maxOf(minBuf, rate / 50 * 2 * 4)
-        val rec = runCatching {
-            android.media.AudioRecord(
-                android.media.MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                rate,
-                android.media.AudioFormat.CHANNEL_IN_MONO,
-                android.media.AudioFormat.ENCODING_PCM_16BIT,
-                bufSize,
-            )
-        }.getOrNull()
-        if (rec == null || rec.state != android.media.AudioRecord.STATE_INITIALIZED) {
-            log("VOICE: AudioRecord 初始化失败（state=${rec?.state}）")
-            runCatching { rec?.release() }
-            return
-        }
-        val started = runCatching { rec.startRecording() }.isSuccess
-        if (!started) {
-            log("VOICE: startRecording 失败")
-            runCatching { rec.release() }
-            return
-        }
-        micRecord = rec
-        micJob = scope.launch(Dispatchers.IO) {
-            val chunk = ShortArray(320) // 20ms @16kHz
-            while (isActive) {
-                val n = runCatching { rec.read(chunk, 0, chunk.size) }.getOrDefault(0)
-                if (n > 0) {
-                    val pcm = if (n == chunk.size) chunk else chunk.copyOf(n)
-                    runCatching { RustCoreBridge.nativeSendMic(pcm) }
-                }
-            }
-        }
-        log("VOICE: 手机麦克风已接入 CarLife VR 通道（16kHz 单声道，20ms/帧）")
-    }
-
-    private fun stopVoiceMic() {
-        micJob?.cancel()
-        micJob = null
-        micRecord?.let { r ->
-            runCatching { r.stop() }
-            runCatching { r.release() }
-        }
-        micRecord = null
-    }
-
     // ---------------------------------------------------------------- WiFi
 
     private suspend fun joinAndBind(context: Context, endpoint: CarPlayEndpoint): Network? {
-        connectionTrace?.event("wifi.join.begin", "ssidPresent=${!endpoint.ssid.isNullOrBlank()} credentialPresent=${!endpoint.passphrase.isNullOrBlank()} previousNetwork=$boundNetwork")
+        connectionTrace?.event("wifi.join.begin", "ssidPresent=${!endpoint.ssid.isNullOrBlank()} credentialPresent=${!endpoint.passphrase.isNullOrBlank()} security=${endpoint.securityType} previousNetwork=$boundNetwork")
         val ssid = endpoint.ssid
         val psk = endpoint.passphrase
         val cm = context.getSystemService(ConnectivityManager::class.java)
@@ -1092,14 +1063,15 @@ object HyperCarRepo {
             connectionTrace?.event("wifi.join.reuse", "network=$joinedNetwork")
             return joinedNetwork
         }
+        val networkOwnerTrace = connectionTrace
         val joiner = wifiJoiner ?: WifiJoiner(context) {
             log("WIFI: 车机热点消失")
-            scope.launch { runDisconnect("热点消失") }
+            scope.launch { runDisconnect("热点消失", networkOwnerTrace) }
         }.also { wifiJoiner = it }
         val existing = ssid?.let { joiner.existingNetwork(it) }
-        val network = existing ?: if (!ssid.isNullOrBlank() && !psk.isNullOrBlank()) {
+        val network = existing ?: if (!ssid.isNullOrBlank() && psk != null) {
             log("WIFI: 尝试加入热点 $ssid")
-            when (val result = joiner.joinCarHotspotSilently(ssid, psk)) {
+            when (val result = joiner.joinCarHotspotSilently(ssid, psk, endpoint.securityType)) {
                 is WifiJoiner.JoinResult.Joined -> { markDegradedFirstConnectIfNeeded(); result.network }
                 else -> { log("WIFI: 入网失败：${joiner.lastFailureReason}"); joiner.existingNetwork(ssid) }
             }
@@ -1164,6 +1136,7 @@ object HyperCarRepo {
             sourceVersion = seen?.sourceVersion,
             ipAddresses = listOf(gateway),
             gateway = gateway,
+            securityType = seen?.securityType,
         )
     }
 
@@ -1279,7 +1252,7 @@ object HyperCarRepo {
                 i++
             }
         }
-        candidates.remove(self.hostAddress)
+        self.hostAddress?.let { candidates.remove(it) }
         if (candidates.isEmpty()) return null
 
         val ports = headUnitProfile.fallbackAirplayPorts.distinct().ifEmpty { listOf(7000) }
@@ -1447,7 +1420,7 @@ object HyperCarRepo {
             socket.connect(resolveEndpoint(host, port), timeoutMillis)
             currentCoroutineContext().ensureActive()
             val fd = ParcelFileDescriptor.fromSocket(socket).detachFd()
-            keepAliveForRust(socket)
+            socket.close() // Rust 持有 dup 后的副本；不保留 Java 原句柄。
             log("NET +${stageMs()}ms ✓ $host:$port 已连通（Wi-Fi #$network，耗时 ${System.currentTimeMillis() - startedAt}ms）")
             fd
         } catch (error: Exception) {
@@ -1470,20 +1443,6 @@ object HyperCarRepo {
     }
 
     // ---------------------------------------------------------------- socket 供给（移交 Rust）
-
-    /**
-     * 交给 Rust 的 socket 宿主（Socket / DatagramSocket）**必须保持可达**。
-     *
-     * `detachFd()` 只是把 fd 从 PFD 里摘出来交给 Rust；Java 的 Socket 对象仍然持有同一个
-     * fd，是它背后的 `FileDescriptor` 负责在 GC 时 close。若此时 Socket 已不可达，GC 会在
-     * Rust 还在用的时候把 fd 关掉（推流中途断流、引擎 EBADF）。这里把宿主对象留一份强引用：
-     * 实际 fd 由 Rust 持有并在 nativeStop 时关闭，Java 这边只是不再去 close 它。
-     * 每个会话只留几个小对象，只增不减（不 close、不回收，避免重复 close 到被复用的 fd 号）。
-     *
-     * 注：不能用 `android.system.Os.dup(int)` 做副本——该重载不是公开 API（只有
-     * `dup(FileDescriptor)`），编译期就过不了。
-     */
-    private val socketKeepAlive = java.util.Collections.synchronizedList(mutableListOf<Any>())
 
     /**
      * 配对身份自愈：**文件是主、SharedPreferences 是备份**。
@@ -1514,10 +1473,6 @@ object HyperCarRepo {
             }
         }.onFailure { log("PAIR: 身份自愈失败 - ${it.message}") }
     }
-    private fun keepAliveForRust(owner: Any) {
-        socketKeepAlive.add(owner)
-    }
-
     /**
      * 解析 AirPlay 端点地址：**链路本地 IPv6（fe80::）必须带 scope** 才能连。
      *
@@ -1551,27 +1506,63 @@ object HyperCarRepo {
 
     private val socketProvider = object : RustCoreBridge.SocketProvider {
         override fun openTcpFd(host: String, port: Int, timeoutMs: Int): Int = runCatching {
-            val socket = Socket()
-            socket.tcpNoDelay = true
-            socket.connect(resolveEndpoint(host, port), timeoutMs.coerceAtLeast(1_000))
-            keepAliveForRust(socket)
-            ParcelFileDescriptor.fromSocket(socket).detachFd()
-        }.getOrElse { -1 }
+            val network = boundNetwork ?: return -1
+            Socket().use { socket ->
+                network.bindSocket(socket)
+                socket.tcpNoDelay = true
+                socket.connect(resolveEndpoint(host, port), timeoutMs.coerceAtLeast(1_000))
+                // minSdk=31：fromSocket 已 dup；交出副本并关闭 Java 原句柄。
+                ParcelFileDescriptor.fromSocket(socket).use { it.detachFd() }
+            }
+        }.getOrElse {
+            log("NET: 原生 TCP 请求失败 $host:$port ${it.javaClass.simpleName}: ${it.message}")
+            -1
+        }
 
         override fun openUdpFd(host: String, port: Int): Int = runCatching {
-            val udp = DatagramSocket()
-            udp.connect(resolveEndpoint(host, port))
-            keepAliveForRust(udp)
-            ParcelFileDescriptor.fromDatagramSocket(udp).detachFd()
-        }.getOrElse { -1 }
+            val network = boundNetwork ?: return -1
+            DatagramSocket().use { udp ->
+                network.bindSocket(udp)
+                udp.connect(resolveEndpoint(host, port))
+                ParcelFileDescriptor.fromDatagramSocket(udp).use { it.detachFd() }
+            }
+        }.getOrElse {
+            log("NET: 原生 UDP 请求失败 $host:$port ${it.javaClass.simpleName}: ${it.message}")
+            -1
+        }
     }
-
     // ---------------------------------------------------------------- Rust 回调
 
     private val rustListener = object : RustCoreBridge.EventListener {
-        override fun onState(state: String, detail: String) {
-            connectionTrace?.event("native.$state", detail) ?: log("CORE: [$state] $detail")
+        override fun onState(generation: Long, state: String, detail: String) {
+            nativeGate.ifCurrent(generation) { onCurrentState(generation, state, detail) }
+        }
+
+        private fun onCurrentState(generation: Long, state: String, detail: String) {
+            if (!sessionLive.get()) return
+            connectionTrace?.event("native.$state", "generation=$generation $detail") ?: log("CORE: [$state] $detail")
             when (state) {
+                "starting" -> {
+                    if (headUnitProfile.id == io.github.hypercar.headunit.HeadUnitProfiles.AUDI_MIB3.id) {
+                        virtualIap = VirtualIap2Session(
+                            send = { bytes -> RustCoreBridge.nativeSendIap(generation, bytes) },
+                            log = { line -> log("IAP[$generation] $line") },
+                            preferredChallengeBytes = headUnitProfile.mfiPreferredChallengeBytes,
+                        )
+                    }
+                }
+                "iap_ready" -> {
+                    val owner = virtualIap
+                    if (owner != null && virtualIapJob == null) {
+                        owner.arm()
+                        virtualIapJob = scope.launch {
+                            while (isActive) {
+                                delay(50)
+                                if (!nativeGate.ifCurrent(generation) { if (virtualIap === owner) owner.tick() } || !owner.isOpen()) break
+                            }
+                        }
+                    }
+                }
                 "negotiating" -> push(link = LinkState.Negotiating(detail))
                 "connected" -> {
                     if (!sessionLive.get()) return
@@ -1595,9 +1586,9 @@ object HyperCarRepo {
                     } else {
                         wakeLocalCarLife()
                     }
-                    // 语音助手要靠车机侧供麦克风；CarLife 连上后再开采集，
-                    // 避免没会话时空录（也会占着麦克风影响其他应用）
-                    startVoiceMic()
+                    // voice=0：由原厂 CarLife 使用手机麦克风，Hypercar 不重复采集。
+
+
                 }
                 "carlife_waiting" -> push(carLife = CarLifeState.Waiting())
                 // Rust 侧 CarLife 14 步握手完成（VIDEO_ENCODER_START 已发）
@@ -1638,15 +1629,29 @@ object HyperCarRepo {
                 }
                 "failed" -> retryAirplayOrFail(detail)
                 "ended" -> {
-                    scope.launch { runDisconnect(detail) }
+                    val ownerTrace = connectionTrace
+                    scope.launch {
+                        if (nativeGate.isCurrent(generation)) runDisconnect(detail, ownerTrace)
+                    }
                 }
                 "stopping" -> { /* runDisconnect 内处理 */ }
             }
         }
 
-        override fun onLog(line: String) = log(line)
+        override fun onLog(generation: Long, line: String) {
+            if (generation == 0L) log(line)
+            else nativeGate.ifCurrent(generation) { log("NATIVE[$generation] $line") }
+        }
 
-        override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {
+        override fun onIap(generation: Long, bytes: ByteArray) {
+            nativeGate.ifCurrent(generation) { virtualIap?.feed(bytes) }
+        }
+
+        override fun onStats(generation: Long, fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {
+            nativeGate.ifCurrent(generation) { onCurrentStats(fps, frames, kbps, audioPlaying, ducking) }
+        }
+
+        private fun onCurrentStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {
             // 用 update（CAS）而不是读-改-写：每秒一次，与 log() 的读-改-写并发会吞掉日志行。
             if (frames > lastVideoFrames) lastFrameProgressAt = SystemClock.elapsedRealtime()
             lastVideoFrames = frames
@@ -1681,22 +1686,32 @@ object HyperCarRepo {
         ?: resolveCarLifeSource()?.enginePackage
 
     private suspend fun ownedCarLifePort(port: Int): Boolean {
-        if (!isLocalPortListening(port)) {
-            connectionTrace?.sample("source.port.$port.closed") { "listening=false" }
-            return false
-        }
         val owner = carLifeSession ?: return false
         if (!owner.isOpen || !ShizukuTools.isReady) return false
         val uid = runCatching { appContext()?.packageManager?.getApplicationInfo(owner.source.enginePackage, 0)?.uid }
             .getOrNull() ?: return false
-        val table = runCatching { ShizukuTools.exec("cat /proc/net/tcp /proc/net/tcp6", 4_000).out }.getOrNull() ?: return false
-        val listeners = CarLifePorts.parse(table)
-        return CarLifePorts.owned(listeners, port, uid).also {
-            connectionTrace?.sample("source.port.$port.${if (it) "owned" else "foreign"}") { "listening=true expectedUid=$uid owners=${listeners.filter { row -> row.port == port }.take(4)} accepted=$it" }
-            if (it) owner.markUsed()
+        val result = runCatching { ShizukuTools.exec("cat /proc/net/tcp /proc/net/tcp6", 4_000) }.getOrNull()
+        if (result == null || result.code != 0 || !CarLifePorts.readable(result.out)) {
+            connectionTrace?.sample("source.port.$port.unknown") {
+                "expectedUid=$uid procExit=${result?.code} detail=${result?.err?.take(180)} accepted=false"
+            }
+            return false
         }
+        if (carLifeSession !== owner || !owner.isOpen) return false
+        val rows = CarLifePorts.sockets(result.out).filter { it.port == port }
+        val listeners = CarLifePorts.parse(result.out).filter { it.port == port }
+        val accepted = CarLifePorts.owned(listeners, port, uid)
+        val state = when {
+            accepted -> "owned"
+            listeners.isNotEmpty() -> "foreign"
+            else -> "not_listening"
+        }
+        connectionTrace?.sample("source.port.$port.$state") {
+            "expectedUid=$uid listeners=${listeners.take(4)} tcpStates=${rows.map { it.state }.distinct()} accepted=$accepted"
+        }
+        if (accepted) owner.markUsed()
+        return accepted
     }
-
     /**
      * 探测本机 CarLife（MD）是否在 `127.0.0.1:7240` 监听。
      *
@@ -1717,22 +1732,30 @@ object HyperCarRepo {
      * 我们连上又立刻 close，会被它当成「车机连上又断开」，直接把 CMD/VIDEO 线程踢回初始态
      * （2026-10-26 现场：8240 被探测过一次之后，Rust 真正拨进去 0 字节、一帧视频都没有）。
      *
-     * 这里用「bind 冲突」判断：能 bind 成功 = 没人监听（立刻关掉）；抛 `BindException` = 有人在听。
+     * 优先读内核表中的 LISTEN 状态；TIME_WAIT/残留连接不算监听。读表失败才保守检查 bind 冲突。
      * **全程不产生任何 TCP 握手**，不会碰 CarLife 的 accept 队列。
      */
-    private fun isLocalPortListening(port: Int): Boolean =
-        try {
+    private suspend fun isLocalPortListening(port: Int): Boolean {
+        if (ShizukuTools.isReady) {
+            val result = runCatching { ShizukuTools.exec("cat /proc/net/tcp /proc/net/tcp6", 4_000) }.getOrNull()
+            if (result?.code == 0 && CarLifePorts.readable(result.out)) {
+                return CarLifePorts.parse(result.out).any { it.port == port }
+            }
+        }
+        // 无法读内核表时保守地报告端口不可用，不能据此认定监听者就是 CarLife。
+        return try {
             java.net.ServerSocket().use { ss ->
-                ss.reuseAddress = false // 必须在 bind 前设：SO_REUSEADDR 会让「有监听」也绑得上
+                ss.reuseAddress = false
                 ss.bind(java.net.InetSocketAddress("127.0.0.1", port), 1)
             }
-            false // 绑上了 → 没人监听（已立刻关掉）
-        } catch (_: java.net.BindException) {
-            true // EADDRINUSE → CarLife 正在 LISTEN
-        } catch (_: Throwable) {
             false
+        } catch (_: java.net.BindException) {
+            true
+        } catch (error: Exception) {
+            connectionTrace?.sample("source.port.$port.probe_error") { "${error.javaClass.simpleName}: ${error.message}" }
+            true
         }
-
+    }
     /** 单次零接触探测 127.0.0.1:7240 是否在监听（唤醒流程里用，不要阻塞）。 */
     private suspend fun probeCarLifeOnce(): Boolean = ownedCarLifePort(CARLIFE_CMD_PORT)
 
@@ -2382,7 +2405,7 @@ object HyperCarRepo {
         val rendered = if (line.startsWith("TRACE[")) line else trace?.decorate(line) ?: line
         android.util.Log.i("HyperCar", rendered)
         if (!logRecording) return // 记录开关关闭：丢弃（logcat 仍写，adb 可查）
-        val stamp = logTimeFormat.get().format(java.util.Date())
+        val stamp = requireNotNull(logTimeFormat.get()).format(java.util.Date())
         appendDiskLog("$stamp  $rendered")
         _snapshots.update { s ->
             val extra =

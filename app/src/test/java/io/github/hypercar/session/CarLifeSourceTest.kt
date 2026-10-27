@@ -208,4 +208,15 @@ class CarLifeSourceTest {
         assertFalse(CarLifePorts.owned(listeners, 8240, 10234))
         assertFalse(CarLifePorts.owned(CarLifePorts.parse("Permission denied"), 7240, 10234))
     }
+    @Test fun timeWaitIsNotAListenerAndReadFailureIsNotForeignOwnership() {
+        val table = """
+            sl local_address rem_address st tx_queue rx tr tm retr uid
+            0: 0100007F:1C48 0100007F:1234 06 00000000:00000000 00:00000000 00000000 0 0 123
+        """.trimIndent()
+        assertTrue(CarLifePorts.readable(table))
+        assertEquals("06", CarLifePorts.sockets(table).single().state)
+        assertTrue(CarLifePorts.parse(table).isEmpty())
+        assertFalse(CarLifePorts.readable("cat: Permission denied"))
+        assertTrue(CarLifePorts.readable("sl local_address rem_address st"))
+    }
 }

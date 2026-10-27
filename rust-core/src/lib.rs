@@ -27,21 +27,24 @@ mod iap2_nav;
 mod pairing;
 mod rtsp;
 mod screen;
+mod session;
 mod srp6a;
 mod tlv8;
 mod timing;
+mod video_pipeline;
 
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::Arc;
 
-use jni::objects::{GlobalRef, JClass, JObject, JShortArray, JString};
-use jni::sys::{jboolean, jint, JNI_TRUE, JNI_FALSE};
+use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JShortArray, JString};
+use jni::sys::{jboolean, jint, jlong, JNI_TRUE, JNI_FALSE};
 use jni::JNIEnv;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::runtime::{Builder, Runtime};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
+use crate::session::{spawn_scoped, CancelOnDrop, SessionStop};
 
 use crate::airplay::{SocketProvider, TouchInput};
 
@@ -58,29 +61,43 @@ static JAVA_VM: RwLock<Option<jni::JavaVM>> = RwLock::new(None);
 static LISTENER: RwLock<Option<GlobalRef>> = RwLock::new(None);
 
 struct EngineHandle {
-    stop: Arc<Notify>,
+    stop: Arc<SessionStop>,
     touch_tx: mpsc::UnboundedSender<TouchInput>,
     key_tx: mpsc::UnboundedSender<u32>,
     /// 手机麦克风 PCM → CarLife VR 通道（语音助手用）
     mic_tx: mpsc::UnboundedSender<Vec<i16>>,
+    iap_tx: mpsc::Sender<Vec<u8>>,
 }
 
 static ENGINE: Lazy<parking_lot::Mutex<Option<EngineHandle>>> =
     Lazy::new(|| parking_lot::Mutex::new(None));
+static LIFECYCLE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+static RETIRING: Lazy<parking_lot::Mutex<Vec<Arc<SessionStop>>>> =
+    Lazy::new(|| parking_lot::Mutex::new(Vec::new()));
 
 // ---------------------------------------------------------------- 回调工具
 
 /// Rust → Kotlin 日志（经 EventListener.onLog；同时走 logcat）。
 pub(crate) fn emit_log(line: &str) {
+    if !session::callback_allowed() { return; }
+    emit_log_for(session::current_id(), line);
+}
+
+fn emit_log_for(id: i64, line: &str) {
     log::info!("{line}");
     call_listener("onLog", |env, obj| {
         let jline = env.new_string(line)?;
-        env.call_method(obj, "onLog", "(Ljava/lang/String;)V", &[(&jline).into()])
+        env.call_method(obj, "onLog", "(JLjava/lang/String;)V", &[id.into(), (&jline).into()])
             .map(|_| ())
     });
 }
 
 pub(crate) fn emit_state(state: &str, detail: &str) {
+    if !session::callback_allowed() { return; }
+    emit_state_for(session::current_id(), state, detail);
+}
+
+fn emit_state_for(id: i64, state: &str, detail: &str) {
     log::info!("STATE {state}: {detail}");
     call_listener("onState", |env, obj| {
         let js = env.new_string(state)?;
@@ -88,8 +105,8 @@ pub(crate) fn emit_state(state: &str, detail: &str) {
         env.call_method(
             obj,
             "onState",
-            "(Ljava/lang/String;Ljava/lang/String;)V",
-            &[(&js).into(), (&jd).into()],
+            "(JLjava/lang/String;Ljava/lang/String;)V",
+            &[id.into(), (&js).into(), (&jd).into()],
         )
         .map(|_| ())
     });
@@ -103,6 +120,8 @@ pub(crate) fn emit_stats(
     audio_playing: bool,
     ducking: bool,
 ) {
+    if !session::callback_allowed() { return; }
+    let id = session::current_id();
     call_listener("onStats", |env, obj| {
         env.call_method(
             obj,
@@ -111,8 +130,9 @@ pub(crate) fn emit_stats(
             // → I J J Z Z（5 个参数）。**必须严格 5 位**：旧值多写了一个 I（"(IJJIZZ)V"）
             // 导致 GetMethodID 直接失败、onStats 一次都没调到——首页帧率/码率/音频芯片全空
             // （2026-10-25 定谳）。
-            "(IJJZZ)V",
+            "(JIJJZZ)V",
             &[
+                id.into(),
                 fps.into(),
                 frames.into(),
                 kbps.into(),
@@ -150,8 +170,9 @@ fn with_env<T>(
 }
 
 fn call_listener(method: &str, f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::errors::Result<()>) {
-    let guard = LISTENER.read();
-    let Some(global) = guard.as_ref() else { return };
+    // Kotlin 回调可能重入 nativeStop；不能把原生锁一直持有到 Java 返回。
+    let global = LISTENER.read().clone();
+    let Some(global) = global else { return };
     // JObject 不实现 Clone；as_obj() 返回 &JObject，直接按引用传给 f。
     let obj = global.as_obj();
     let _ = with_env(|env| f(env, obj));
@@ -159,6 +180,15 @@ fn call_listener(method: &str, f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::err
 }
 
 // ---------------------------------------------------------------- socket 供给器
+
+pub(crate) fn emit_iap(bytes: &[u8]) {
+    if !session::callback_allowed() || bytes.len() > 65_536 { return; }
+    let id = session::current_id();
+    call_listener("onIap", |env, obj| {
+        let packet = env.byte_array_from_slice(bytes)?;
+        env.call_method(obj, "onIap", "(J[B)V", &[id.into(), (&packet).into()]).map(|_| ())
+    });
+}
 
 /// Kotlin SocketProvider（carNetwork 绑定的 socket 工厂）→ Rust trait 实现。
 struct JniSocketProvider {
@@ -168,6 +198,7 @@ struct JniSocketProvider {
 
 impl JniSocketProvider {
     fn call_fd(&self, method: &str, host: &str, port: u16, timeout_ms: u32) -> Option<RawFd> {
+        if !session::callback_allowed() { return None; }
         let mut env = self.vm.attach_current_thread_as_daemon().ok()?;
         let jhost = env.new_string(host).ok()?;
         let fd: jint = env
@@ -197,6 +228,7 @@ impl SocketProvider for JniSocketProvider {
         let fd = self.call_fd("openTcpFd", host, port, timeout_ms)?;
         unsafe {
             let std_stream = std::net::TcpStream::from_raw_fd(fd);
+            if !session::callback_allowed() { return None; }
             let _ = std_stream.set_nonblocking(true);
             let _ = std_stream.set_nodelay(true);
             TcpStream::from_std(std_stream).ok()
@@ -204,6 +236,7 @@ impl SocketProvider for JniSocketProvider {
     }
 
     fn open_udp(&self, host: &str, port: u16) -> Option<UdpSocket> {
+        if !session::callback_allowed() { return None; }
         // 注意 Kotlin 侧 openUdpFd(host, port) 只有两个参数，签名为 (Ljava/lang/String;I)I
         let mut env = self.vm.attach_current_thread_as_daemon().ok()?;
         let jhost = env.new_string(host).ok()?;
@@ -222,6 +255,7 @@ impl SocketProvider for JniSocketProvider {
         }
         unsafe {
             let std_udp = std::net::UdpSocket::from_raw_fd(fd as RawFd);
+            if !session::callback_allowed() { return None; }
             let _ = std_udp.set_nonblocking(true);
             UdpSocket::from_std(std_udp).ok()
         }
@@ -273,11 +307,13 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStart(
     config_json: JString,
     control_fd: jint,
     socket_provider: JObject,
+    generation: jlong,
 ) -> jboolean {
+    let _lifecycle = LIFECYCLE.lock();
     // 任何 panic 都不得越过 JNI 边界：一旦越过（哪怕 panic=unwind）Rust 会 abort 整个进程，
     // 现场只剩「进程消失 + 内存日志全丢」。这里兜住，翻译成 JNI_FALSE + 一条日志。
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        native_start_impl(env, config_json, control_fd, socket_provider)
+        native_start_impl(env, config_json, control_fd, socket_provider, generation)
     }));
     match outcome {
         Ok(value) => value,
@@ -299,7 +335,12 @@ fn native_start_impl(
     config_json: JString,
     control_fd: jint,
     socket_provider: JObject,
+    generation: jlong,
 ) -> jboolean {
+    // JNI 调用一进入就接管 FD，配置失败或 panic 时也由 RAII 关闭，避免泄漏已连车机的连接。
+    let owned_stream = if control_fd >= 0 {
+        Some(unsafe { std::net::TcpStream::from_raw_fd(control_fd as RawFd) })
+    } else { None };
     // 停旧引擎
     stop_engine();
 
@@ -314,8 +355,8 @@ fn native_start_impl(
             return JNI_FALSE;
         }
     };
-    if control_fd < 0 {
-        emit_log("controlFd 非法");
+    if owned_stream.is_none() || generation <= 0 {
+        emit_log("controlFd 或 generation 非法");
         return JNI_FALSE;
     }
     emit_log("nativeStart: 配置已解析，开始接管控制 FD");
@@ -328,8 +369,8 @@ fn native_start_impl(
     // 2026-10-23 20:44 的秒崩就死在这一行：日志停在「CORE: 调用 nativeStart」，之后
     // 一条 CORE 都没有（'there is no reactor running' panic → abort）。这里显式 enter()。
     let control_stream = {
-        let std_stream = unsafe {
-            let std_stream = std::net::TcpStream::from_raw_fd(control_fd as RawFd);
+        let std_stream = {
+            let std_stream = owned_stream.unwrap();
             let _ = std_stream.set_nonblocking(true);
             let _ = std_stream.set_nodelay(true);
             std_stream
@@ -362,12 +403,27 @@ fn native_start_impl(
     let (key_tx, key_rx) = mpsc::unbounded_channel::<u32>();
     // 手机麦克风 → CarLife VR（语音助手要靠车机喂麦克风）
     let (mic_tx, mic_rx) = mpsc::unbounded_channel::<Vec<i16>>();
-    let stop = Arc::new(Notify::new());
+    let (iap_tx, iap_rx) = mpsc::channel::<Vec<u8>>(64);
+    let stop = SessionStop::new(generation);
 
     let stop_run = stop.clone();
     let touch_tx_engine = touch_tx.clone();
     let key_tx_engine = key_tx.clone();
-    let engine_task = TOKIO_RT.spawn(async move {
+    let retired = RETIRING.lock().clone();
+    let engine_task = {
+      let _runtime = TOKIO_RT.enter();
+      spawn_scoped(stop.clone(), async move {
+        let _cleanup = CancelOnDrop(stop_run.clone());
+        emit_state("starting", "核心层引擎已启动");
+        // 新会话接触 CarLife 之前，等待旧任务释放读写中的所有 socket。
+        for previous in retired {
+            if tokio::time::timeout(std::time::Duration::from_secs(15), previous.wait_idle()).await.is_err() {
+                emit_state("failed", "上一次核心层任务尚未退出，本轮停止以避免重复连接来源");
+                return;
+            }
+        }
+        RETIRING.lock().retain(|previous| !previous.is_idle());
+        if stop_run.is_cancelled() { return; }
         let result = engine::run_engine(
             cfg,
             control_stream,
@@ -378,6 +434,7 @@ fn native_start_impl(
             key_rx,
             // 手机麦克风（AudioRecord）经 nativeSendMic 注入
             Some(mic_rx),
+            iap_rx,
             stop_run,
         )
         .await;
@@ -385,13 +442,16 @@ fn native_start_impl(
             emit_log(&format!("引擎退出: {e}"));
             emit_state("failed", e);
         }
-    });
+      })
+    };
     // panic 隔离看门狗：Cargo 已去掉 panic = "abort"，任务内 panic 由 tokio 捕获在
     // JoinHandle 里。这里把它报成「会话失败」并留日志，而不是让进程无声消失。
     TOKIO_RT.spawn(async move {
         if let Err(join_error) = engine_task.await {
-            emit_log(&format!("引擎任务异常退出: {join_error}"));
-            emit_state("failed", "核心层内部异常（panic），请导出日志");
+            if join_error.is_panic() {
+                emit_log_for(generation, &format!("引擎任务异常退出: {join_error}"));
+                emit_state_for(generation, "failed", "核心层内部异常（panic），请导出日志");
+            }
         }
     });
 
@@ -402,10 +462,10 @@ fn native_start_impl(
         touch_tx,
         key_tx,
         mic_tx,
+        iap_tx,
     });
 
     emit_log("nativeStart: 引擎任务已派生");
-    emit_state("starting", "核心层引擎已启动");
     JNI_TRUE
 }
 
@@ -414,17 +474,33 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStop(
     _env: JNIEnv,
     _class: JClass,
 ) {
+    let _lifecycle = LIFECYCLE.lock();
     stop_engine();
 }
 
 fn stop_engine() {
     if let Some(handle) = ENGINE.lock().take() {
-        // notify_waiters 唤醒当前所有等待者；notify_one 存一个 permit，
-        // 防止「停止信号早于最终 await 注册」时引擎挂死（Notify 不记忆 waiters）。
-        handle.stop.notify_waiters();
-        handle.stop.notify_one();
-        emit_log("引擎已停止");
+        handle.stop.cancel();
+        // 生命周期锁内只发非会话日志，避免与 Kotlin 回调的状态锁互相等待。
+        emit_log_for(0, "核心层已收到停止请求；等待所有本轮任务退出");
+        RETIRING.lock().push(handle.stop);
     }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSendIap(
+    env: JNIEnv,
+    _class: JClass,
+    generation: jlong,
+    packet: JByteArray,
+) -> jboolean {
+    let Ok(len) = env.get_array_length(&packet) else { return JNI_FALSE; };
+    if len <= 0 || len > 65_536 { return JNI_FALSE; }
+    let Ok(bytes) = env.convert_byte_array(packet) else { return JNI_FALSE; };
+    let engine = ENGINE.lock();
+    let Some(handle) = engine.as_ref() else { return JNI_FALSE; };
+    if handle.stop.id != generation || handle.stop.is_cancelled() { return JNI_FALSE; }
+    if handle.iap_tx.try_send(bytes).is_ok() { JNI_TRUE } else { JNI_FALSE }
 }
 
 /// 手机麦克风 PCM（16kHz 单声道 16-bit）→ CarLife VR 通道。
@@ -434,7 +510,7 @@ fn stop_engine() {
 /// 封帧推给 MD。Android 侧需要在 manifest 申请 RECORD_AUDIO 并运行时授权。
 #[no_mangle]
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSendMic(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     pcm: JShortArray,
 ) {
@@ -488,7 +564,7 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeIsRunni
     _env: JNIEnv,
     _class: JClass,
 ) -> jboolean {
-    if ENGINE.lock().is_some() {
+    if ENGINE.lock().as_ref().is_some_and(|handle| !handle.stop.is_cancelled()) {
         JNI_TRUE
     } else {
         JNI_FALSE

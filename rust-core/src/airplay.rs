@@ -1,4 +1,4 @@
-﻿//! AirPlay 发送端会话（协商整体下沉 Rust —— 与参考文档的关键差异，见 docs/NEGOTIATION-GAPS.md）。
+//! AirPlay 发送端会话（协商整体下沉 Rust —— 与参考文档的关键差异，见 docs/NEGOTIATION-GAPS.md）。
 //!
 //! 流程（cardeck 真车验证的顺序，Audi MIB3 / BMW iD8.5 通用骨架）：
 //!  1. `GET /info`（带空 bplist 体 + plist Content-Type，老固件对缺体的 /info 回 400/455）
@@ -21,7 +21,8 @@ use parking_lot::Mutex;
 
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
+use crate::session::{spawn_scoped, SessionStop};
 
 use crate::audio_out::AudioOut;
 use crate::bplist::{self, Value};
@@ -29,7 +30,7 @@ use crate::pairing::{ControllerIdentity, PairSetupClient, PairVerifyClient, TlvT
 use crate::rtsp::{ControlCipher, RtspChannel};
 use crate::screen::{ScreenCipher, ScreenSender};
 use crate::timing::TimingServer;
-use crate::{emit_log, emit_state};
+use crate::{emit_iap, emit_log, emit_state};
 
 /// Rust 需要新 socket 时回调 Kotlin（必须绑定车机网络，否则流量走手机）。
 pub trait SocketProvider: Send + Sync {
@@ -71,6 +72,7 @@ pub struct AirplayOutcome {
     pub screen: ScreenSender,
     pub audio: Option<AudioOut>,
     pub keep_alive_stats: bool,
+    pub timing: TimingServer,
 }
 
 /// 跑完整个 AirPlay 协商，返回屏幕/音频发送器（交给 pump 任务）。
@@ -81,9 +83,10 @@ pub async fn negotiate(
     factory: Arc<dyn SocketProvider>,
     touch_tx: mpsc::UnboundedSender<TouchInput>,
     key_tx: mpsc::UnboundedSender<u32>,
-    stop: Arc<Notify>,
+    iap_rx: mpsc::Receiver<Vec<u8>>,
+    stop: Arc<SessionStop>,
 ) -> Result<AirplayOutcome, String> {
-    let (mut channel, _control_inbound) = RtspChannel::spawn(read, write, None);
+    let (mut channel, _control_inbound) = RtspChannel::spawn(read, write, None, stop.clone());
 
     // ---- 1. /info（**best-effort**，不可用不致命）----
     //
@@ -162,7 +165,7 @@ pub async fn negotiate(
                 match factory.open_tcp(&p.car_ip, p.airplay_port, 5_000) {
                     Some(stream) => {
                         let (r, w) = stream.into_split();
-                        let (fresh, _rx) = RtspChannel::spawn(r, w, None);
+                        let (fresh, _rx) = RtspChannel::spawn(r, w, None, stop.clone());
                         channel = fresh;
                         emit_log("PAIR: 已换新控制连接");
                     }
@@ -206,7 +209,7 @@ pub async fn negotiate(
             match factory.open_tcp(&p.car_ip, p.airplay_port, 5_000) {
                 Some(stream) => {
                     let (r, w) = stream.into_split();
-                    let (fresh, _rx) = RtspChannel::spawn(r, w, None);
+                    let (fresh, _rx) = RtspChannel::spawn(r, w, None, stop.clone());
                     channel = fresh;
                     emit_log("PAIR: 已换新控制连接");
                 }
@@ -290,24 +293,10 @@ pub async fn negotiate(
     }
 
     // ---- 3. modesChanged ----
-    let modes = build_modes_changed();
-    match channel
-        .request(
-            "POST",
-            "/command",
-            &modes,
-            "application/x-apple-binary-plist",
-            &[],
-            Duration::from_secs(5),
-        )
-        .await
-    {
-        Ok(resp) => emit_log(&format!("AIRPLAY: modesChanged [{}]", resp.first_line)),
-        Err(e) => emit_log(&format!("AIRPLAY: modesChanged 失败 - {e}")),
-    }
+    assert_modes(&channel).await?;
 
     // ---- 4. 计时服务 + 会话级 SETUP ----
-    let timing = TimingServer::start().map_err(|e| format!("计时服务启动失败: {e}"))?;
+    let timing = TimingServer::start(stop.clone()).map_err(|e| format!("计时服务启动失败: {e}"))?;
     let body = build_session_setup(&p.device_id, timing.port, shared_secret.is_some());
     let resp = channel
         .request(
@@ -341,7 +330,7 @@ pub async fn negotiate(
         .open_tcp(&p.car_ip, event_port, 5_000)
         .ok_or_else(|| format!("事件通道连接失败 {}:{event_port}", p.car_ip))?;
     let (ev_r, ev_w) = event_stream.into_split();
-    let (event_channel, event_rx) = RtspChannel::spawn(ev_r, ev_w, None);
+    let (event_channel, event_rx) = RtspChannel::spawn(ev_r, ev_w, None, stop.clone());
     if let Some(shared) = &shared_secret {
         let (read_key, write_key) = derive_event_keys(shared);
         event_channel.set_cipher(ControlCipher::new(read_key, write_key));
@@ -352,13 +341,14 @@ pub async fn negotiate(
     // 队列，攒到 64 条报「事件通道发送队列超限」（现场 2026-10-23 23:33 定位）。
     {
         let stop_ev = stop.clone();
-        tokio::spawn(async move {
+        spawn_scoped(stop.clone(), async move {
             let _keep_alive = event_channel;
             stop_ev.notified().await;
         });
     }
     spawn_event_dispatcher(
         event_rx,
+        channel.clone(),
         touch_tx,
         key_tx,
         // 触摸的「显示空间」分母，优先级：
@@ -441,10 +431,12 @@ pub async fn negotiate(
                 let pps = nals.iter().find(|n| crate::screen::nal_type(n) == 8).copied();
                 if let (Some(sps), Some(pps)) = (sps, pps) {
                     let avcc = crate::screen::build_avcc(sps, pps);
-                    let cfg_ok = screen.send_config(&avcc).await.is_ok();
-                    let frame_ok = screen.send_video_annexb(first, 0).await.is_ok();
+                    screen.send_config(&avcc).await.map_err(|e| format!("等待页配置写失败 kind={:?} os={:?}: {e}", e.kind(), e.raw_os_error()))?;
+                    let frame_ok = screen.send_video_annexb(first).await
+                        .map_err(|e| format!("等待页首帧写失败 kind={:?} os={:?}: {e}", e.kind(), e.raw_os_error()))?;
+                    let cfg_ok = true;
                     emit_log(&format!(
-                        "AIRPLAY: 已发送待机卡片母版 {}x{}（config={cfg_ok} idr={frame_ok}，{} 帧素材）——车机不再黑屏",
+                        "AIRPLAY: 已写出等待页母版 {}x{}（config={cfg_ok} idr={frame_ok}，{} 帧素材）；接收端显示仍需实车核对",
                         set.width, set.height, set.frames.len()
                     ));
                 } else {
@@ -455,6 +447,10 @@ pub async fn negotiate(
         None => emit_log("AIRPLAY: 没有匹配宽高比的待机素材——跳过卡片"),
     }
 
+
+    // MIB3 虚拟 iAP2：控制通道出站、事件通道入站；与当前引擎一起取消。
+    spawn_iap_sender(channel.clone(), iap_rx, stop.clone());
+    emit_state("iap_ready", "主屏 SETUP 已完成，可启动虚拟 iAP2 控制链路");
 
     // ---- 7. （音频挪到 RECORD 之后，见第 8 步）----
     // 宝马这台（AirTunes/450.14）在屏幕流 SETUP 后约 1.5s 就关控制通道；
@@ -496,6 +492,7 @@ pub async fn negotiate(
         screen,
         audio,
         keep_alive_stats,
+        timing,
     })
 }
 
@@ -665,6 +662,93 @@ fn build_modes_changed() -> Vec<u8> {
     ]))
 }
 
+async fn assert_modes(channel: &RtspChannel) -> Result<(), String> {
+    let resp = channel.request(
+        "POST", "/command", &build_modes_changed(), "application/x-apple-binary-plist",
+        &[], Duration::from_secs(5),
+    ).await?;
+    if resp.status() != 200 { return Err(format!("modesChanged 被拒绝 [{}]", resp.first_line)); }
+    emit_log(&format!("AIRPLAY: modesChanged [{}]", resp.first_line));
+    Ok(())
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn ui_and_mode_requests_send_resource_ownership_reply_on_control_channel() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let (r, w) = client.into_split();
+        let stop = SessionStop::new(81);
+        let (control, _) = RtspChannel::spawn(r, w, None, stop.clone());
+        let (inbound, rx) = mpsc::unbounded_channel();
+        let (touch, _) = mpsc::unbounded_channel();
+        let (keys, _) = mpsc::unbounded_channel();
+        spawn_event_dispatcher(rx, control, touch, keys, (1920, 720), Arc::new(Mutex::new((1920, 720))), stop.clone());
+        for kind in ["changeModes", "requestUI"] {
+        inbound.send(crate::rtsp::RtspMessage {
+            first_line: "POST /command RTSP/1.0".into(),
+            headers: Default::default(),
+            body: bplist::encode(&Value::dict(vec![("type", Value::str(kind))])),
+        }).unwrap();
+        let mut buffer = Vec::new();
+        let request = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let mut chunk = [0u8; 4096];
+                let n = server.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                buffer.extend_from_slice(&chunk[..n]);
+                if let Some(request) = crate::rtsp::parse_rtsp_messages(&mut buffer).pop() { break request; }
+            }
+        }).await.unwrap();
+        let body = bplist::parse(&request.body).unwrap();
+        assert_eq!(body.get("type").and_then(Value::as_str), Some("modesChanged"));
+        let resources = body.get("params").unwrap().get("resources").unwrap().as_array().unwrap();
+        assert_eq!(resources.len(), 2);
+        assert!(resources.iter().all(|r| r.get("entity").and_then(Value::as_int) == Some(1)));
+        server.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n", request.cseq().unwrap()).as_bytes()).await.unwrap();
+        }
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(1), stop.wait_idle()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn virtual_iap_bytes_are_sent_as_control_commands_and_cancel_cleanly() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let (r, w) = client.into_split();
+        let stop = SessionStop::new(82);
+        let (control, _) = RtspChannel::spawn(r, w, None, stop.clone());
+        let (tx, rx) = mpsc::channel(2);
+        spawn_iap_sender(control, rx, stop.clone());
+        let packet = vec![0xff, 0x55, 2, 0, 0xee, 0x10];
+        tx.send(packet.clone()).await.unwrap();
+        let mut buffer = Vec::new();
+        let request = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let mut chunk = [0u8; 4096];
+                let n = server.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                buffer.extend_from_slice(&chunk[..n]);
+                if let Some(request) = crate::rtsp::parse_rtsp_messages(&mut buffer).pop() { break request; }
+            }
+        }).await.unwrap();
+        let body = bplist::parse(&request.body).unwrap();
+        assert_eq!(request.first_line, "POST /command RTSP/1.0");
+        assert_eq!(body.get("type").and_then(Value::as_str), Some("iAPSendMessage"));
+        assert_eq!(body.get("params").unwrap().get("data").and_then(Value::as_bytes), Some(packet.as_slice()));
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(1), stop.wait_idle()).await.unwrap();
+        assert!(tx.send(vec![1]).await.is_err());
+    }
+}
+
 fn build_screen_setup(conn_id: i64, uuid: &str) -> Vec<u8> {
     bplist::encode(&Value::dict(vec![(
         "streams",
@@ -758,11 +842,11 @@ fn spawn_keepalive_loops(
     factory: Arc<dyn SocketProvider>,
     keep_alive_port: u16,
     car_ip: String,
-    stop: Arc<Notify>,
+    stop: Arc<SessionStop>,
 ) {
     if keep_alive_port != 0 {
         let stop_k = stop.clone();
-        tokio::spawn(async move {
+        spawn_scoped(stop.clone(), async move {
             let Some(udp) = factory.open_udp(&car_ip, keep_alive_port) else {
                 emit_log("AIRPLAY: keepAlive UDP 端口不可用");
                 return;
@@ -774,20 +858,21 @@ fn spawn_keepalive_loops(
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {}
                 }
                 n = n.wrapping_add(1);
-                if udp.send(&n.to_be_bytes()).await.is_err() {
+                if let Err(e) = udp.send(&n.to_be_bytes()).await {
+                    emit_log(&format!("AIRPLAY: UDP keepAlive 写失败 kind={:?} os={:?}: {e}", e.kind(), e.raw_os_error()));
                     return;
                 }
             }
         });
     }
 
-    tokio::spawn(async move {
+    spawn_scoped(stop.clone(), async move {
         loop {
             tokio::select! {
                 _ = stop.notified() => return,
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
-            if channel
+            if let Err(error) = channel
                 .request(
                     "POST",
                     "/feedback",
@@ -797,9 +882,29 @@ fn spawn_keepalive_loops(
                     Duration::from_secs(3),
                 )
                 .await
-                .is_err()
             {
-                return; // 控制通道已断
+                let detail = format!("AirPlay feedback 失败：{error}");
+                emit_log(&detail);
+                emit_state("ended", &detail);
+                stop.cancel();
+                return;
+            }
+        }
+    });
+}
+
+fn spawn_iap_sender(channel: Arc<RtspChannel>, mut packets: mpsc::Receiver<Vec<u8>>, stop: Arc<SessionStop>) {
+    spawn_scoped(stop.clone(), async move {
+        while let Some(packet) = packets.recv().await {
+            let body = bplist::encode(&Value::dict(vec![
+                ("type", Value::str("iAPSendMessage")),
+                ("params", Value::dict(vec![("data", Value::Data(packet))])),
+            ]));
+            if let Err(error) = channel.post_fire_and_forget("/command", &body, "application/x-apple-binary-plist").await {
+                let detail = format!("虚拟 iAP2 控制写失败: {error}");
+                emit_state("ended", &detail);
+                stop.cancel();
+                return;
             }
         }
     });
@@ -809,25 +914,31 @@ fn spawn_keepalive_loops(
 
 fn spawn_event_dispatcher(
     mut inbound: tokio::sync::mpsc::UnboundedReceiver<crate::rtsp::RtspMessage>,
+    control: Arc<RtspChannel>,
     touch_tx: mpsc::UnboundedSender<TouchInput>,
     key_tx: mpsc::UnboundedSender<u32>,
     display_size: (u32, u32),
     target_size: Arc<Mutex<(u32, u32)>>,
-    stop: Arc<Notify>,
+    stop: Arc<SessionStop>,
 ) {
-    tokio::spawn(async move {
+    spawn_scoped(stop.clone(), async move {
         let mut bad_commands = 0usize;
         let mut tip_down = false; // 上一次报告的按下状态（down/move/up 边沿检测）
         let mut seen_commands: Vec<String> = Vec::new();
         let mut hid_reports: u64 = 0;
     let mut touch_logged: u32 = 0; // 触摸换算诊断计数（前几次 + 每 200 次记一行）
         let mut other_lines: u64 = 0;
+        let mut unhandled: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         loop {
             let msg = tokio::select! {
                 _ = stop.notified() => return,
                 m = inbound.recv() => match m {
                     Some(m) => m,
-                    None => return,
+                    None => {
+                        emit_state("ended", "AirPlay 事件通道已关闭，停止本轮媒体推流");
+                        stop.cancel();
+                        return;
+                    }
                 },
             };
             if !msg.first_line.contains("/command") {
@@ -904,9 +1015,28 @@ fn spawn_event_dispatcher(
                     }
                 }
                 "hidSetInputMode" | "ping" | "fps" => {}
+                "changeModes" | "requestUI" => {
+                    // RTSP 200 只确认收包；资源切换还要回 modesChanged。
+                    if let Err(error) = assert_modes(&control).await {
+                        emit_log(&format!("EVENT: {cmd_type} 资源应答失败: {error}"));
+                    }
+                }
+                "iAPSendMessage" => {
+                    if let Some(data) = command.get("params").and_then(|p| p.get("data")).and_then(Value::as_bytes) {
+                        emit_iap(data);
+                    } else {
+                        emit_log("EVENT: iAPSendMessage 缺少 params.data，无法交给虚拟链路");
+                    }
+                }
                 other => {
-                    if bad_commands <= 8 {
-                        emit_log(&format!("EVENT: 未处理的车机命令 type={other}"));
+                    let count = unhandled.entry(other.to_string()).or_default();
+                    *count += 1;
+                    if *count <= 3 || *count % 100 == 0 {
+                        let params = command.get("params");
+                        let keys: Vec<_> = params.and_then(Value::as_dict)
+                            .map(|pairs| pairs.iter().filter_map(|(key, _)| key.as_str()).collect()).unwrap_or_default();
+                        let bytes = params.and_then(|p| p.get("data")).and_then(Value::as_bytes).map(|data| data.len());
+                        emit_log(&format!("EVENT: 未实现命令语义 type={other} count={count} paramsKeys={keys:?} dataBytes={bytes:?}；RTSP 层已应答 200"));
                     }
                 }
             }

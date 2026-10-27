@@ -53,12 +53,13 @@ object RustCoreBridge {
     /** Rust → Kotlin 状态/日志回调（在 Rust 工作线程调用，实现方需自行切主线程）。 */
     interface EventListener {
         /** 状态迁移：[state] 为机器码，[detail] 为人话（见 engine.rs 的 emit 调用）。 */
-        fun onState(state: String, detail: String)
+        fun onState(generation: Long, state: String, detail: String)
 
-        fun onLog(line: String)
+        fun onLog(generation: Long, line: String)
+        fun onIap(generation: Long, bytes: ByteArray)
 
         /** 统计心跳（约 1s 一次）：fps/frames/kbps/音频闪避。 */
-        fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean)
+        fun onStats(generation: Long, fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean)
     }
 
     @Volatile
@@ -84,9 +85,10 @@ object RustCoreBridge {
      * @param controlFd Kotlin 已 connect 到 车机 AirPlay 端口（carNetwork 绑定）的 TCP FD（已 detach）
      * @param socketProvider 后续新端口的 socket 供给
      */
-    external fun nativeStart(configJson: String, controlFd: Int, socketProvider: SocketProvider): Boolean
+    external fun nativeStart(configJson: String, controlFd: Int, socketProvider: SocketProvider, generation: Long): Boolean
 
     external fun nativeStop()
+    external fun nativeSendIap(generation: Long, bytes: ByteArray): Boolean
 
     /** AirPlay 事件通道解出的车机触摸 → CarLife 0x68001（坐标已在 Rust 侧换算）。 */
     external fun nativeSendTouch(action: Int, x: Int, y: Int)

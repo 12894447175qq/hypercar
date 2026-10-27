@@ -30,6 +30,7 @@
 
 use crate::crypto::{chacha_seal, nonce64, Aes128CtrStream};
 use crate::timing::ntp_be;
+use crate::video_pipeline::FrameClock;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::OwnedWriteHalf;
@@ -74,6 +75,7 @@ pub struct ScreenSender {
     cipher: ScreenCipher,
     /** ChaCha 帧计数（每帧自增；AES-CTR 形态不使用但照常计数，对齐参考实现）。 */
     frame_counter: u64,
+    clock: FrameClock,
     /** 解码器画布宽/高（VideoConfig 头部 params[1..3]，f32 LE）。 */
     width: f32,
     height: f32,
@@ -117,6 +119,7 @@ impl ScreenSender {
             w,
             cipher,
             frame_counter: 0,
+            clock: FrameClock::default(),
             width: even_width as f32,
             height: even_height as f32,
             keep_alive_with_stats,
@@ -156,7 +159,20 @@ impl ScreenSender {
             ));
             self.width = w as f32;
             self.height = h as f32;
+            self.reset_video_config();
         }
+    }
+
+    pub fn reset_video_config(&mut self) {
+        self.config_sent = false;
+        self.last_sps = None;
+        self.last_pps = None;
+        self.logged_first_frame = false;
+    }
+
+    async fn write_wire(&mut self, wire: &[u8]) -> std::io::Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), self.w.write_all(wire)).await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "screen TCP write exceeded 5s"))?
     }
 
     /// 发送 VideoConfig（明文 avcC body）。
@@ -174,7 +190,7 @@ impl ScreenSender {
         let mut wire = Vec::with_capacity(HEADER_LEN + avcc.len());
         wire.extend_from_slice(&header);
         wire.extend_from_slice(avcc);
-        self.w.write_all(&wire).await?;
+        self.write_wire(&wire).await?;
         self.config_sent = true;
         Ok(())
     }
@@ -182,13 +198,13 @@ impl ScreenSender {
     /// 发送一帧视频。输入 AnnexB（可能粘连 SPS/PPS/IDR/P 多 NAL）：
     ///  - 检测到 SPS/PPS 且与上次不同时，先发 VideoConfig(avcC)；
     ///  - 其余 NAL（SPS/PPS 除外）打成一帧（4 字节 BE 长度前缀序列）按加密形态密封后
-    ///    作 VideoFrame；`pts_us` 为毫秒时间戳 * 1000，换算 NTP 32.32 写进 params[0]。
+    ///    作 VideoFrame；使用与 TimingServer 同源的本机单调时间换算 NTP 32.32。
     ///
-    /// config 尚未发出时丢帧（对齐参考实现：车机没有 avcC 就无从解码）。
-    pub async fn send_video_annexb(&mut self, annexb: &[u8], pts_us: u64) -> std::io::Result<()> {
+    /// 返回 true 才表示已写出视频帧；只有配置或等待参数时返回 false。
+    pub async fn send_video_annexb(&mut self, annexb: &[u8]) -> std::io::Result<bool> {
         let nals = annexb_nals(annexb);
         if nals.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         // 诊断：首次出帧打印 NAL 类型（H.264 应为 7=SPS/8=PPS/5=IDR/1=P）；
         // 同时守卫 HEVC——CarLife 新版（如 8.8.5）可能改用 H.265，而当前实现只做
@@ -238,7 +254,7 @@ impl ScreenSender {
             }
         }
         if !self.config_sent {
-            return Ok(()); // config 未发（本帧也没带 SPS/PPS）：丢弃
+            return Ok(false); // config 未发（本帧也没带 SPS/PPS）：丢弃
         }
 
         // 打包「4 字节 BE 长度前缀 NAL 序列」（SPS/PPS 已经走 VideoConfig，不进帧体）
@@ -252,9 +268,11 @@ impl ScreenSender {
             plain.extend_from_slice(nal);
         }
         if plain.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
+        // CarLife 厂商可能填 Unix 秒、毫秒或重复值；不把该字段直通到 AirPlay。
+        let pts_us = self.clock.next(crate::timing::monotonic_nanos() / 1_000);
         let ntp = ntp_le_from_us(pts_us);
         // 头只能构造一次：ChaCha 的 AAD 必须是最终写出的那 128 字节
         let (header, body) = match &mut self.cipher {
@@ -276,13 +294,13 @@ impl ScreenSender {
         let mut wire = Vec::with_capacity(HEADER_LEN + body.len());
         wire.extend_from_slice(&header);
         wire.extend_from_slice(&body);
-        self.w.write_all(&wire).await?;
+        self.write_wire(&wire).await?;
 
         self.frames = self.frames.wrapping_add(1);
         self.bytes = self.bytes.wrapping_add(plain.len() as u64);
         self.frames_since_keep_alive = self.frames_since_keep_alive.wrapping_add(1);
         self.bytes_since_keep_alive = self.bytes_since_keep_alive.wrapping_add(plain.len() as u64);
-        Ok(())
+        Ok(true)
     }
 
     /// 屏幕流 keepAlive（内部按 1s 节流，调用方在推流循环里逐帧调用即可）。
@@ -330,7 +348,7 @@ impl ScreenSender {
         let mut wire = Vec::with_capacity(HEADER_LEN + body.len());
         wire.extend_from_slice(&header);
         wire.extend_from_slice(&body);
-        self.w.write_all(&wire).await
+        self.write_wire(&wire).await
     }
 
     /// 已发送帧总数（对外统计，如英雄卡实时帧率取差值）。
@@ -434,5 +452,70 @@ pub fn build_avcc(sps: &[u8], pps: &[u8]) -> Vec<u8> {
     avcc.extend_from_slice(&(pps.len() as u16).to_be_bytes());
     avcc.extend_from_slice(pps);
     avcc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::chacha_open;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn read_packet(stream: &mut TcpStream) -> ([u8; HEADER_LEN], Vec<u8>) {
+        let mut header = [0u8; HEADER_LEN];
+        tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut header)).await.unwrap().unwrap();
+        let len = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
+        let mut body = vec![0; len];
+        stream.read_exact(&mut body).await.unwrap();
+        (header, body)
+    }
+
+    #[tokio::test]
+    async fn standby_source_switch_restores_config_and_uses_one_monotonic_wire_clock() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let (_r, w) = client.into_split();
+        let key = [6; 32];
+        let mut sender = ScreenSender::new(w, ScreenCipher::ChaCha(key), 1920, 720, false);
+        let standby = crate::airplay::standby_for_aspect(2560, 752).unwrap();
+        let source = [0, 0, 0, 1, 0x67, 0x42, 0, 0x1e, 0, 0, 0, 1, 0x68, 0xce, 0, 0, 0, 1, 0x65, 0x88];
+        let mut previous_ntp = 0;
+        let mut counter = 0;
+        for (width, height, frame) in [
+            (standby.width, standby.height, standby.frames[0]),
+            (1920, 720, source.as_slice()),
+            (standby.width, standby.height, standby.frames[0]),
+            (1920, 720, source.as_slice()),
+        ] {
+            sender.set_size(width, height);
+            sender.reset_video_config();
+            let earliest = crate::timing::monotonic_nanos();
+            assert!(sender.send_video_annexb(frame).await.unwrap());
+            let latest = crate::timing::monotonic_nanos() + 1_000_000;
+            let (config, body) = read_packet(&mut server).await;
+            assert_eq!(config[4], OP_CONFIG);
+            assert!(!body.is_empty());
+            assert_eq!(config[6], SCREEN_FLAG_ENCRYPTED);
+            assert_eq!(f32::from_le_bytes(config[16..20].try_into().unwrap()), width as f32);
+            assert_eq!(f32::from_le_bytes(config[20..24].try_into().unwrap()), height as f32);
+            let (header, sealed) = read_packet(&mut server).await;
+            assert_eq!(header[4], OP_FRAME);
+            let ntp = u64::from_le_bytes(header[8..16].try_into().unwrap());
+            assert!(ntp > previous_ntp);
+            assert!(ntp >= u64::from_be_bytes(ntp_be(earliest.saturating_sub(1_000))));
+            assert!(ntp <= u64::from_be_bytes(ntp_be(latest)));
+            previous_ntp = ntp;
+            let plain = chacha_open(&key, &nonce64(counter), &sealed, &header).unwrap();
+            assert!(!plain.is_empty());
+            counter += 1;
+        }
+        assert_eq!(sender.frames_sent(), 4);
+        // 配置包以及缺少配置的 P 帧，都不能算成已发送视频。
+        sender.reset_video_config();
+        assert!(!sender.send_video_annexb(&[0, 0, 0, 1, 0x41, 0x9a]).await.unwrap());
+        assert!(!sender.send_video_annexb(&source[..14]).await.unwrap());
+        assert_eq!(sender.frames_sent(), 4);
+    }
 }
 

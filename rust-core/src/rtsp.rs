@@ -18,6 +18,7 @@ use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, oneshot};
+use crate::session::{spawn_scoped, SessionStop};
 
 use crate::crypto::{chacha_open, chacha_seal, nonce64};
 
@@ -192,6 +193,7 @@ impl RtspChannel {
         read: OwnedReadHalf,
         write: OwnedWriteHalf,
         cipher: Option<ControlCipher>,
+        stop: Arc<SessionStop>,
     ) -> (Arc<Self>, mpsc::UnboundedReceiver<RtspMessage>) {
         let write = Arc::new(tokio::sync::Mutex::new(write));
         let cipher = Arc::new(Mutex::new(cipher));
@@ -200,7 +202,7 @@ impl RtspChannel {
             Arc::new(Mutex::new(HashMap::new()));
         let (inbound_tx, inbound) = mpsc::unbounded_channel();
 
-        let reader = tokio::spawn(reader_loop(
+        let reader = spawn_scoped(stop, reader_loop(
             read,
             write.clone(),
             cipher.clone(),
@@ -246,6 +248,7 @@ impl RtspChannel {
         let cseq = self.next_cseq();
         let (tx, rx) = oneshot::channel();
         self.pending.lock().insert(cseq, tx);
+        let _pending = PendingRequest { pending: self.pending.clone(), cseq };
 
         let head = format!(
             "{method} {path} RTSP/1.0\r\n\
@@ -264,20 +267,8 @@ impl RtspChannel {
         plaintext.extend_from_slice(head.as_bytes());
         plaintext.extend_from_slice(body);
 
-        let wire = {
-            let mut guard = self.cipher.lock();
-            match guard.as_mut() {
-                Some(cipher) => cipher.encrypt(&plaintext),
-                None => plaintext,
-            }
-        };
-        {
-            let mut w = self.write.lock().await;
-            w.write_all(&wire)
-                .await
-                .map_err(|e| format!("控制通道写失败: {e}"))?;
-            w.flush().await.ok();
-        }
+        write_serialized(&self.write, &self.cipher, &plaintext).await
+            .map_err(|e| format!("控制通道写失败 CSeq={cseq} {method} {path} kind={:?} os={:?}: {e}", e.kind(), e.raw_os_error()))?;
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(msg)) => Ok(msg),
@@ -310,18 +301,8 @@ impl RtspChannel {
         let mut plaintext = Vec::with_capacity(head.len() + body.len());
         plaintext.extend_from_slice(head.as_bytes());
         plaintext.extend_from_slice(body);
-        let wire = {
-            let mut guard = self.cipher.lock();
-            match guard.as_mut() {
-                Some(cipher) => cipher.encrypt(&plaintext),
-                None => plaintext,
-            }
-        };
-        let mut w = self.write.lock().await;
-        w.write_all(&wire)
-            .await
-            .map_err(|e| format!("事件通道写失败: {e}"))?;
-        w.flush().await.ok();
+        write_serialized(&self.write, &self.cipher, &plaintext).await
+            .map_err(|e| format!("事件通道写失败 kind={:?} os={:?}: {e}", e.kind(), e.raw_os_error()))?;
         Ok(())
     }
 
@@ -341,6 +322,27 @@ type SharedWrite = Arc<tokio::sync::Mutex<OwnedWriteHalf>>;
 type SharedCipher = Arc<Mutex<Option<ControlCipher>>>;
 type PendingMap = Arc<Mutex<HashMap<i32, oneshot::Sender<RtspMessage>>>>;
 
+struct PendingRequest { pending: PendingMap, cseq: i32 }
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) { self.pending.lock().remove(&self.cseq); }
+}
+
+/// nonce 分配与 TCP 写入必须在同一串行区间。先加密再等待写锁会让并发心跳/应答乱序。
+async fn write_serialized(write: &SharedWrite, cipher: &SharedCipher, plaintext: &[u8]) -> std::io::Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut w = write.lock().await;
+        let wire = {
+            let mut guard = cipher.lock();
+            match guard.as_mut() {
+                Some(c) => c.encrypt(plaintext),
+                None => plaintext.to_vec(),
+            }
+        };
+        w.write_all(&wire).await
+    }).await.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "RTSP write exceeded 5s"))?
+}
+
 async fn reader_loop(
     mut read: OwnedReadHalf,
     write: SharedWrite,
@@ -353,9 +355,15 @@ async fn reader_loop(
     let mut chunk = [0u8; 4096];
     loop {
         let n = match read.read(&mut chunk).await {
-            Ok(0) => break,
+            Ok(0) => {
+                crate::emit_log("EVENT/CTRL: TCP EOF，对端已关闭读取通道");
+                break;
+            }
             Ok(n) => n,
-            Err(_) => break,
+            Err(e) => {
+                crate::emit_log(&format!("EVENT/CTRL: 读取失败 kind={:?} os={:?}: {e}", e.kind(), e.raw_os_error()));
+                break;
+            }
         };
         raw.extend_from_slice(&chunk[..n]);
 
@@ -369,7 +377,7 @@ async fn reader_loop(
                         Some(p)
                     }
                     Err(e) => {
-                        log::error!("EVENT/CTRL: {e}——关闭通道");
+                        crate::emit_log(&format!("EVENT/CTRL: {e}——关闭通道"));
                         break;
                     }
                 },
@@ -393,7 +401,11 @@ async fn reader_loop(
                 }
             } else {
                 // 车机的来向请求：先应答（立即，防止车机塞满 3 条拆通道），再分发
-                respond_ok(&write, &cipher, msg.cseq()).await;
+                if let Err(e) = respond_ok(&write, &cipher, msg.cseq()).await {
+                    crate::emit_log(&format!("EVENT/CTRL: 应答写失败 kind={:?} os={:?}: {e}", e.kind(), e.raw_os_error()));
+                    pending.lock().clear();
+                    return;
+                }
                 // 上层接收器被丢弃（会话收尾）时静默跳过，不结束读循环
                 let _ = inbound_tx.send(msg);
             }
@@ -403,19 +415,83 @@ async fn reader_loop(
     pending.lock().clear();
 }
 
-async fn respond_ok(write: &SharedWrite, cipher: &SharedCipher, cseq: Option<i32>) {
+async fn respond_ok(write: &SharedWrite, cipher: &SharedCipher, cseq: Option<i32>) -> std::io::Result<()> {
     let head = match cseq {
         Some(c) => format!("RTSP/1.0 200 OK\r\nContent-Length: 0\r\nCSeq: {c}\r\n\r\n"),
         None => "RTSP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n".to_string(),
     };
-    let wire = {
-        let mut guard = cipher.lock();
-        match guard.as_mut() {
-            Some(c) => c.encrypt(head.as_bytes()),
-            None => head.into_bytes(),
+    write_serialized(write, cipher, head.as_bytes()).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn encrypted_concurrent_writes_and_inbound_replies_keep_nonce_order() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let (r, w) = client.into_split();
+        let stop = SessionStop::new(90);
+        let (channel, mut inbound) = RtspChannel::spawn(r, w, Some(ControlCipher::new([1; 32], [2; 32])), stop.clone());
+        let hold_write = channel.write.lock().await;
+        let mut tasks = Vec::new();
+        for i in 0..128 {
+            let channel = channel.clone();
+            tasks.push(tokio::spawn(async move {
+                channel.post_fire_and_forget("/command", format!("body-{i}").as_bytes(), "text/plain").await.unwrap();
+            }));
         }
-    };
-    let mut w = write.lock().await;
-    let _ = w.write_all(&wire).await;
-    let _ = w.flush().await;
+        // 正在等待写锁的消息不得提前消耗 nonce。
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(channel.cipher.lock().as_ref().unwrap().write_counter, 0);
+        drop(hold_write);
+        let mut remote_cipher = ControlCipher::new([2; 32], [1; 32]);
+        let request = remote_cipher.encrypt(b"POST /command RTSP/1.0\r\nCSeq: 701\r\nContent-Length: 0\r\n\r\n");
+        server.write_all(&request).await.unwrap();
+        let mut raw = Vec::new();
+        let mut plain = Vec::new();
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while received.len() < 129 {
+                let mut chunk = [0u8; 16384];
+                let n = server.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                raw.extend_from_slice(&chunk[..n]);
+                let (decoded, consumed) = remote_cipher.decrypt(&raw).unwrap();
+                raw.drain(..consumed);
+                plain.extend_from_slice(&decoded);
+                received.extend(parse_rtsp_messages(&mut plain));
+            }
+        }).await.unwrap();
+        for task in tasks { task.await.unwrap(); }
+        assert_eq!(received.iter().filter(|m| !m.is_response()).count(), 128);
+        assert!(received.iter().any(|m| m.status() == 200 && m.cseq() == Some(701)));
+        assert_eq!(inbound.recv().await.unwrap().cseq(), Some(701));
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(1), stop.wait_idle()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_removes_pending_transaction() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (_server, _) = listener.accept().await.unwrap();
+        let (r, w) = client.into_split();
+        let stop = SessionStop::new(91);
+        let (channel, _inbound) = RtspChannel::spawn(r, w, None, stop.clone());
+        let request_channel = channel.clone();
+        let task = tokio::spawn(async move {
+            let _ = request_channel.request("GET", "/info", &[], "", &[], Duration::from_secs(20)).await;
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(channel.pending.lock().len(), 1);
+        task.abort();
+        let _ = task.await;
+        assert!(channel.pending.lock().is_empty());
+        stop.cancel();
+        stop.wait_idle().await;
+    }
 }

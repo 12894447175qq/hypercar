@@ -104,10 +104,11 @@ class WifiJoiner(
      * @param ssid 热点名（可能含空格/中文）。
      * @param psk  热点密码；空=开放热点；WEP 形态返回 [JoinResult.Unsupported]。
      */
-    suspend fun joinCarHotspotSilently(ssid: String, psk: String): JoinResult {
+    suspend fun joinCarHotspotSilently(ssid: String, psk: String, securityType: Int? = null): JoinResult {
         lastFailureReason = null
-        // WEP 无法用 wpa2/开放表达——两条路径都不支持，交调用方兜底
-        if (isWepKey(psk)) {
+        val mode = CarHotspotSecurity.resolve(securityType, psk)
+        // WEP 只能依据协议类型识别；合法 WPA2 密码也可能是 10/13/26 字符。
+        if (mode == CarHotspotSecurity.Mode.WEP) {
             lastFailureReason = "热点是 WEP 加密，公开 API 无法静默入网"
             return JoinResult.Unsupported
         }
@@ -115,27 +116,32 @@ class WifiJoiner(
         release()
         return if (ShizukuTools.isReady) {
             Log.i(TAG, "Shizuku 可用：走 cmd wifi 静默路径（0 弹窗）")
-            joinViaShell(ssid, psk)
+            joinViaShell(ssid, psk, mode)
         } else {
             Log.i(TAG, "Shizuku 不可用：降级为 WifiNetworkSpecifier（热点首连需确认一次）")
-            joinViaSpecifier(ssid, psk)
+            joinViaSpecifier(ssid, psk, mode)
         }
     }
 
     /** Shizuku 路径：`cmd wifi connect-network` 静默入网（0 弹窗，热点进系统已保存网络）。 */
-    private suspend fun joinViaShell(ssid: String, psk: String): JoinResult =
+    private suspend fun joinViaShell(ssid: String, psk: String, mode: CarHotspotSecurity.Mode): JoinResult =
         withContext(Dispatchers.IO) {
             // ① 确保 WiFi 开关打开
             ShizukuTools.exec("cmd wifi set-wifi-enabled enabled")
 
             // ② connect-network：exit=0 仅表示「已投递给 WifiService」，不代表已连上
             val connectCmd =
-                if (psk.isBlank()) {
+                if (mode == CarHotspotSecurity.Mode.OPEN) {
                     "cmd wifi connect-network ${shellQuote(ssid)} open"
                 } else {
-                    "cmd wifi connect-network ${shellQuote(ssid)} wpa2 ${shellQuote(psk)}"
+                    "cmd wifi connect-network ${shellQuote(ssid)} ${mode.shellName} ${shellQuote(psk)}"
                 }
-            ShizukuTools.exec(connectCmd)
+            val result = ShizukuTools.exec(connectCmd)
+            if (result.code != 0) {
+                // shell 错误可能回显参数；只记录退出码，密码不写进日志。
+                lastFailureReason = "系统未接受 Wi-Fi 连接请求（exit=${result.code}, security=${mode.shellName}）"
+                return@withContext JoinResult.Failed
+            }
 
             // ③ 轮询 cmd wifi status 直到 SSID 匹配（500ms × 15s，可取消）
             if (!awaitSsid(ssid, JOIN_WAIT_MS)) {
@@ -165,13 +171,17 @@ class WifiJoiner(
      * 用法是：装好后先手动打开一次 App 完成首连确认，之后「上车自动连接」才会全程静默。
      * 拿不到句柄（框弹不出/用户拒绝/超时）一律返回 Failed，由调用方降级到「绑定当前网络」。
      */
-    private suspend fun joinViaSpecifier(ssid: String, psk: String): JoinResult =
+    private suspend fun joinViaSpecifier(ssid: String, psk: String, mode: CarHotspotSecurity.Mode): JoinResult =
         withContext(Dispatchers.IO) {
             val specifier = WifiNetworkSpecifier.Builder().apply {
                 setSsid(ssid)
                 // 开放网络：Builder 没有 setOpenNetwork()，不设任何密码方法即为开放；
                 // WPA2 只有 setWpa2Passphrase 一条路径。
-                if (psk.isNotBlank()) setWpa2Passphrase(psk)
+                when (mode) {
+                    CarHotspotSecurity.Mode.WPA3 -> setWpa3Passphrase(psk)
+                    CarHotspotSecurity.Mode.WPA2 -> setWpa2Passphrase(psk)
+                    else -> Unit
+                }
             }.build()
 
             // app 专属网络：只能加 TRANSPORT_WIFI + specifier，
@@ -284,9 +294,6 @@ class WifiJoiner(
             }
         }
     }
-
-    /** WEP 密钥形态（5/10/13/26 位）——静默路径无法表达，返回 true 让调用方走兜底。 */
-    private fun isWepKey(psk: String): Boolean = psk.length in setOf(5, 10, 13, 26)
 
     /** 轮询 `cmd wifi status` 直到出现目标 SSID；[timeoutMs] 内未匹配返回 false。可取消。 */
     private suspend fun awaitSsid(ssid: String, timeoutMs: Long): Boolean {

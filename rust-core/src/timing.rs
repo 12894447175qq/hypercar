@@ -13,6 +13,8 @@
 use tokio::net::UdpSocket;
 
 use once_cell::sync::Lazy;
+use std::sync::Arc;
+use crate::session::{spawn_scoped, SessionStop};
 
 /// 进程级单调时间基：timesync 应答与音频同步包**必须共用同一原点**，
 /// 否则车机算出的媒体时钟锚点会带一个常量偏移（音画不同步）。
@@ -98,13 +100,13 @@ impl TimingServer {
     /// 非 async 签名下无法直接 await 绑定，故走「std 绑定 → 非阻塞 →
     /// `UdpSocket::from_std`」路径；`from_std` 需要注册到 reactor，因此**必须在
     /// tokio runtime 上下文中调用**（会话流程本就跑在 async 里，天然满足）。
-    pub fn start() -> std::io::Result<Self> {
+    pub fn start(stop: Arc<SessionStop>) -> std::io::Result<Self> {
         let std_socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
         std_socket.set_nonblocking(true)?; // tokio 要求非阻塞模式
         let port = std_socket.local_addr()?.port();
         let socket = UdpSocket::from_std(std_socket)?;
 
-        let task = tokio::spawn(async move {
+        let task = spawn_scoped(stop, async move {
             let mut buf = [0u8; 256];
             loop {
                 let (len, peer) = match socket.recv_from(&mut buf).await {
@@ -126,5 +128,41 @@ impl TimingServer {
     /// 停止应答循环（abort 后台任务；socket 随任务一起丢弃）。
     pub fn stop(&mut self) {
         self.task.abort();
+    }
+}
+
+impl Drop for TimingServer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn timing_answers_then_releases_port_on_stop_and_on_failed_setup_drop() {
+        for explicit_stop in [true, false] {
+            let stop = SessionStop::new(51);
+            let server = TimingServer::start(stop.clone()).unwrap();
+            let port = server.port;
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut request = [0u8; 32];
+            request[..4].copy_from_slice(&[0x80, 0xd2, 0, 7]);
+            request[24..].copy_from_slice(&123u64.to_be_bytes());
+            client.send_to(&request, ("127.0.0.1", port)).await.unwrap();
+            let mut response = [0u8; 32];
+            let (n, _) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut response)).await.unwrap().unwrap();
+            assert_eq!(n, 32);
+            assert_eq!(response[1], 0xd3);
+            assert_eq!(&response[8..16], &request[24..32]);
+            if explicit_stop { stop.cancel(); }
+            drop(server);
+            tokio::time::timeout(Duration::from_secs(1), stop.wait_idle()).await.unwrap();
+            let rebound = UdpSocket::bind(("0.0.0.0", port)).await.unwrap();
+            drop(rebound);
+        }
     }
 }

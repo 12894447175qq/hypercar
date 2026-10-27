@@ -182,6 +182,21 @@ class Iap2LinkEngine(
     /** 进入协商：发 marker + 同步包（发送端=发起方）。 */
     fun start(nowMillis: Long) {
         if (state != State.IDLE) return
+        initiate(nowMillis)
+    }
+
+    /** MIB3：主屏 SETUP 后先 DETECT，采纳车机 SYN，再回 SYN|ACK。 */
+    fun startResponder(nowMillis: Long) {
+        if (state != State.IDLE) return
+        state = State.NEGOTIATING
+        appendOutput(MARKER)
+        markerDeadline = nowMillis + MARKER_RESEND_MILLIS
+        lastOutputMillis = nowMillis
+    }
+
+    /** 无对端会话表时可退回本表 SYN；已建链的连接不能被迟到 marker 重置。 */
+    fun initiate(nowMillis: Long) {
+        if (state == State.NORMAL || state == State.DEAD || peerSynchronization != null) return
         state = State.NEGOTIATING
         appendOutput(MARKER)
         markerDeadline = nowMillis + MARKER_RESEND_MILLIS

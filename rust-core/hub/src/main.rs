@@ -57,10 +57,14 @@ mod pairing;
 mod rtsp;
 #[path = "../../src/screen.rs"]
 mod screen;
+#[path = "../../src/session.rs"]
+mod session;
 #[path = "../../src/srp6a.rs"]
 mod srp6a;
 #[path = "../../src/timing.rs"]
 mod timing;
+#[path = "../../src/video_pipeline.rs"]
+mod video_pipeline;
 #[path = "../../src/tlv8.rs"]
 mod tlv8;
 
@@ -68,21 +72,28 @@ use std::net::ToSocketAddrs;
 use std::time::Duration;
 
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
 
 use airplay::{SocketProvider, TouchInput};
 
 // ---- lib.rs 里的 emit_* 在这里换成 stdout（Android 版走 JNI 回调）----
 
 pub(crate) fn emit_log(line: &str) {
+    if !session::callback_allowed() { return; }
     println!("[log]   {line}");
 }
 
+pub(crate) fn emit_iap(bytes: &[u8]) {
+    emit_log(&format!("IAPLINK: PC harness received {} bytes; virtual control is implemented by the Android client", bytes.len()));
+}
+
 pub(crate) fn emit_state(state: &str, detail: &str) {
+    if !session::callback_allowed() { return; }
     println!("[state] {state}: {detail}");
 }
 
 pub(crate) fn emit_stats(fps: i32, frames: i64, kbps: i64, audio_playing: bool, ducking: bool) {
+    if !session::callback_allowed() { return; }
     println!("[stats] fps={fps} frames={frames} kbps={kbps} audio={audio_playing} duck={ducking}");
 }
 
@@ -899,7 +910,7 @@ async fn run(args: Args) -> Result<(), String> {
     let (touch_tx, touch_rx) = mpsc::unbounded_channel::<TouchInput>();
     let (key_tx, key_rx) = mpsc::unbounded_channel::<u32>();
 
-    let stop = Arc::new(Notify::new());
+    let stop = session::SessionStop::new(1);
 
     // Ctrl+C → 通知引擎收摊
     {
@@ -907,8 +918,7 @@ async fn run(args: Args) -> Result<(), String> {
         tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
                 println!("[main] 收到 Ctrl+C，正在停止…");
-                stop.notify_waiters();
-                stop.notify_one();
+                stop.cancel();
             }
         });
     }
@@ -935,6 +945,7 @@ async fn run(args: Args) -> Result<(), String> {
     };
 
     // 3) 交给引擎：它内部会起 CarLife HU，再做 AirPlay 协商与双泵
+    let (_iap_tx, iap_rx) = mpsc::channel(1);
     let result = engine::run_engine(
         cfg,
         control,
@@ -945,9 +956,12 @@ async fn run(args: Args) -> Result<(), String> {
         key_rx,
         // PC 侧不提供麦克风：语音助手用手机自己的麦克风（见 --voice）
         None,
-        stop,
+        iap_rx,
+        stop.clone(),
     )
     .await;
+    stop.cancel();
+    stop.wait_idle().await;
 
     match result {
         Ok(()) => {

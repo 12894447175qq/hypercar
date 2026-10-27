@@ -1,4 +1,4 @@
-﻿//! 网关引擎编排：CarLife 回环 ⇄ AirPlay 推流 的粘合层。
+//! 网关引擎编排：CarLife 回环 ⇄ AirPlay 推流 的粘合层。
 //!
 //! 数据面（全部零转码）：
 //!  - 视频：CarLife 8240 的 H.264 Annex B 裸流 → ScreenSender（128B 头 + ChaCha20-Poly1305）
@@ -17,18 +17,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
+use crate::session::{spawn_scoped, SessionStop};
 
 use crate::airplay::{self, AirplayParams, SocketProvider, TouchInput};
 use crate::audio_out::AudioOut;
 use crate::carlife::{CarLifeConfig, CarLifeHub};
 use crate::screen::ScreenSender;
+use crate::video_pipeline::SourceVideoBuffer;
 use crate::{emit_log, emit_stats, emit_state};
 
 /// CarLife 通道产出的事件。
 pub enum CarLifeEvent {
     Handshake,
-    VideoFrame { pts_us: u64, data: Vec<u8> },
+    VideoFrame { source_timestamp: u32, data: Vec<u8> },
     AudioInit { tts: bool, rate: u32, channels: u8 },
     AudioStop { tts: bool },
     AudioData { tts: bool, rate: u32, channels: u8, data: Vec<u8> },
@@ -96,8 +98,10 @@ pub async fn run_engine(
     mut key_rx: mpsc::UnboundedReceiver<u32>,
     // 麦克风 PCM 来源（PC 侧联调注入；Android 上为 None）
     mut mic_rx: Option<mpsc::UnboundedReceiver<Vec<i16>>>,
-    stop: Arc<Notify>,
+    iap_rx: mpsc::Receiver<Vec<u8>>,
+    stop: Arc<SessionStop>,
 ) -> Result<(), String> {
+    if stop.is_cancelled() { return Ok(()); }
     emit_state("negotiating", "CarLife 网关启动");
 
     // ---- CarLife 网关先行：协商期间 CarLife app 即可接入回环 ----
@@ -118,13 +122,16 @@ pub async fn run_engine(
             // **端口被本机 CarLife 占了 = 它才是监听方**：小米 CarLife/CarWith 在
             // 「车辆热点 → 开始连接」后自己 bind 7240~9340 等车机连入。此时我们改当客户端，
             // 直接拨 127.0.0.1 即可同机打通（2026-10-25 验证：两个进程抢 7240 会双双卡死）。
+            #[cfg(not(target_os = "android"))]
             Err(e) if e.contains("Address already in use") || e.contains("os error 98") => {
                 emit_log(
                     "CARLIFE: 7240 已被本机 CarLife/CarWith 监听占用——自动改走「主动拨号 127.0.0.1」",
                 );
                 CarLifeHub::connect(life_cfg, "127.0.0.1".to_string(), stop.clone())?
             }
-            Err(e) => return Err(e),
+            // Android 的 md_host 必须由 Kotlin 的 UID/LISTEN 校验决定。
+            // bind 冲突也可能来自残留任务或其他程序，不能据此盲拨 127.0.0.1。
+            Err(e) => return Err(format!("{e}；请核对本轮端口归属与旧任务退出状态")),
         },
     };
     let hub = Arc::new(hub);
@@ -133,7 +140,7 @@ pub async fn run_engine(
     {
         let hub = hub.clone();
         let stop_t = stop.clone();
-        tokio::spawn(async move {
+        spawn_scoped(stop.clone(), async move {
             loop {
                 tokio::select! {
                     _ = stop_t.notified() => return,
@@ -154,7 +161,7 @@ pub async fn run_engine(
     if let Some(mut mic_rx) = mic_rx.take() {
         let hub = hub.clone();
         let stop_m = stop.clone();
-        tokio::spawn(async move {
+        spawn_scoped(stop.clone(), async move {
             loop {
                 tokio::select! {
                     _ = stop_m.notified() => return,
@@ -171,7 +178,7 @@ pub async fn run_engine(
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<CarLifeEvent>();
     {
         let stop_d = stop.clone();
-        tokio::spawn(async move {
+        spawn_scoped(stop.clone(), async move {
             loop {
                 tokio::select! {
                     _ = stop_d.notified() => return,
@@ -187,6 +194,7 @@ pub async fn run_engine(
                                 ev,
                                 CarLifeEvent::VideoFrame { .. }
                                     | CarLifeEvent::EncoderResolution { .. }
+                                    | CarLifeEvent::ClientLeft { video: true }
                             );
                             if to_audio {
                                 if audio_tx.send(ev).is_err() { return; }
@@ -195,8 +203,6 @@ pub async fn run_engine(
                             } else {
                                 match ev {
                                     CarLifeEvent::Handshake => emit_log("CARLIFE: 握手完成"),
-                                    CarLifeEvent::ClientLeft { video: true } =>
-                                        emit_log("CARLIFE: 视频客户端断开"),
                                     _ => {}
                                 }
                             }
@@ -208,154 +214,158 @@ pub async fn run_engine(
         });
     }
 
-    // ---- 视频泵 ----
+    // ---- 视频泵：来源与等待页分别保存解码状态 ----
     let (screen_ready_tx, screen_ready_rx) = tokio::sync::oneshot::channel::<ScreenSender>();
     let video_stats = Arc::new(Mutex::new(PumpStat::default()));
+    let initial_size = (cfg.width, cfg.height);
     {
         let stop_v = stop.clone();
         let stats = video_stats.clone();
-        tokio::spawn(async move {
+        spawn_scoped(stop.clone(), async move {
             let mut sender: Option<ScreenSender> = None;
-            // 屏幕流就绪前收到的编码尺寸先存着，就绪时补上
-            let mut pending_size: Option<(u32, u32)> = None;
+            let mut source = SourceVideoBuffer::new(initial_size.0, initial_size.1);
             let mut ready = Some(screen_ready_rx);
             let mut video_rx = video_rx;
-            // 16ms tick：CarLife 没推流时用它按 ~60fps 发待机循环帧（真帧来了就以真帧为主）
             let mut tick = tokio::time::interval(Duration::from_millis(16));
-            // CarLife 还没开始推流时，用待机卡片按 1 帧/秒占住屏幕流（避免车机黑屏/提前关通道）
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut showing_standby = true;
             let mut last_real_frame: Option<std::time::Instant> = None;
-            let mut standby_idx: usize = 0;
-            let mut standby_size_sent: Option<(u32, u32)> = None;
-            // 待机节奏：前 2s 全速（60fps）让接收端锁住流，之后降到 15fps 省带宽；
-            // 每 5s 从 IDR 重放一次，迟到的/卡住的解码器能自己恢复。
-            let mut standby_started: Option<std::time::Instant> = None;
-            let mut standby_tick: u32 = 0;
+            let mut source_timestamp_logged = false;
+            let mut standby_idx = 0usize;
+            let mut standby_size_sent = None;
+            let mut standby_started = std::time::Instant::now();
+            let mut standby_tick = 0u32;
             let mut standby_last_idr = std::time::Instant::now();
             loop {
                 tokio::select! {
                     _ = stop_v.notified() => return,
                     r = async {
                         match ready.as_mut() {
-                            Some(rx) => Some(rx.await.ok()),
+                            Some(rx) => rx.await.ok(),
                             None => std::future::pending().await,
                         }
                     } => {
-                        if let Some(mut s) = r.flatten() {
-                            if let Some((w, h)) = pending_size.take() {
-                                s.set_size(w, h);
-                            }
-                            sender = Some(s);
-                        }
+                        sender = r;
                         ready = None;
+                        if sender.is_none() { return; }
                     }
                     ev = video_rx.recv() => match ev {
                         Some(CarLifeEvent::EncoderResolution { width, height }) => {
-                            // 手机回报实际编码尺寸 → 同步 AirPlay 画布（VideoConfig 宽高）。
-                            // 必须在首帧引出 VideoConfig 之前生效，否则车机按旧画布解码。
-                            if let Some(s) = sender.as_mut() {
-                                s.set_size(width, height);
-                            } else {
-                                pending_size = Some((width, height));
-                            }
+                            // 等待页可以临时用母版尺寸，但不能覆盖来源尺寸。
+                            source.set_size(width, height);
                         }
-                        Some(CarLifeEvent::VideoFrame { pts_us, data }) => {
-                            if let Some(s) = sender.as_mut() {
-                                let len = data.len() as u64;
-                                // CarLife 媒体头的时间戳偶有 0/非单调（不同发送端实现不一），
-                                // 直接当 PTS 会让车机按 0 排播 → 卡顿/丢帧。为 0 时用本机单调钟。
-                                let pts = if pts_us == 0 {
-                                    crate::timing::monotonic_nanos() / 1_000
-                                } else {
-                                    pts_us
-                                };
-                                if s.send_video_annexb(&data, pts).await.is_err() {
-                                    emit_state("ended", "屏幕流写失败（车机侧断开）");
-                                    return;
-                                }
-                                last_real_frame = Some(std::time::Instant::now());
-                                let mut st = stats.lock();
-                                st.frames += 1;
-                                st.bytes += len;
+                        Some(CarLifeEvent::VideoFrame { source_timestamp, data }) => {
+                            if !source_timestamp_logged {
+                                source_timestamp_logged = true;
+                                emit_log(&format!(
+                                    "VIDEO: 来源原始时间戳={source_timestamp}；输出统一使用本机单调钟，与 AirPlay timing 同源"
+                                ));
                             }
-                            // 屏幕流未就绪：丢帧（CarLife 先于 AirPlay 接入属正常）
+                            // AirPlay 尚未就绪时保留有 SPS/PPS/IDR 的完整 GOP。
+                            source.push(data);
+                        }
+                        Some(CarLifeEvent::ClientLeft { video: true }) => {
+                            source.require_keyframe();
+                            last_real_frame = None;
+                            emit_log("CARLIFE: 视频来源断开；重连后等待新的来源 IDR，禁止沿用旧参考帧");
                         }
                         Some(_) => {}
                         None => return,
                     },
                     _ = tick.tick() => {
-                        // 屏幕流 keepAlive 帧（明文、1s 节流；缺它 Audi MMI 3315 10.2s 拆轮）
                         if let Some(s) = sender.as_mut() {
-                            let _ = s.maybe_send_keep_alive().await;
-                            // CarLife 还没推流 → 按 ~60fps 播放待机循环（1 IDR + 59 个极小 P 帧）。
-                            // 真帧到达后自动停用（1s 内有过真帧就不再插卡片）。
+                            if let Err(error) = s.maybe_send_keep_alive().await {
+                                screen_write_failed("keepAlive", error, &stats, &stop_v);
+                                return;
+                            }
                             let stale = last_real_frame
                                 .map(|t| t.elapsed() >= Duration::from_millis(900))
                                 .unwrap_or(true);
-                            if stale {
-                                let (w, h) = s.size();
-                                if let Some(set) =
-                                    crate::airplay::standby_for_aspect(w, h)
-                                {
+                            if stale && !source.has_pending() {
+                                if !showing_standby {
+                                    // 等待页是另一条 H.264 流，返回来源时必须重新从 IDR 开始。
+                                    source.require_keyframe();
+                                    showing_standby = true;
+                                    standby_size_sent = None;
+                                }
+                                if let Some(set) = crate::airplay::standby_for_aspect(source.size.0, source.size.1) {
                                     if !set.frames.is_empty() {
                                         if standby_size_sent != Some((set.width, set.height)) {
-                                            // 切到母版尺寸并重发 VideoConfig（画面就是母版分辨率）
                                             s.set_size(set.width, set.height);
-                                            if let Some(first) = set.frames.first() {
-                                                let nals = crate::screen::annexb_nals(first);
-                                                let sps = nals.iter().find(|n| crate::screen::nal_type(n) == 7).copied();
-                                                let pps = nals.iter().find(|n| crate::screen::nal_type(n) == 8).copied();
-                                                if let (Some(sps), Some(pps)) = (sps, pps) {
-                                                    let avcc = crate::screen::build_avcc(sps, pps);
-                                                    let _ = s.send_config(&avcc).await;
-                                                }
-                                            }
+                                            s.reset_video_config();
                                             standby_size_sent = Some((set.width, set.height));
                                             standby_idx = 0;
                                             standby_tick = 0;
-                                            standby_started = Some(std::time::Instant::now());
-                                            standby_last_idr = std::time::Instant::now();
+                                            standby_started = std::time::Instant::now();
+                                            standby_last_idr = standby_started;
                                             emit_log(&format!(
-                                                "AIRPLAY: 待机循环开始（母版 {}x{}，{} 帧；前 2s 60fps，之后 15fps，每 5s 补 IDR）",
-                                                set.width,
-                                                set.height,
-                                                set.frames.len()
+                                                "AIRPLAY: 等待页 {}x{}；来源尺寸保留为 {}x{}，等待来源 SPS/PPS/IDR",
+                                                set.width, set.height, source.size.0, source.size.1
                                             ));
                                         }
                                         standby_tick = standby_tick.wrapping_add(1);
-                                        let warmup = standby_started
-                                            .map(|t| t.elapsed() < Duration::from_secs(2))
-                                            .unwrap_or(true);
-                                        // tick 是 16ms（≈60fps）：每 4 拍发一帧 = 15fps
-                                        let mut due = warmup || standby_tick % 4 == 0;
+                                        let mut due = standby_started.elapsed() < Duration::from_secs(2)
+                                            || standby_tick % 4 == 0;
                                         if standby_last_idr.elapsed() >= Duration::from_secs(5) {
-                                            // 强制从 IDR 重放：接收端中途重启/丢包也能恢复画面
                                             standby_idx = 0;
                                             standby_last_idr = std::time::Instant::now();
                                             due = true;
                                         }
                                         if due {
                                             let frame = set.frames[standby_idx % set.frames.len()];
-                                            let pts = crate::timing::monotonic_nanos() / 1_000;
-                                            let _ = s.send_video_annexb(frame, pts).await;
+                                            if let Err(error) = s.send_video_annexb(frame).await {
+                                                screen_write_failed("standby/config", error, &stats, &stop_v);
+                                                return;
+                                            }
                                             standby_idx = standby_idx.wrapping_add(1);
                                         }
                                     }
                                 }
-                                    }
+                            }
+                        }
+                    }
+                }
+                // ready、尺寸或视频事件任一到达后立即冲刷，首帧不必等待下一帧触发。
+                if source.has_pending() {
+                    if let Some(s) = sender.as_mut() {
+                        if showing_standby || s.size() != source.size {
+                            s.set_size(source.size.0, source.size.1);
+                            s.reset_video_config();
+                            showing_standby = false;
+                            standby_size_sent = None;
+                            emit_log(&format!("VIDEO: 切换到来源 {}x{}，重发来源解码参数与 IDR", source.size.0, source.size.1));
+                        }
+                        while let Some(data) = source.pop() {
+                            match s.send_video_annexb(&data).await {
+                                Ok(true) => {
+                                    last_real_frame = Some(std::time::Instant::now());
+                                    let mut st = stats.lock();
+                                    st.frames += 1;
+                                    st.bytes += data.len() as u64;
+                                }
+                                Ok(false) => {
+                                    source.require_keyframe();
+                                    emit_log("VIDEO: 未写出来源帧，等待完整 SPS/PPS/IDR；本帧不计入统计");
+                                    break;
+                                }
+                                Err(error) => {
+                                    screen_write_failed("source/config", error, &stats, &stop_v);
+                                    return;
+                                }
+                            }
                         }
                     }
                 }
             }
         });
     }
-
     // ---- 音频泵：重采样 + 闪避混音 + RTP ----
     let (audio_out_tx, audio_out_rx) = tokio::sync::oneshot::channel::<AudioOut>();
     let audio_stats = Arc::new(Mutex::new(AudioPumpStat::default()));
     {
         let stop_a = stop.clone();
         let stats = audio_stats.clone();
-        tokio::spawn(async move {
+        spawn_scoped(stop.clone(), async move {
             let mut out: Option<AudioOut> = None;
             let mut ready = Some(audio_out_rx);
             let mut audio_rx = audio_rx;
@@ -506,9 +516,13 @@ pub async fn run_engine(
         factory,
         touch_tx,
         key_tx,
+        iap_rx,
         stop.clone(),
     )
     .await?;
+
+    // 计时服务与会话同寿命；协商失败和取消时也由 Drop 关闭 UDP 任务。
+    let _timing = outcome.timing;
 
     // 屏幕/音频发送器交给泵
     let _ = screen_ready_tx.send(outcome.screen);
@@ -521,7 +535,7 @@ pub async fn run_engine(
         let stop_s = stop.clone();
         let vstats = video_stats.clone();
         let astats = audio_stats.clone();
-        tokio::spawn(async move {
+        spawn_scoped(stop.clone(), async move {
             let mut last_frames = 0u64;
             let mut last_bytes = 0u64;
             let mut last_tick = tokio::time::Instant::now();
@@ -629,6 +643,22 @@ fn take_or_zero(q: &mut VecDeque<i16>) -> i16 {
 struct PumpStat {
     frames: u64,
     bytes: u64,
+}
+
+fn screen_write_failed(
+    stage: &str,
+    error: std::io::Error,
+    stats: &Mutex<PumpStat>,
+    stop: &SessionStop,
+) {
+    let frames = stats.lock().frames;
+    let detail = format!(
+        "屏幕流写失败 stage={stage} kind={:?} os={:?} sourceFrames={frames}: {error}",
+        error.kind(), error.raw_os_error()
+    );
+    emit_log(&detail);
+    emit_state("ended", &detail);
+    stop.cancel();
 }
 
 #[derive(Default)]

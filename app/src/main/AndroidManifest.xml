@@ -36,16 +36,10 @@
     <!-- 服务与唤醒 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
-    <!-- 语音助手要供麦（AudioRecord）：Android 14+ 后台录音必须声明 microphone 类型 -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <!-- 语音助手（2026-10-24 起）：CarLife 的语音识别要求「车机」侧提供麦克风数据
-         （VR 通道 VR_MIC_DATA 0x00058001）。本机 HU 就用手机自己的麦克风采，
-         经 nativeSendMic 注入；除此之外不采集任何音频。 -->
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <uses-feature
         android:name="android.hardware.bluetooth"
@@ -106,7 +100,7 @@
         <service
             android:name=".autowake.HyperCarService"
             android:exported="false"
-            android:foregroundServiceType="connectedDevice|microphone" />
+            android:foregroundServiceType="connectedDevice" />
 
         <!-- ACL 广播在隐式广播例外清单内，清单静态注册可拉起被杀进程 -->
         <!-- 调试：adb 广播触发 CarLife 投屏 AIDL 探测（结果写 files/cast_probe.txt） -->

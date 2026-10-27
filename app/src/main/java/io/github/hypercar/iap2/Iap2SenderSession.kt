@@ -801,6 +801,7 @@ class Iap2SenderSession(
             ipAddresses = startSession?.ipAddresses ?: emptyList(),
             // 网关不在 iAP2 消息里；上层入网后从 DHCP/链路信息取
             gateway = null,
+            securityType = wifi?.securityType ?: startSession?.wirelessAp?.securityType,
         )
 
     // ---- MFi 挑战 ----

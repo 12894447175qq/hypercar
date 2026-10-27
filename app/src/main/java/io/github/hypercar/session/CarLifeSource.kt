@@ -122,13 +122,19 @@ class CarLifeWakeSession(val source: CarLifeSource) {
 /** /proc/net/tcp{,6}: inspect LISTEN UID without consuming CarLife's single accept(). */
 object CarLifePorts {
     data class Listener(val port: Int, val uid: Int, val address: String)
-    fun parse(table: String): List<Listener> = table.lineSequence().mapNotNull { line ->
+    data class SocketRow(val port: Int, val uid: Int, val address: String, val state: String)
+    fun readable(table: String): Boolean = table.lineSequence().any {
+        it.contains("local_address") && it.contains("st")
+    }
+    fun sockets(table: String): List<SocketRow> = table.lineSequence().mapNotNull { line ->
         val cols = line.trim().split(Regex("\\s+"))
-        if (cols.size < 8 || cols[3] != "0A") return@mapNotNull null
+        if (cols.size < 8 || cols[3].toIntOrNull(16) == null) return@mapNotNull null
         val port = cols[1].substringAfterLast(':').toIntOrNull(16) ?: return@mapNotNull null
         val uid = cols[7].toIntOrNull() ?: return@mapNotNull null
-        Listener(port, uid, cols[1].substringBefore(':'))
+        SocketRow(port, uid, cols[1].substringBefore(':').uppercase(), cols[3].uppercase())
     }.toList()
+    fun parse(table: String): List<Listener> = sockets(table).filter { it.state == "0A" }
+        .map { Listener(it.port, it.uid, it.address) }
 
     fun owned(listeners: List<Listener>, port: Int, expectedUid: Int): Boolean {
         // Accept only wildcard/loopback listeners. A listener on another interface cannot serve 127.0.0.1.
