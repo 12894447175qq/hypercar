@@ -17,6 +17,14 @@ class CarLifeSourceTest {
     @Test fun missingVivoDoesNotSwitchSources() {
         assertNull(CarLifeSource.resolve(CarLifeSource.VIVO) { it != CarLifeSource.VIVO })
     }
+    @Test fun vivoRequiresTheOriginalJoviRenderer() {
+        assertNull(CarLifeSource.resolve(CarLifeSource.VIVO) { it != CarLifeSource.JOVI })
+    }
+    @Test fun automaticSelectionSkipsAnIncompleteVivoSource() {
+        assertEquals(CarLifeSource.XIAOMI, CarLifeSource.resolve("") {
+            it in setOf(CarLifeSource.VIVO, CarLifeSource.XIAOMI)
+        }!!.enginePackage)
+    }
     @Test fun otherSourcesKeepTheirOwnEngine() {
         for (pkg in listOf(CarLifeSource.PUBLIC, CarLifeSource.XIAOMI, "com.hihonor.carlink")) {
             assertEquals(pkg, CarLifeSource.resolve(pkg) { true }!!.enginePackage)
@@ -30,8 +38,29 @@ class CarLifeSourceTest {
         CarLifeWakeSession(CarLifeSource(CarLifeSource.VIVO)).wake({ commands.add(it) }, { false })
         assertEquals(listOf(
             "am start -n com.baidu.carlife.vivo/com.baidu.carlife.CarlifeActivity",
-            "am start-foreground-service -n com.baidu.carlife.vivo/com.baidu.carlife.service.CarlifeConnectService",
+            "am start-foreground-service -n com.baidu.carlife.vivo/com.baidu.carlife.service.CarlifeConnectService" +
+                " --es bindPackageName com.vivo.car.networking" +
+                " --es bindClassName com.vivo.vivo_car_service.CarLifeMixingService --ei usb_type 13 --ez mix_manual true",
         ), commands)
+    }
+    @Test fun vivoInitializesRendererEvenWhenItsPortsAreAlreadyOpen() = runTest {
+        val commands = mutableListOf<String>()
+        CarLifeWakeSession(CarLifeSource(CarLifeSource.VIVO)).wake({ commands.add(it) }, { true })
+        assertEquals(2, commands.size)
+        assertTrue(commands.last().contains("CarLifeMixingService"))
+        assertFalse(commands.any { it.contains("xiaomi") })
+    }
+    @Test fun existingVivoSocketPreparationDoesNotRestartActivity() = runTest {
+        val commands = mutableListOf<String>()
+        val session = CarLifeWakeSession(CarLifeSource(CarLifeSource.VIVO))
+        session.prepareRenderer { commands.add(it) }
+        assertEquals(1, commands.size)
+        assertTrue(commands.single().startsWith("am start-foreground-service"))
+    }
+    @Test fun closedSessionCannotInitializeRenderer() = runTest {
+        val session = CarLifeWakeSession(CarLifeSource(CarLifeSource.VIVO))
+        session.close()
+        session.prepareRenderer { error("closed connection must not launch Jovi") }
     }
     @Test fun listenerAvoidsRestartAndFallback() = runTest {
         val commands = mutableListOf<String>()

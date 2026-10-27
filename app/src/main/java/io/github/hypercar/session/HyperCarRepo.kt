@@ -472,7 +472,7 @@ object HyperCarRepo {
                 resolveCarLifeSource()?.let(::CarLifeWakeSession)
             } else null
             if ((SettingsStore.carlifeEnabled || SettingsStore.carlifeFirst) && carLifeSession == null) {
-                fail("所选 CarLife 组件未安装：${SettingsStore.carlifePackage}；请安装或重新选择来源")
+                fail("所选 CarLife 或厂商投屏组件未安装：${SettingsStore.carlifePackage}；vivo 来源还需要原厂 Jovi")
                 return
             }
             // Shizuku 从「必须」降级为「可选增强」：没有它照样能连，只是两条路径降级——
@@ -687,6 +687,7 @@ object HyperCarRepo {
             if (probeCarLifeOnce()) {
                 log("WAKE: CarLife 已在监听 7240——跳过拉起（避免触发单实例重启）")
                 _snapshots.value = _snapshots.value.copy(carLife = CarLifeState.Waiting())
+                prepareLocalCarLifeRenderer()
             } else {
                 wakeLocalCarLife()
             }
@@ -1701,6 +1702,37 @@ object HyperCarRepo {
         return null
     }
 
+    private fun prepareLocalCarLifeRenderer() {
+        val owner = carLifeSession ?: return
+        if (owner.source.rendererInitialization == null || !owner.isOpen || !sessionLive.get()) return
+        if (wakeJob?.isActive == true) return
+        wakeJob = scope.launch {
+            if (ShizukuTools.isReady) {
+                owner.prepareRenderer { command ->
+                    currentCoroutineContext().ensureActive()
+                    if (carLifeSession === owner && owner.isOpen && sessionLive.get()) {
+                        val r = ShizukuTools.exec(command, 8_000)
+                        log("WAKE: 初始化 vivo/Jovi 投屏来源 exit=${r.code} ${r.err.take(160)}")
+                    }
+                }
+            } else startVivoRendererWithoutShell(owner)
+        }
+    }
+
+    private fun startVivoRendererWithoutShell(owner: CarLifeWakeSession) {
+        if (owner.source.enginePackage != CarLifeSource.VIVO || carLifeSession !== owner || !owner.isOpen || !sessionLive.get()) return
+        val ctx = appContext() ?: return
+        owner.markUsed()
+        runCatching {
+            ctx.startForegroundService(android.content.Intent().setComponent(
+                android.content.ComponentName.unflattenFromString(owner.source.service!!))
+                .putExtra("bindPackageName", CarLifeSource.JOVI)
+                .putExtra("bindClassName", CarLifeSource.JOVI_CAST_SERVICE)
+                .putExtra("usb_type", 13)
+                .putExtra("mix_manual", true))
+        }.onFailure { log("WAKE: vivo/Jovi 投屏初始化失败：${it.message}") }
+    }
+
     /** One activity per selected engine, followed by a cancellable service fallback. */
     private fun wakeLocalCarLife() {
         if (!SettingsStore.carlifeEnabled && !SettingsStore.carlifeFirst) return
@@ -1722,6 +1754,11 @@ object HyperCarRepo {
                             .setPackage(owner.source.wakePackage))
                     }
                 }.onFailure { log("WAKE: 启动失败：${it.message}；可授权 Shizuku 后重试") }
+                if (owner.source.rendererInitialization != null) {
+                    delay(3_000)
+                    currentCoroutineContext().ensureActive()
+                    startVivoRendererWithoutShell(owner)
+                }
                 return@launch
             }
             owner.wake(exec = { command ->
@@ -1805,11 +1842,11 @@ object HyperCarRepo {
             // CarLife 的 APK 里有 MediaProjection/createVirtualDisplay/createInputSurface：
             // 它的视频很可能是"录屏 → 编码"。Android 13+ 每次都要系统授权（或 PROJECT_MEDIA appop），
             // 没授权就只会出现"编码器 STARTED 但 Qin:0"。
-            log(
-                "DIAG: 提示——CarLife 视频依赖录屏授权（MediaProjection）。若手机上刚弹过" +
-                    "「开始录制/投放」请点允许；没有弹窗时可在 Shizuku 里执行 " +
-                    "`appops set ${selectedEnginePackage()} PROJECT_MEDIA allow`",
-            )
+            if (owner.source.enginePackage == CarLifeSource.VIVO) {
+                log("DIAG: vivo 取源请核对 Jovi CarLifeMixingService 绑定与虚拟屏；端口监听不代表渲染已初始化")
+            } else {
+                log("DIAG: 请核对所选来源的渲染与投屏授权；仅有协议握手不能证明编码器收到画面")
+            }
             dumpCarLifeDiag()
         }
     }

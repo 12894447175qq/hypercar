@@ -9,17 +9,25 @@ import java.util.concurrent.atomic.AtomicBoolean
 data class CarLifeSource(val wakePackage: String, val enginePackage: String = wakePackage) {
     val activity: String? get() = enginePackage.takeIf { it in engines }?.let { "$it/com.baidu.carlife.CarlifeActivity" }
     val service: String? get() = enginePackage.takeIf { it in engines }?.let { "$it/com.baidu.carlife.service.CarlifeConnectService" }
+    val rendererInitialization: String? get() = if (enginePackage == VIVO) {
+        "am start-foreground-service -n $service --es bindPackageName $JOVI" +
+            " --es bindClassName $JOVI_CAST_SERVICE --ei usb_type 13 --ez mix_manual true"
+    } else null
 
     companion object {
         const val VIVO = "com.baidu.carlife.vivo"
         const val XIAOMI = "com.baidu.carlife.xiaomi"
         const val PUBLIC = "com.baidu.carlife"
+        const val JOVI = "com.vivo.car.networking"
+        const val JOVI_CAST_SERVICE = "com.vivo.vivo_car_service.CarLifeMixingService"
         private val engines = setOf(PUBLIC, VIVO, XIAOMI)
         val candidates = listOf(PUBLIC, VIVO, XIAOMI, "com.miui.carlink", "com.xiaomi.carlink", "com.hihonor.carlink")
         fun resolve(configured: String, installed: (String) -> Boolean): CarLifeSource? {
-            val pkg = configured.trim().ifBlank { candidates.firstOrNull(installed) ?: return null }
+            val pkg = configured.trim()
+            if (pkg.isBlank()) return candidates.firstNotNullOfOrNull { resolve(it, installed) }
             if (!Regex("[a-zA-Z][a-zA-Z0-9_]*(\\.[a-zA-Z0-9_]+)+").matches(pkg) || !installed(pkg)) return null
             val engine = if (pkg == "com.miui.carlink") XIAOMI else pkg
+            if (engine == VIVO && !installed(JOVI)) return null
             return if (installed(engine)) CarLifeSource(pkg, engine) else null
         }
     }
@@ -34,6 +42,14 @@ class CarLifeWakeSession(val source: CarLifeSource) {
     fun markUsed() { if (isOpen) used.set(true) }
     fun close() { open.set(false) }
 
+    suspend fun prepareRenderer(exec: suspend (String) -> Unit) {
+        currentCoroutineContext().ensureActive()
+        if (isOpen) source.rendererInitialization?.let {
+            markUsed()
+            exec(it)
+        }
+    }
+
     suspend fun wake(exec: suspend (String) -> Unit, listening: suspend () -> Boolean) {
         currentCoroutineContext().ensureActive()
         if (!isOpen) return
@@ -46,7 +62,10 @@ class CarLifeWakeSession(val source: CarLifeSource) {
         exec("am start -n $activity")
         delay(3_000)
         currentCoroutineContext().ensureActive()
-        if (isOpen && !listening()) source.service?.let { exec("am start-foreground-service -n $it") }
+        if (!isOpen) return
+        // vivo opens sockets before its renderer is bound. A listening 7240 is not sufficient.
+        if (source.rendererInitialization != null) prepareRenderer(exec)
+        else if (!listening()) source.service?.let { exec("am start-foreground-service -n $it") }
     }
 }
 

@@ -62,6 +62,7 @@
              我们却判成未安装，唤醒一路退回 com.miui.carlink）。 -->
         <package android:name="com.baidu.carlife" />
         <package android:name="com.baidu.carlife.vivo" />
+        <package android:name="com.vivo.car.networking" />
         <package android:name="com.baidu.carlife.xiaomi" />
         <package android:name="com.miui.carlink" />
         <package android:name="com.xiaomi.carlink" />

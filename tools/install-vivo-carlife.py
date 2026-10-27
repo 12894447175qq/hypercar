@@ -22,7 +22,11 @@ def main():
     adb = [args.adb, "-P", args.server_port, "-s", args.serial]
 
     def run(command):
-        return subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+        completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if completed.returncode:
+            detail = (completed.stderr or completed.stdout).decode(errors="replace").strip()
+            raise RuntimeError(f"Command failed ({completed.returncode}): {detail[:2000]}")
+        return completed.stdout
 
     def device(*command):
         return run(adb + list(command)).decode().strip()
@@ -52,6 +56,9 @@ def main():
         "source": "Installed Jovi assets/carlife_273.apk", "already_installed": installed,
         "installed_now": False, "modified_or_resigned": False,
     }
+    # Keep the verified fingerprint even if the phone blocks installation while locked.
+    (args.output / "verification.json").write_text(json.dumps(result, indent=2) + "\n")
+    (args.output / "signature.txt").write_text(verified)
     if installed:
         # Do not overwrite a different installed variant or silently trust a conflicting signer.
         installed_path = device("shell", "pm", "path", package).splitlines()[0].removeprefix("package:")
