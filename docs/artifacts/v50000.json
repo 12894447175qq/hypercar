@@ -1,0 +1,32 @@
+{
+  "package": "io.github.hypercar",
+  "version_name": "0.1.1",
+  "version_code": 50000,
+  "apk": "HyperCar-0.1.1-v50000-diagnostic-test.apk",
+  "apk_bytes": 4332001,
+  "apk_sha256": "15c5543bdf2512d748564ebc622d509adafe2971edea2467f097920f75dd53c8",
+  "signer_certificate_sha256": "01020c4ff672bdef9550f9c740285fdaf1f4ae0d70e9296050c0815d1570d5af",
+  "mapping": "mapping.txt.gz",
+  "mapping_gzip_sha256": "0d01ee98fb60ff4e2dd60924f1fad919f826445bb08370bea94c137743b445ac",
+  "mapping_uncompressed_sha256": "7828f439a08d5cbe29a71e069ba15da3b602193b9a8e9afb255c8a08e2331cf2",
+  "source_commit": "30cff45f68b736b86f7485c60a3045dd5bf0565f",
+  "native_libraries": {
+    "lib/arm64-v8a/libandroidx.graphics.path.so": "41e9a793c43a0f4fddb19e33f346bace464f30f888ba7b9eaf96294ea115bfb6",
+    "lib/arm64-v8a/libhypercar_core.so": "a5eaf16619895221b8214f220d12ccb4221ff74f27edd00d7cd6b99073aac113"
+  },
+  "verification": {
+    "unit_test_suites": 8,
+    "unit_tests": 45,
+    "unit_test_failures": 0,
+    "unit_test_errors": 0,
+    "lint_errors": 0,
+    "lint_warnings": 31,
+    "lint_information": 2,
+    "apk_signature_verified": true,
+    "on_device_installation": "not_verified",
+    "on_device_log_export": "not_verified",
+    "vehicle_acceptance": "not_run"
+  },
+  "delivery_directory": "release/v50000",
+  "verified_on": "2026-10-27"
+}
