@@ -52,12 +52,12 @@ class CarBluetoothReceiver : BroadcastReceiver() {
         // address/name 都要 BLUETOOTH_CONNECT；拿不到（或拿到占位 MAC）无法判断是否目标车机
         val address = runCatching { device.address }.getOrNull()
         val name = runCatching { device.name }.getOrNull()
-        if (address == null || address.equals(PLACEHOLDER_MAC, ignoreCase = true) || name == null) {
+        if (address == null || address.equals(PLACEHOLDER_MAC, ignoreCase = true)) {
             trace.event("acl.ignored", "reason=identity_unavailable namePresent=${name != null} addressPresent=${address != null}")
             return
         }
-        if (!isTargetCar(app, address, name)) {
-            trace.event("acl.ignored", "reason=target_filter policy=${if (SettingsStore.targetCarMac.isNullOrBlank()) "brand_keywords" else "explicit_mac"} deviceTail=${address.takeLast(5)} fallbackKeywords=$CAR_KEYWORDS")
+        if (!CarBluetoothTarget.matches(address, name, SettingsStore.targetCarMac, SettingsStore.headUnitProfileId)) {
+            trace.event("acl.ignored", "reason=target_filter policy=${if (SettingsStore.targetCarMac.isNullOrBlank()) "brand_keywords" else "explicit_mac"} deviceTail=${address.takeLast(5)} profile=${SettingsStore.headUnitProfileId} fallbackKeywords=${CarBluetoothTarget.keywords(SettingsStore.headUnitProfileId)}")
             return
         }
         // iAP2 的「只配对、不连接」会主动断车机音频配置文件（个别 ROM 退到设备级断开），
@@ -92,13 +92,6 @@ class CarBluetoothReceiver : BroadcastReceiver() {
             }
     }
 
-    /** 目标车机判定：选定 MAC 优先，否则按蓝牙名关键词兜底。 */
-    private fun isTargetCar(context: Context, address: String, name: String): Boolean {
-        val targetMac = SettingsStore.targetCarMac
-        if (!targetMac.isNullOrBlank()) return address.equals(targetMac, ignoreCase = true)
-        return CAR_KEYWORDS.any { name.contains(it, ignoreCase = true) }
-    }
-
     @Suppress("DEPRECATION")
     private fun deviceOf(intent: Intent): BluetoothDevice? =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -113,9 +106,6 @@ class CarBluetoothReceiver : BroadcastReceiver() {
 
         /** 「自己断开导致的 ACL 断开」日志节流（出站循环每 3s 一轮，别一行一行刷）。 */
         const val SELF_DROP_LOG_THROTTLE_MILLIS = 30_000L
-
-        /** 未选目标车机时的兜底：常见车机蓝牙名关键词（真车 BMW/MINI/宝马）。 */
-        val CAR_KEYWORDS = listOf("BMW", "MINI", "宝马")
 
         /** 日志节流时间戳。放 companion：清单接收器每次广播都是新实例，实例字段记不住。 */
         @Volatile

@@ -2,12 +2,10 @@ package io.github.hypercar.autowake
 
 import android.app.Notification
 import android.app.Service
-import android.bluetooth.BluetoothDevice
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.wifi.WifiManager
-import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
@@ -18,26 +16,7 @@ import io.github.hypercar.R
 import io.github.hypercar.diagnostics.ConnectionTrace
 import io.github.hypercar.session.HyperCarRepo
 
-/**
- * 秒连链路的前台保活服务（foregroundServiceType=connectedDevice，manifest 已配）。
- *
- * 职责边界：**只负责前台豁免与持锁**，会话重活全部转交 [AutoStart.handler]。
- *
- * cardeck 两条铁律（内化）：
- *  ① Android 12+ 后台 FGS 启动豁免**没有「蓝牙广播」这一项**；本项目靠 SYSTEM_ALERT_WINDOW
- *     （manifest 已声明）满足官方豁免项。被拦时（用户没授悬浮窗）startForegroundService 抛
- *     ForegroundServiceStartNotAllowedException——只记日志，别崩；用户手动打开 App 连一次即可
- *     （那次有可见 Activity，不受后台启动限制）。
- *  ② 停止用 startService 投递 ACTION_STOP：服务在跑时进程已是前台服务态，允许 startService
- *     （不受后台启动限制）。
- *
- * 循环防护：onStartCommand 置 [isRunning]=true **早于**转交 handler；handler 据此区分
- * 「receiver 首次拉起（isRunning=false→startForegroundService）」与「service 触发会话
- * （isRunning=true→做重活）」，不会形成 receiver↔service 无限循环。停止侧同理：
- * ACTION_STOP 只在 **isRunning 由 true 变 false 的那一次**转交 handler(false)——
- * handler(false) 内部又会投 ACTION_STOP 收摊前台，无此判据就会 handler↔service 互相
- * startService 刷屏（历史 bug）。
- */
+/** Connection-scoped foreground protection shared by manual, automatic and retry entrypoints. */
 class HyperCarService : Service() {
     private val trace = ConnectionTrace("fgs", HyperCarRepo::log, android.os.SystemClock::elapsedRealtime)
     private var wakeLock: PowerManager.WakeLock? = null
@@ -45,54 +24,52 @@ class HyperCarService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    private var activeTicket: Long? = null
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val device = deviceOf(intent)
-        trace.event("service.command", "action=${intent?.action} startId=$startId flags=$flags devicePresent=${device != null} running=$isRunning")
-        when (intent?.action) {
-            ACTION_STOP -> {
-                // 只在「服务确实在跑」的这一次停止里转交会话层收尾。
-                // 会话层的 handler(connected=false) 自己也会投 ACTION_STOP（收摊前台），
-                // 若这里无条件回灌 handler，就形成
-                //   onStartCommand(STOP) → handler(false) → startService(STOP) → onStartCommand …
-                // 的自激循环：每秒数百次 nativeStop + 快照重置 + 两条日志，且与车机是否在
-                // 场无关（下车后进程还在循环里刷）。wasRunning 判据把循环卡在第一圈。
-                val wasRunning = isRunning
-                isRunning = false
-                if (device != null && wasRunning) {
-                    runCatching { AutoStart.handler?.invoke(applicationContext, device, false) }
-                        .onFailure { trace.failure("service.stop.handoff", it); Log.e(TAG, "转交停止失败", it) }
-                }
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                releaseLocks()
-                stopSelf()
-                return START_NOT_STICKY
-            }
-            else -> {
-                // 必须用显式 connectedDevice 类型：2 参 startForeground 会拾取 manifest 声明的
-                // 全部类型，Android 14 对 mediaProjection 校验 AppOps 会直接崩（本服务无投影）。
-                if (!startForegroundSafe()) {
-                    isRunning = false
-                    releaseLocks()
-                    stopSelf(startId)
-                    return START_NOT_STICKY
-                }
-                acquireLocks()
-                isRunning = true
-                // 转交 handler 触发会话（重活在 handler 内）。receiver 路径已在 handler 里
-                // startForegroundService 过；这里 service 已前台，handler 见 isRunning=true 直接做会话。
-                if (intent?.action == ACTION_START && device != null) {
-                    runCatching { AutoStart.handler?.invoke(applicationContext, device, true) }
-                        .onFailure { trace.failure("service.start.handoff", it); Log.e(TAG, "触发会话失败", it) }
-                }
-            }
+        val ticket = intent?.getLongExtra(EXTRA_TICKET, 0L) ?: 0L
+        trace.event("service.command", "action=${intent?.action} ticket=$ticket startId=$startId")
+        if (intent?.action == ACTION_STOP) {
+            if (activeTicket == ticket && leases.currentId() == null) stopProtection(startId)
+            else trace.event("service.stale_stop", "ticket=$ticket active=$activeTicket requested=${leases.currentId()}")
+            return START_NOT_STICKY
         }
-        return START_STICKY
+        if (intent?.action != ACTION_KEEP_ALIVE || !leases.isCurrent(ticket)) {
+            trace.event("service.stale_start", "ticket=$ticket requested=${leases.currentId()}")
+            if (leases.currentId() == null) stopProtection(startId)
+            return START_NOT_STICKY
+        }
+        activeTicket = ticket
+        try {
+            check(startForegroundSafe()) { "连接保活服务未能进入前台" }
+            acquireLocks()
+            isRunning = true
+            if (!leases.ready(ticket) && leases.currentId() == null) stopProtection(startId)
+        } catch (error: Exception) {
+            trace.failure("service.start", error)
+            leases.failed(ticket, error)
+            stopProtection(startId)
+        }
+        // A restarted process must not hold locks without an owning connection.
+        return START_NOT_STICKY
+    }
+
+    private fun stopProtection(startId: Int) {
+        isRunning = false
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        releaseLocks()
+        stopSelf(startId)
     }
 
     override fun onDestroy() {
-        trace.event("service.destroy", "running=$isRunning")
+        val ticket = activeTicket
+        trace.event("service.destroy", "running=$isRunning ticket=$ticket")
         isRunning = false
         releaseLocks()
+        if (ticket != null && leases.isCurrent(ticket)) {
+            leases.failed(ticket, IllegalStateException("连接保活服务已停止"))
+            HyperCarRepo.onKeepAliveLost(ticket)
+        }
         super.onDestroy()
     }
 
@@ -147,42 +124,37 @@ class HyperCarService : Service() {
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
 
-    @Suppress("DEPRECATION")
-    private fun deviceOf(intent: Intent?): BluetoothDevice? {
-        val i = intent ?: return null
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            i.getParcelableExtra(EXTRA_DEVICE, BluetoothDevice::class.java)
-        } else {
-            i.getParcelableExtra(EXTRA_DEVICE)
-        }
-    }
-
     companion object {
         private const val TAG = "HyperCarService"
         private const val NOTIFICATION_ID = 1
+        private const val ACTION_KEEP_ALIVE = "io.github.hypercar.action.KEEP_ALIVE"
+        private const val ACTION_STOP = "io.github.hypercar.action.RELEASE_KEEP_ALIVE"
+        private const val EXTRA_TICKET = "io.github.hypercar.extra.KEEP_ALIVE_TICKET"
+        private val leases = ConnectionKeepAliveGate()
 
-        /** 上车：车机 ACL 连上时（经 AutoStart.handler）拉起本服务。 */
-        const val ACTION_START = "io.github.hypercar.action.AUTO_START"
-
-        /** 下车：ACL 断开时（经 startService）收摊。 */
-        const val ACTION_STOP = "io.github.hypercar.action.AUTO_STOP"
-
-        /** 随 intent 传递的目标车机（BluetoothDevice），供 service 转交 handler 用。 */
-        const val EXTRA_DEVICE = "io.github.hypercar.extra.DEVICE"
-
-        /** 服务是否在前台运行（handler 据此区分「拉起服务」与「触发会话」，防循环）。 */
-        @Volatile
-        var isRunning: Boolean = false
+        @Volatile var isRunning: Boolean = false
             private set
 
-        fun startIntent(context: Context, device: BluetoothDevice): Intent =
-            Intent(context, HyperCarService::class.java)
-                .setAction(ACTION_START)
-                .putExtra(EXTRA_DEVICE, device)
+        fun request(context: Context, retained: ConnectionKeepAliveGate.Ticket? = null): ConnectionKeepAliveGate.Ticket {
+            if (retained != null && isRunning && leases.isCurrent(retained.id)) return retained
+            val ticket = leases.begin()
+            try {
+                context.startForegroundService(Intent(context, HyperCarService::class.java)
+                    .setAction(ACTION_KEEP_ALIVE).putExtra(EXTRA_TICKET, ticket.id))
+            } catch (error: Exception) {
+                leases.release(ticket.id)
+                throw IllegalStateException("连接保活服务启动失败，请打开 Hypercar 后重试：${error.javaClass.simpleName}", error)
+            }
+            return ticket
+        }
 
-        fun stopIntent(context: Context, device: BluetoothDevice?): Intent =
-            Intent(context, HyperCarService::class.java)
-                .setAction(ACTION_STOP)
-                .let { if (device != null) it.putExtra(EXTRA_DEVICE, device) else it }
+        fun release(context: Context, ticket: ConnectionKeepAliveGate.Ticket) {
+            if (!leases.release(ticket.id) || !isRunning) return
+            // The service validates both the stopped ticket and any newer request.
+            runCatching {
+                context.startService(Intent(context, HyperCarService::class.java)
+                    .setAction(ACTION_STOP).putExtra(EXTRA_TICKET, ticket.id))
+            }.onFailure { Log.e(TAG, "释放保活服务失败", it) }
+        }
     }
 }

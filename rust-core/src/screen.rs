@@ -28,6 +28,7 @@
 //!    独立的存活信号；缺失时 RECORD 后约 10s 整轮会话被 reset（2026-10-19 奥迪 3315
 //!    两轮实测，视频/feedback/事件通道当时全都健康）。
 
+use sha2::{Digest, Sha256};
 use crate::crypto::{chacha_seal, nonce64, Aes128CtrStream};
 use crate::timing::ntp_be;
 use crate::video_pipeline::FrameClock;
@@ -95,6 +96,7 @@ pub struct ScreenSender {
     keep_alive_count: u64,
     /** 是否已发过 VideoConfig（未发前丢弃视频帧，对齐参考实现）。 */
     config_sent: bool,
+    config_counter: u64,
     /** 最近一次随 VideoConfig 发出的 SPS/PPS（变化检测用）。 */
     last_sps: Option<Vec<u8>>,
     last_pps: Option<Vec<u8>>,
@@ -130,6 +132,7 @@ impl ScreenSender {
             bytes_since_keep_alive: 0,
             keep_alive_count: 0,
             config_sent: false,
+            config_counter: 0,
             last_sps: None,
             last_pps: None,
             logged_first_frame: false,
@@ -192,6 +195,13 @@ impl ScreenSender {
         wire.extend_from_slice(avcc);
         self.write_wire(&wire).await?;
         self.config_sent = true;
+        self.config_counter += 1;
+        let fingerprint: String = Sha256::digest(avcc)[..6].iter().map(|b| format!("{b:02x}")).collect();
+        crate::emit_log(&format!(
+            "VIDEO: config_written id={} size={}x{} profile={} level={} avccBytes={} avccHash={} nextFrameCounter={} encrypted=true",
+            self.config_counter, self.width, self.height, avcc.get(1).copied().unwrap_or(0),
+            avcc.get(3).copied().unwrap_or(0), avcc.len(), fingerprint, self.frame_counter,
+        ));
         Ok(())
     }
 

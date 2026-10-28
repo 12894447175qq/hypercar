@@ -25,6 +25,10 @@ use crate::audio_out::AudioOut;
 use crate::carlife::{CarLifeConfig, CarLifeHub};
 use crate::screen::ScreenSender;
 use crate::video_pipeline::SourceVideoBuffer;
+
+#[cfg(test)]
+#[path = "video_flow_tests.rs"]
+mod video_flow_tests;
 use crate::{emit_log, emit_stats, emit_state};
 
 /// CarLife 通道产出的事件。
@@ -113,6 +117,7 @@ pub async fn run_engine(
         width: cfg.width,
         height: cfg.height,
         fps: cfg.fps,
+        wait_for_airplay: true,
         voice: cfg.voice,
         // HU_INFO 里 required 的 btaddress/btname：用 iAP2 的稳定设备号当车机蓝牙 MAC
         bt_address: cfg.device_id.clone(),
@@ -229,151 +234,7 @@ pub async fn run_engine(
         let stop_v = stop.clone();
         let stats = video_stats.clone();
         spawn_scoped(stop.clone(), async move {
-            let mut sender: Option<ScreenSender> = None;
-            let mut source = SourceVideoBuffer::new(initial_size.0, initial_size.1);
-            let mut ready = Some(screen_ready_rx);
-            let mut video_rx = video_rx;
-            let mut tick = tokio::time::interval(Duration::from_millis(16));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut showing_standby = true;
-            let mut last_real_frame: Option<std::time::Instant> = None;
-            let mut source_timestamp_logged = false;
-            let mut standby_idx = 0usize;
-            let mut standby_size_sent = None;
-            let mut standby_started = std::time::Instant::now();
-            let mut standby_tick = 0u32;
-            let mut standby_last_idr = std::time::Instant::now();
-            loop {
-                tokio::select! {
-                    _ = stop_v.notified() => return,
-                    r = async {
-                        match ready.as_mut() {
-                            Some(rx) => rx.await.ok(),
-                            None => std::future::pending().await,
-                        }
-                    } => {
-                        sender = r;
-                        ready = None;
-                        if sender.is_none() {
-                            emit_log("VIDEO: sender_unavailable，协商未完成或视频交接已关闭");
-                            return;
-                        }
-                        emit_log("VIDEO: pump_ready，已接收屏幕发送器；等待来源完整 SPS/PPS/IDR，等待页不算来源首帧");
-                    }
-                    ev = video_rx.recv() => match ev {
-                        Some(CarLifeEvent::EncoderResolution { width, height }) => {
-                            // 等待页可以临时用母版尺寸，但不能覆盖来源尺寸。
-                            source.set_size(width, height);
-                        }
-                        Some(CarLifeEvent::VideoFrame { source_timestamp, data }) => {
-                            if !source_timestamp_logged {
-                                source_timestamp_logged = true;
-                                emit_log(&format!(
-                                    "VIDEO: 来源原始时间戳={source_timestamp}；输出统一使用本机单调钟，与 AirPlay timing 同源"
-                                ));
-                            }
-                            // AirPlay 尚未就绪时保留有 SPS/PPS/IDR 的完整 GOP。
-                            source.push(data);
-                        }
-                        Some(CarLifeEvent::ClientLeft { video: true }) => {
-                            source.require_keyframe();
-                            last_real_frame = None;
-                            emit_log("CARLIFE: 视频来源断开；重连后等待新的来源 IDR，禁止沿用旧参考帧");
-                        }
-                        Some(_) => {}
-                        None => return,
-                    },
-                    _ = tick.tick() => {
-                        if let Some(s) = sender.as_mut() {
-                            if let Err(error) = s.maybe_send_keep_alive().await {
-                                screen_write_failed("keepAlive", error, &stats, &stop_v);
-                                return;
-                            }
-                            let stale = last_real_frame
-                                .map(|t| t.elapsed() >= Duration::from_millis(900))
-                                .unwrap_or(true);
-                            if stale && !source.has_pending() {
-                                if !showing_standby {
-                                    // 等待页是另一条 H.264 流，返回来源时必须重新从 IDR 开始。
-                                    source.require_keyframe();
-                                    showing_standby = true;
-                                    standby_size_sent = None;
-                                }
-                                if let Some(set) = crate::airplay::standby_for_aspect(source.size.0, source.size.1) {
-                                    if !set.frames.is_empty() {
-                                        if standby_size_sent != Some((set.width, set.height)) {
-                                            s.set_size(set.width, set.height);
-                                            s.reset_video_config();
-                                            standby_size_sent = Some((set.width, set.height));
-                                            standby_idx = 0;
-                                            standby_tick = 0;
-                                            standby_started = std::time::Instant::now();
-                                            standby_last_idr = standby_started;
-                                            emit_log(&format!(
-                                                "AIRPLAY: 等待页 {}x{}；来源尺寸保留为 {}x{}，等待来源 SPS/PPS/IDR",
-                                                set.width, set.height, source.size.0, source.size.1
-                                            ));
-                                        }
-                                        standby_tick = standby_tick.wrapping_add(1);
-                                        let mut due = standby_started.elapsed() < Duration::from_secs(2)
-                                            || standby_tick % 4 == 0;
-                                        if standby_last_idr.elapsed() >= Duration::from_secs(5) {
-                                            standby_idx = 0;
-                                            standby_last_idr = std::time::Instant::now();
-                                            due = true;
-                                        }
-                                        if due {
-                                            let frame = set.frames[standby_idx % set.frames.len()];
-                                            if let Err(error) = s.send_video_annexb(frame).await {
-                                                screen_write_failed("standby/config", error, &stats, &stop_v);
-                                                return;
-                                            }
-                                            standby_idx = standby_idx.wrapping_add(1);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // ready、尺寸或视频事件任一到达后立即冲刷，首帧不必等待下一帧触发。
-                if source.has_pending() {
-                    if let Some(s) = sender.as_mut() {
-                        if showing_standby || s.size() != source.size {
-                            s.set_size(source.size.0, source.size.1);
-                            s.reset_video_config();
-                            showing_standby = false;
-                            standby_size_sent = None;
-                            emit_log(&format!("VIDEO: 切换到来源 {}x{}，重发来源解码参数与 IDR", source.size.0, source.size.1));
-                        }
-                        while let Some(data) = source.pop() {
-                            match s.send_video_annexb(&data).await {
-                                Ok(true) => {
-                                    last_real_frame = Some(std::time::Instant::now());
-                                    let frames = {
-                                        let mut st = stats.lock();
-                                        st.frames += 1;
-                                        st.bytes += data.len() as u64;
-                                        st.frames
-                                    };
-                                    if frames == 1 {
-                                        emit_log(&format!("VIDEO: first_source_frame_written bytes={} size={}x{}；非等待页；接收端是否解码显示仍需实车核对", data.len(), source.size.0, source.size.1));
-                                    }
-                                }
-                                Ok(false) => {
-                                    source.require_keyframe();
-                                    emit_log("VIDEO: 未写出来源帧，等待完整 SPS/PPS/IDR；本帧不计入统计");
-                                    break;
-                                }
-                                Err(error) => {
-                                    screen_write_failed("source/config", error, &stats, &stop_v);
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            run_video_pump(initial_size, screen_ready_rx, video_rx, stats, stop_v).await;
         });
     }
     // ---- 音频泵：重采样 + 闪避混音 + RTP ----
@@ -576,6 +437,7 @@ pub async fn run_engine(
 
     // 屏幕/音频发送器交给泵
     let _ = screen_ready_tx.send(outcome.screen);
+    hub.allow_video_init();
     if let Some(audio) = outcome.audio {
         audio.start(audio_out_tx);
     }
@@ -687,12 +549,159 @@ fn take_or_zero(q: &mut VecDeque<i16>) -> i16 {
     q.pop_front().unwrap_or(0)
 }
 
+
+pub(crate) async fn run_video_pump(
+    initial_size: (u32, u32),
+    screen_ready_rx: tokio::sync::oneshot::Receiver<ScreenSender>,
+    video_rx: mpsc::UnboundedReceiver<CarLifeEvent>,
+    stats: Arc<Mutex<PumpStat>>,
+    stop_v: Arc<SessionStop>,
+) {
+    let mut sender: Option<ScreenSender> = None;
+    let mut source = SourceVideoBuffer::new(initial_size.0, initial_size.1);
+    let mut ready = Some(screen_ready_rx);
+    let mut video_rx = video_rx;
+    let mut tick = tokio::time::interval(Duration::from_millis(16));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut showing_standby = true;
+    let mut source_timestamp_logged = false;
+    let mut standby_idx = 0usize;
+    let mut standby_size_sent = None;
+    let mut standby_started = std::time::Instant::now();
+    let mut standby_tick = 0u32;
+    let mut standby_last_idr = std::time::Instant::now();
+    loop {
+        tokio::select! {
+            _ = stop_v.notified() => return,
+            r = async {
+                match ready.as_mut() {
+                    Some(rx) => rx.await.ok(),
+                    None => std::future::pending().await,
+                }
+            } => {
+                sender = r;
+                ready = None;
+                if sender.is_none() {
+                    emit_log("VIDEO: sender_unavailable，协商未完成或视频交接已关闭");
+                    return;
+                }
+                emit_log("VIDEO: pump_ready，已接收屏幕发送器；等待来源完整 SPS/PPS/IDR，等待页不算来源首帧");
+            }
+            ev = video_rx.recv() => match ev {
+                Some(CarLifeEvent::EncoderResolution { width, height }) => {
+                    // 等待页可以临时用母版尺寸，但不能覆盖来源尺寸。
+                    source.set_size(width, height);
+                }
+                Some(CarLifeEvent::VideoFrame { source_timestamp, data }) => {
+                    if !source_timestamp_logged {
+                        source_timestamp_logged = true;
+                        emit_log(&format!(
+                            "VIDEO: 来源原始时间戳={source_timestamp}；输出统一使用本机单调钟，与 AirPlay timing 同源"
+                        ));
+                    }
+                    // AirPlay 尚未就绪时保留有 SPS/PPS/IDR 的完整 GOP。
+                    source.push(data);
+                }
+                Some(CarLifeEvent::ClientLeft { video: true }) => {
+                    source.require_keyframe();
+                    showing_standby = true;
+                    standby_size_sent = None;
+                    emit_log("CARLIFE: 视频来源断开；重连后等待新的来源 IDR，禁止沿用旧参考帧");
+                }
+                Some(_) => {}
+                None => return,
+            },
+            _ = tick.tick() => {
+                if let Some(s) = sender.as_mut() {
+                    if let Err(error) = s.maybe_send_keep_alive().await {
+                        screen_write_failed("keepAlive", error, &stats, &stop_v);
+                        return;
+                    }
+                    // An unchanged source can be silent. Keep its last frame until
+                    // the source channel actually closes, instead of flashing standby.
+                    if showing_standby && !source.has_pending() {
+                        if let Some(set) = crate::airplay::standby_for_aspect(source.size.0, source.size.1) {
+                            if !set.frames.is_empty() {
+                                if standby_size_sent != Some((set.width, set.height)) {
+                                    s.set_size(set.width, set.height);
+                                    s.reset_video_config();
+                                    standby_size_sent = Some((set.width, set.height));
+                                    standby_idx = 0;
+                                    standby_tick = 0;
+                                    standby_started = std::time::Instant::now();
+                                    standby_last_idr = standby_started;
+                                    emit_log(&format!(
+                                        "AIRPLAY: 等待页 {}x{}；来源尺寸保留为 {}x{}，等待来源 SPS/PPS/IDR",
+                                        set.width, set.height, source.size.0, source.size.1
+                                    ));
+                                }
+                                standby_tick = standby_tick.wrapping_add(1);
+                                let mut due = standby_started.elapsed() < Duration::from_secs(2)
+                                    || standby_tick % 4 == 0;
+                                if standby_last_idr.elapsed() >= Duration::from_secs(5) {
+                                    standby_idx = 0;
+                                    standby_last_idr = std::time::Instant::now();
+                                    due = true;
+                                }
+                                if due {
+                                    let frame = set.frames[standby_idx % set.frames.len()];
+                                    if let Err(error) = s.send_video_annexb(frame).await {
+                                        screen_write_failed("standby/config", error, &stats, &stop_v);
+                                        return;
+                                    }
+                                    standby_idx = standby_idx.wrapping_add(1);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // ready、尺寸或视频事件任一到达后立即冲刷，首帧不必等待下一帧触发。
+        if source.has_pending() {
+            if let Some(s) = sender.as_mut() {
+                if showing_standby || s.size() != source.size {
+                    s.set_size(source.size.0, source.size.1);
+                    s.reset_video_config();
+                    showing_standby = false;
+                    standby_size_sent = None;
+                    emit_log(&format!("VIDEO: 切换到来源 {}x{}，重发来源解码参数与 IDR", source.size.0, source.size.1));
+                }
+                while let Some(data) = source.pop() {
+                    match s.send_video_annexb(&data).await {
+                        Ok(true) => {
+                            let frames = {
+                                let mut st = stats.lock();
+                                st.frames += 1;
+                                st.bytes += data.len() as u64;
+                                st.frames
+                            };
+                            if frames == 1 {
+                                emit_log(&format!("VIDEO: first_source_frame_written bytes={} size={}x{}；非等待页；接收端是否解码显示仍需实车核对", data.len(), source.size.0, source.size.1));
+                            }
+                        }
+                        Ok(false) => {
+                            source.require_keyframe();
+                            emit_log("VIDEO: 未写出来源帧，等待完整 SPS/PPS/IDR；本帧不计入统计");
+                            break;
+                        }
+                        Err(error) => {
+                            screen_write_failed("source/config", error, &stats, &stop_v);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- 统计
 
 #[derive(Default)]
-struct PumpStat {
-    frames: u64,
-    bytes: u64,
+pub(crate) struct PumpStat {
+    pub(crate) frames: u64,
+    pub(crate) bytes: u64,
 }
 
 fn screen_write_failed(

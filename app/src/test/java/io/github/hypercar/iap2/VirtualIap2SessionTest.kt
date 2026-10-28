@@ -124,6 +124,18 @@ class VirtualIap2SessionTest {
         assertTrue(overflow.output.isEmpty())
     }
 
+    @Test fun peerSyncWithoutFinalAckCannotWaitForever() {
+        val f = Fixture()
+        f.session.arm()
+        val sync = Iap2LinkEngine.SynchronizationPayload(4, 4096, 1000, 500, 4, 3,
+            listOf(Iap2LinkEngine.SessionDescriptor(1, 0, 1)))
+        f.session.feed(packet(0x80, 20, 0, 0, sync.encode()))
+        f.clock = 20_001
+        f.session.tick()
+        assertFalse(f.session.isOpen())
+        assertTrue(f.logs.any { "cause=timeout" in it && "peerSync=true" in it })
+    }
+
     companion object {
         private fun packet(control: Int, seq: Int, ack: Int, session: Int, payload: ByteArray = byteArrayOf()): ByteArray {
             val length = 9 + if (payload.isEmpty()) 0 else payload.size + 1

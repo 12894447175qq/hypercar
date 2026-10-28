@@ -14,9 +14,7 @@ import android.os.SystemClock
 import io.github.hypercar.diagnostics.ConnectionTrace
 import io.github.hypercar.shizuku.ShizukuTools
 import io.github.hypercar.shizuku.shellQuote
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.UUID
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
@@ -29,22 +27,22 @@ internal class VivoCarLifeBinding private constructor(
     private val context: Context,
     private val source: CarLifeSource,
     private val trace: ConnectionTrace,
+    private val onLost: (String) -> Unit,
 ) : CarLifeRendererLease {
     private val main = Handler(Looper.getMainLooper())
-    private val ready = CompletableDeferred<Unit>()
-    private val closed = AtomicBoolean(false)
-    private val connected = AtomicBoolean(false)
+    private val state = RendererBindingState(onLost)
+    private val ready get() = state.ready
     private val bindAction = "io.github.hypercar.BIND_VIVO_CARLIFE.${UUID.randomUUID()}"
     // Only accessed on the main thread.
     private var bindingAttempted = false
-    override val isActive: Boolean get() = connected.get() && !closed.get()
+    override val isActive: Boolean get() = state.isActive
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, service: IBinder) {
-            if (closed.get()) { trace.event("bind.late_callback", "component=$name action=$bindAction"); return }
-            connected.set(true)
+            if (state.isClosed) { trace.event("bind.late_callback", "component=$name action=$bindAction"); return }
+            if (!service.isBinderAlive) { unavailable("原厂服务返回了失效 Binder"); return }
+            if (!state.connected()) return
             trace.event("bind.connected", "component=$name binderAlive=${service.isBinderAlive} action=$bindAction")
-            ready.complete(Unit)
         }
 
         override fun onNullBinding(name: ComponentName) = unavailable("原厂服务没有提供绑定接口")
@@ -53,16 +51,15 @@ internal class VivoCarLifeBinding private constructor(
     }
 
     private fun unavailable(reason: String) {
-        connected.set(false)
-        if (!closed.get()) {
+        if (!state.isClosed) {
             trace.event("bind.unavailable", "reason=$reason action=$bindAction")
-            ready.completeExceptionally(IllegalStateException(reason))
+            state.unavailable(reason)
         }
     }
 
     private fun bind(): Boolean {
         check(Looper.myLooper() == Looper.getMainLooper())
-        if (closed.get()) { trace.event("bind.skipped", "closed=true"); return false }
+        if (state.isClosed) { trace.event("bind.skipped", "closed=true"); return false }
         val component = requireNotNull(ComponentName.unflattenFromString(source.service!!))
         val intent = Intent().setComponent(component)
             // Intent extras do not distinguish ServiceConnection bind records.
@@ -90,9 +87,8 @@ internal class VivoCarLifeBinding private constructor(
     }
 
     override fun close() {
-        if (!closed.compareAndSet(false, true)) return
-        trace.event("unbind.request", "connected=${connected.get()} action=$bindAction thread=${Thread.currentThread().name}")
-        connected.set(false)
+        if (!state.close()) return
+        trace.event("unbind.request", "connected=${state.isActive} action=$bindAction thread=${Thread.currentThread().name}")
         val release = Runnable {
             if (bindingAttempted) {
                 bindingAttempted = false
@@ -108,7 +104,7 @@ internal class VivoCarLifeBinding private constructor(
     }
 
     companion object {
-        suspend fun connect(context: Context, source: CarLifeSource, log: (String) -> Unit, parentId: String? = null, stillValid: () -> Boolean): CarLifeRendererLease {
+        suspend fun connect(context: Context, source: CarLifeSource, log: (String) -> Unit, parentId: String? = null, onLost: (String) -> Unit = {}, stillValid: () -> Boolean): CarLifeRendererLease {
             require(source.usesBoundRenderer)
             val trace = ConnectionTrace("vivo", log, SystemClock::elapsedRealtime, parentId)
             trace.event("initialize.begin", "source=${source.enginePackage} shizuku=${ShizukuTools.isReady}")
@@ -118,7 +114,7 @@ internal class VivoCarLifeBinding private constructor(
               return acquireVivoRenderer(
                 acquire = {
                     trace.event("bind.attempt", "number=${++attempts}")
-                    attempt(context, source, trace, stillValid)
+                    attempt(context, source, trace, onLost, stillValid)
                 },
                 bootstrap = {
                     currentCoroutineContext().ensureActive()
@@ -178,8 +174,8 @@ internal class VivoCarLifeBinding private constructor(
             trace.event("jovi.integration_scope", "rendererBindingOnly=true originalAuthorizationAndDeviceSessionState=not_observable desktopRequiresVisualCheck=true")
         }
 
-        private suspend fun attempt(context: Context, source: CarLifeSource, trace: ConnectionTrace, stillValid: () -> Boolean): CarLifeRendererLease? {
-            val binding = VivoCarLifeBinding(context.applicationContext, source, trace)
+        private suspend fun attempt(context: Context, source: CarLifeSource, trace: ConnectionTrace, onLost: (String) -> Unit, stillValid: () -> Boolean): CarLifeRendererLease? {
+            val binding = VivoCarLifeBinding(context.applicationContext, source, trace, onLost)
             try {
                 val accepted = withContext(Dispatchers.Main.immediate) {
                     if (!stillValid()) throw CancellationException("CarLife session already closed")

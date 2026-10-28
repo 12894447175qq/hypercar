@@ -29,6 +29,12 @@ class VirtualIap2Session(
     private var challengeAt: Long? = null
     private var authenticated = false
     private var authFailed = false
+    private var rxPackets = 0L
+    private var rxBytes = 0L
+    private var txPackets = 0L
+    private var lastRxAt: Long? = null
+    private var lastReportAt = 0L
+    private var reportedState: Iap2LinkEngine.State? = null
     private var earlyBytes = 0
     @Synchronized fun isOpen(): Boolean = open
 
@@ -59,6 +65,9 @@ class VirtualIap2Session(
     }
 
     private fun feedNow(bytes: ByteArray) {
+        rxPackets++
+        rxBytes += bytes.size
+        lastRxAt = now()
         engine.feed(bytes, now())
         drain()
     }
@@ -71,7 +80,8 @@ class VirtualIap2Session(
             engine.initiate(clock)
             log("IAPLINK: DETECT 后未收到 SYN，补发本方同步表一次")
         }
-        if (engine.peerSynchronization == null && clock - armedAt >= 20_000) {
+        if (engine.state != Iap2LinkEngine.State.NORMAL && clock - armedAt >= 20_000) {
+            report("timeout", force = true)
             log("IAPLINK: 虚拟链路协商超时；停止重复发送，主屏链路由其自身状态管理")
             close()
             return
@@ -84,6 +94,7 @@ class VirtualIap2Session(
     }
 
     private fun drain() {
+        report("progress")
         flush()
         if (!open) return
         if (!csmStarted && engine.state == Iap2LinkEngine.State.NORMAL) {
@@ -101,10 +112,19 @@ class VirtualIap2Session(
 
     private fun flush() {
         val bytes = engine.takeOutput()
+        if (bytes.isNotEmpty()) txPackets++
         if (bytes.isNotEmpty() && open && !send(bytes)) {
             log("IAPLINK: 控制出站队列不可用，停止本轮虚拟链路")
             close()
         }
+    }
+
+    private fun report(cause: String, force: Boolean = false) {
+        val clock = now()
+        if (!force && reportedState == engine.state && clock - lastReportAt < 5_000) return
+        reportedState = engine.state
+        lastReportAt = clock
+        log("IAPLINK: progress cause=$cause state=${engine.state} peerSync=${engine.peerSynchronization != null} csmStarted=$csmStarted authenticated=$authenticated rxPackets=$rxPackets rxBytes=$rxBytes txPackets=$txPackets lastRxAgeMs=${lastRxAt?.let { clock - it }} elapsedMs=${clock - armedAt}")
     }
 
     private fun csm(id: Int, body: ByteArray = byteArrayOf()) {
@@ -180,6 +200,7 @@ class VirtualIap2Session(
 
     @Synchronized override fun close() {
         if (!open) return
+        report("close", force = true)
         open = false
         early.clear()
         earlyBytes = 0

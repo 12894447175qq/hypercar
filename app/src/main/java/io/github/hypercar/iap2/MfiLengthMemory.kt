@@ -37,6 +37,23 @@ object MfiLengthMemory {
     private const val KEY_SILENT = "silent_"
     private const val KEY_REJECTED = "rejected_"
     private val appliedPreferences = HashSet<String>()
+    private val repairedReceivers = HashSet<String>()
+
+    /** Only the receiver whose v50004 trace proved ambiguous history is migrated. */
+    fun repairLegacyAudiHistory(context: Context?, identity: String): Boolean = synchronized(memory) {
+        val receiver = receiverKey(identity)
+        if (receiver != "audi_mmi_4809_audi_3260_delphi") return false
+        val marker = "unambiguous_v2_$receiver"
+        val store = prefs(context)
+        if (store?.getBoolean(marker, false) ?: (marker in repairedReceivers)) return false
+        val previous = load(context, identity)
+        // Keep the observed first-attempt 20B success, discard legacy silent/EOF guesses.
+        val repaired = Entry(succeeded = previous.succeeded?.takeIf { it == 20 })
+        update(context, identity) { repaired }
+        store?.edit()?.putBoolean(marker, true)?.apply()
+        repairedReceivers.add(marker)
+        previous != repaired
+    }
 
     fun baseline(preferred: Int): List<Int> =
         (listOf(preferred.takeIf { it in setOf(16, 20, 32) } ?: 32) + listOf(32, 20, 16)).distinct()
@@ -125,12 +142,7 @@ object MfiLengthMemory {
     }
 
     /**
-     * **硬拒绝**：链路在该长度的挑战期间被对端直接断开（区别于 0xAA04 拒绝字/静默）。
-     *
-     * 这是强证据——即使该长度等于已记「成功」也必须推翻（cardeck 2026-10-24 实测）：
-     * MFi 应答存在归属歧义——上一档超窗后才到的迟到应答会被记到当前档头上
-     * （DiPlay：32B 迟到 1.3s 应答被记成 20B 成功 → 之后每轮 20B 被断链、永不触及 32B，
-     * 记忆永久锁死）。链路被断 = 该长度确实不被接受，必须清掉 succeeded 并记 rejected。
+     * 明确且可归属的 0xAA04 可推翻旧成功。EOF/本地取消不能调用此方法。
      */
     fun recordHardRejected(
         context: Context?,

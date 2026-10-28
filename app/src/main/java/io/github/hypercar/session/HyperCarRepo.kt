@@ -388,8 +388,7 @@ object HyperCarRepo {
             // 排查第一件事就是「哪台机、什么系统、哪个版本」，缺了它只能靠猜。
             log("ENV: ${DeviceInfo.fullSummary(app)}")
             scope.launch { captureCrashArtifacts() }
-            // ACL 广播唤醒入口（receiver → handler）：优先经 FGS 拿前台豁免与持锁，
-            // 服务起来后再触发真正会话（handler 幂等，service 二次进入走直连分支）
+            // All entrypoints call connect(), which awaits the same foreground-service lease.
             AutoStart.handler = { ctx, device, connected ->
                 val app = ctx.applicationContext
                 if (connected) {
@@ -403,27 +402,8 @@ object HyperCarRepo {
                             log("AUTO: 本轮 iAP2 目标锁定为 ACL 车机 $address（${bluetoothName(device) ?: "?"}）")
                         }
                     }
-                    if (!HyperCarService.isRunning) {
-                        runCatching {
-                            app.startForegroundService(HyperCarService.startIntent(app, device))
-                        }.onFailure {
-                            // FGS 被系统拦（未授悬浮窗等）：降级直接连接（进程可能被回收）
-                            log("AUTO: FGS 启动被拦（${it.message}）——降级直接拉起会话")
-                            connect(app)
-                        }
-                    } else {
-                        connect(app)
-                    }
+                    connect(app)
                 } else {
-                    // 收摊路径必须幂等，且**只在服务确实在跑时**投 ACTION_STOP：
-                    // 服务收到 ACTION_STOP 会反向调本 handler(false)（见 HyperCarService），
-                    // 若这里无条件再投 ACTION_STOP，就形成
-                    //   handler(false) → startService(STOP) → onStartCommand(STOP) → handler(false) …
-                    // 的自激回环——实测每秒数百轮，只有「车机蓝牙 断开 + 会话已断开」两种日志，
-                    // 且车机不在场也照刷（进程自己把自己钉在前台）。
-                    if (HyperCarService.isRunning) {
-                        runCatching { app.startService(HyperCarService.stopIntent(app, device)) }
-                    }
                     runCatching { device.address }.getOrNull()?.let { address ->
                         if (address == aclCarMac) { aclCarMac = null; aclCarName = null }
                     }
@@ -476,19 +456,26 @@ object HyperCarRepo {
 
     // ---------------------------------------------------------------- 对 UI
 
-    fun connect(context: Context) {
+    private var keepAliveTicket: io.github.hypercar.autowake.ConnectionKeepAliveGate.Ticket? = null
+    private val sourceRecovery = SourceRecoveryController(scope)
+    @Volatile private var cleanupInProgress = false
+
+    fun connect(context: Context) = connectInternal(context, resetRecoveryBudget = true)
+
+    private fun connectInternal(context: Context, resetRecoveryBudget: Boolean) {
         init(context)
-        if (connecting || streaming) {
-            log("CONNECT: 已在连接/已连接，忽略重复触发")
+        if (connecting || streaming || cleanupInProgress) {
+            log("CONNECT: 已在连接、已连接或正在收尾，忽略重复触发")
             return
         }
+        if (resetRecoveryBudget) sourceRecovery.reset()
         runCatching { stopNative() }
         stopVivoSourceCheck()
         // 手动/自动发起连接都算"用户想要连"，清掉断开标记与重连倒计时
         userDisconnectRequested = false
         reconnectJob?.cancel()
         reconnectJob = null
-        sessionHadLink = false
+        if (resetRecoveryBudget) sessionHadLink = false
         connecting = true
         sessionLive.set(true)
         connectionTrace = ConnectionTrace("connect", ::log, SystemClock::elapsedRealtime).also {
@@ -505,6 +492,7 @@ object HyperCarRepo {
         val ownerTrace = connectionTrace
         connectionTrace?.event("disconnect.request", "connecting=$connecting engineRunning=$streaming live=${sessionLive.get()}")
         stopVivoSourceCheck()
+        sourceRecovery.cancel()
         carLifeSession?.close()
         runCatching { stopNative() }
         wakeJob?.cancel()
@@ -544,6 +532,12 @@ object HyperCarRepo {
         val ownerTrace = connectionTrace
         var untransferredFd: Int? = null
         try {
+            val ticket = HyperCarService.request(context, keepAliveTicket)
+            keepAliveTicket = ticket
+            check(withTimeoutOrNull(8_000) { ticket.ready.await(); true } == true) { "等待连接保活服务就绪超时" }
+            currentCoroutineContext().ensureActive()
+            check(connectionTrace === ownerTrace && sessionLive.get()) { "连接请求已经结束" }
+            ownerTrace?.event("keepalive.ready", "ticket=${ticket.id} foreground=true")
             sourceVideoConfirmed.set(false)
             lastFrameProgressAt = 0L
             connectionTrace?.event("preflight.begin", "waitingPreviousCleanup=${carLifeCleanupJob?.isActive == true}")
@@ -693,7 +687,7 @@ object HyperCarRepo {
                 // 这样接收端（WinPlay）的 BT 桥接不会因链路关闭而退出。
                 push(
                     link = LinkState.Connected(
-                        carName = SettingsStore.targetCarName ?: "BMW ID8.5",
+                        carName = SettingsStore.targetCarName ?: aclCarName ?: headUnitProfile.label,
                         sinceMillis = System.currentTimeMillis(),
                     ),
                     carLife = CarLifeState.Idle,
@@ -863,7 +857,7 @@ object HyperCarRepo {
             if (controlFd == null || controlFd < 0 || port == 0) {
                 fail(
                     "AirPlay 控制端口连接失败 $apHostFinal（试过 ${portsNow};" +
-                        " 端口探测时可能还开着，连接被拒说明接收端已把 AirPlay 服务关掉）",
+                        " 仅确认这些端口当前不可连接，车机服务状态及原因尚未确定）",
                 )
                 return
             }
@@ -915,10 +909,7 @@ object HyperCarRepo {
                 return
             }
             streaming = true
-            // CarLife 唤醒放在 onState("connected") 里做（AirPlay RECORD 完成后），
-            // 避免 CarLife 视频帧在屏幕流就绪前被丢弃。
-            watchCarLifeHandshake()
-            armVideoDiag()
+            // Encoder initialization and the source watchdog begin after AirPlay RECORD.
         } catch (cancelled: CancellationException) {
             connectionTrace?.event("connect.cancelled", "reason=${cancelled.message}")
             // disconnect() 掐掉在途连接：正常取消，不算失败（也不要把 Failed 写进快照）
@@ -944,6 +935,7 @@ object HyperCarRepo {
         // 幂等：重复的断开事件（ACL 断开广播 + 引擎 ended + service 转交）只真正拆一次。
         // 但**状态必须回 Idle**——曾经这里直接 return，导致链路已断、界面还显示"已连接"。
         if (!sessionLive.compareAndSet(true, false)) {
+            if (userDisconnectRequested) releaseKeepAlive()
             _snapshots.update { s ->
                 if (s.link is LinkState.Connected) {
                     s.copy(link = LinkState.Idle, carLife = CarLifeState.Idle)
@@ -955,7 +947,7 @@ object HyperCarRepo {
         }
         push(link = LinkState.Stopping)
         val hadLink = sessionHadLink
-        releaseSessionResources()
+        releaseSessionResources(keepAlive = shouldAutoReconnect(hadLink))
         log("SESSION: 已断开（$reason）")
         _snapshots.update { s ->
             s.copy(
@@ -980,6 +972,9 @@ object HyperCarRepo {
      * iap2 监听一起停了（见 releaseSessionResources），若车机 ACL 一直没断，就再也不会
      * 有 ACL_CONNECTED 广播进来 —— 表现就是"断了之后再也连不上，必须手动点连接"。
      */
+    private fun shouldAutoReconnect(hadLink: Boolean): Boolean = hadLink && !userDisconnectRequested &&
+        SettingsStore.autoConnect && reconnectAttempts < MAX_RECONNECT_ATTEMPTS
+
     private fun scheduleAutoReconnect(reason: String, hadLink: Boolean) {
         if (!hadLink) {
             log("RECONNECT: 本次会话没建立过链路（$reason）——不自动重连")
@@ -1004,8 +999,6 @@ object HyperCarRepo {
         ]
         reconnectJob?.cancel()
         reconnectJob = scope.launch {
-            // 车机自己先连回来就不用我们出手（ACL 广播会走 connect()）
-            if (streaming || connecting) return@launch
             log("RECONNECT: 链路断开（$reason）——${delayMs}ms 后自动重连（第 $attempt/$MAX_RECONNECT_ATTEMPTS 次）")
             kotlinx.coroutines.delay(delayMs)
             if (userDisconnectRequested) return@launch
@@ -1014,7 +1007,7 @@ object HyperCarRepo {
                 return@launch
             }
             reconnectAttempts = attempt
-            connect(ctx)
+            connectInternal(ctx, resetRecoveryBudget = false)
         }
     }
 
@@ -1023,35 +1016,49 @@ object HyperCarRepo {
      * 必须把 iAP2 停掉：只要它在跑，出站循环就每 3s 断一次车机的音频配置文件，
      * 既打扰车机，也会不断制造「ACL 断开」事件。
      */
-    private fun releaseSessionResources() {
-        val trace = connectionTrace
-        trace?.event("cleanup.begin", "engineRunning=$streaming binding=${carLifeSession?.hasRenderer} wifi=$boundNetwork iap2=${iap2 != null}")
-        carLifeSession?.close()
-        val wasDialMode = carLifeDialMode
-        carLifeDialMode = false
-        sessionMdHost = null
-        streaming = false
+    private fun releaseSessionResources(keepAlive: Boolean = false) {
+        cleanupInProgress = true
+        try {
+            val trace = connectionTrace
+            trace?.event("cleanup.begin", "engineRunning=$streaming binding=${carLifeSession?.hasRenderer} wifi=$boundNetwork iap2=${iap2 != null}")
+            sourceRecovery.cancel()
+            connectJob?.cancel()
+            connectJob = null
+            connecting = false
+            carLifeSession?.close()
+            val wasDialMode = carLifeDialMode
+            carLifeDialMode = false
+            sessionMdHost = null
+            streaming = false
 
-        runCatching { stopNative() }.onFailure { trace?.failure("cleanup.native", it) }
-        // 先掐掉"正在拉起 CarLife"的协程，再清理进程：
-        // 否则它会在 3s 等待结束后把无界面服务重新拉起来，留下 7240 空壳（2026-10-26 12:47 现场）。
-        wakeJob?.cancel()
-        wakeJob = null
-        carLifeActiveAt = 0L
-        carLifeLaunchedAt = 0L
-        // Rust 引擎停了之后清理本机 CarLife：否则它会留下"半死空壳"（7240 还占着、
-        // 内部状态机停在上一轮 Phase 7），下次上车连上去永远不回 Phase 1。
-        stopLocalCarLife(wasDialMode)
-        runCatching { iap2?.stop() }.onFailure { trace?.failure("cleanup.iap2", it) }
-        iap2 = null
-        runCatching { ctrlAdvertiser?.stop() }.onFailure { trace?.failure("cleanup.advertiser", it) }
-        ctrlAdvertiser = null
-        runCatching { wifiJoiner?.release() }.onFailure { trace?.failure("cleanup.wifi", it) }
-        wifiJoiner = null
-        joinedSsid = null
-        joinedNetwork = null
-        boundNetwork = null
-        trace?.event("cleanup.app_refs_released", "vendorShutdownNotAssumed=true")
+            runCatching { stopNative() }.onFailure { trace?.failure("cleanup.native", it) }
+            // 先掐掉"正在拉起 CarLife"的协程，再清理进程：
+            // 否则它会在 3s 等待结束后把无界面服务重新拉起来，留下 7240 空壳（2026-10-26 12:47 现场）。
+            wakeJob?.cancel()
+            wakeJob = null
+            carLifeActiveAt = 0L
+            carLifeLaunchedAt = 0L
+            // Rust 引擎停了之后清理本机 CarLife：否则它会留下"半死空壳"（7240 还占着、
+            // 内部状态机停在上一轮 Phase 7），下次上车连上去永远不回 Phase 1。
+            stopLocalCarLife(wasDialMode)
+            runCatching { iap2?.stop() }.onFailure { trace?.failure("cleanup.iap2", it) }
+            iap2 = null
+            runCatching { ctrlAdvertiser?.stop() }.onFailure { trace?.failure("cleanup.advertiser", it) }
+            ctrlAdvertiser = null
+            runCatching { wifiJoiner?.release() }.onFailure { trace?.failure("cleanup.wifi", it) }
+            wifiJoiner = null
+            joinedSsid = null
+            joinedNetwork = null
+            boundNetwork = null
+            if (!keepAlive) releaseKeepAlive()
+            else trace?.event("keepalive.retained", "reason=bounded_reconnect ticket=${keepAliveTicket?.id}")
+            trace?.event("cleanup.app_refs_released", "vendorShutdownNotAssumed=true")
+        } finally { cleanupInProgress = false }
+    }
+
+    private fun releaseKeepAlive() {
+        keepAliveTicket?.let { ticket -> appContext()?.let { HyperCarService.release(it, ticket) } }
+        keepAliveTicket = null
     }
 
     // ---------------------------------------------------------------- WiFi
@@ -1579,7 +1586,7 @@ object HyperCarRepo {
                     reconnectAttempts = 0
                     push(
                         link = LinkState.Connected(
-                            carName = SettingsStore.targetCarName ?: "BMW ID8.5",
+                            carName = SettingsStore.targetCarName ?: aclCarName ?: headUnitProfile.label,
                             sinceMillis = System.currentTimeMillis(),
                         ),
                         carLife = CarLifeState.Waiting(),
@@ -1592,6 +1599,8 @@ object HyperCarRepo {
                     } else {
                         wakeLocalCarLife()
                     }
+                    watchCarLifeHandshake()
+                    armVideoDiag()
                     // voice=0：由原厂 CarLife 使用手机麦克风，Hypercar 不重复采集。
 
 
@@ -1633,7 +1642,12 @@ object HyperCarRepo {
                         }
                     }
                 }
-                "failed" -> retryAirplayOrFail(detail)
+                "failed" -> {
+                    val trace = connectionTrace
+                    scope.launch {
+                        if (nativeGate.isCurrent(generation)) retryAirplayOrFail(detail, trace)
+                    }
+                }
                 "ended" -> {
                     val ownerTrace = connectionTrace
                     scope.launch {
@@ -1809,7 +1823,8 @@ object HyperCarRepo {
         val ctx = appContext() ?: return
         try {
             val accepted = owner.bindRenderer {
-                VivoCarLifeBinding.connect(ctx, owner.source, ::log, connectionTrace?.id) {
+                VivoCarLifeBinding.connect(ctx, owner.source, ::log, connectionTrace?.id,
+                    onLost = { reason -> onSourceBindingLost(owner, reason) }) {
                     carLifeSession === owner && owner.isOpen && sessionLive.get()
                 }
             }
@@ -1822,6 +1837,23 @@ object HyperCarRepo {
                 fail("vivo CarLife 初始化失败：${error.message}；请打开来源应用权限检查，原厂服务未就绪时不会继续假装取源成功")
             }
         }
+    }
+
+    /** Retire all old sockets before re-binding; the next session rechecks all six UIDs. */
+    private fun onSourceBindingLost(owner: CarLifeWakeSession, reason: String) {
+        val trace = connectionTrace
+        if (carLifeSession !== owner || !owner.isOpen) return
+        val context = appContext() ?: return
+        sourceRecovery.lost(
+            isCurrent = { connectionTrace === trace && carLifeSession === owner && owner.isOpen &&
+                sessionLive.get() && !userDisconnectRequested },
+            sourceActive = { owner.hasRenderer },
+            stillWanted = { connectionTrace === trace && !sessionLive.get() && !userDisconnectRequested &&
+                !connecting && !streaming && !cleanupInProgress },
+            stop = { retain -> fail("vivo 来源绑定失效：$reason", allowReconnect = false, keepAliveUntilRetry = retain) },
+            restart = { connectInternal(context, resetRecoveryBudget = false) },
+            log = { stage, detail -> trace?.event("source.recovery.$stage", "$detail reason=$reason") },
+        )
     }
 
     fun openCarLifeSourceSettings(context: Context, packageName: String = SettingsStore.carlifePackage) {
@@ -2238,7 +2270,7 @@ object HyperCarRepo {
                         if (seen == null && coordinator.sessionStartCount == 0) {
                             log(
                                 "SESSION: ${waited}s 内车机一次都没发起 iAP2（ACL 已连但收不到 …cafe 连入）——" +
-                                    "这是车机侧状态：请在 iDrive「移动设备」里删除本机后重新配对，" +
+                                    "当前尚无车机主动连入：请打开车机的智能手机接口页面，" +
                                     "或确认「Apple CarPlay」已为该设备启用（设置里可手动指定目标车机）",
                             )
                         } else {
@@ -2289,21 +2321,30 @@ object HyperCarRepo {
         return old?.merge(incoming) ?: incoming
     }
 
-    private fun fail(reason: String) {
+    fun onKeepAliveLost(ticketId: Long) {
+        val ownerTrace = connectionTrace
+        scope.launch {
+            if (keepAliveTicket?.id == ticketId && connectionTrace === ownerTrace && sessionLive.get()) {
+                fail("连接保活服务意外停止，已结束本轮连接")
+            }
+        }
+    }
+
+    private fun fail(reason: String, allowReconnect: Boolean = true, keepAliveUntilRetry: Boolean = false) {
         connectionTrace?.event("connect.failed", "reason=$reason sourceBinding=${carLifeSession?.hasRenderer} videoFrames=$lastVideoFrames boundNetwork=$boundNetwork")
         sessionLive.set(false)
         log("SESSION 失败: $reason")
         val hadLink = sessionHadLink
         // 失败即停蓝牙/WiFi 侧（保留 Failed 状态给 UI）：否则 iAP2 出站循环会继续每 3s
         // 断一次车机音频配置文件，还占着 RFCOMM 监听，下一次上车也会被旧会话拖住。
-        releaseSessionResources()
+        releaseSessionResources(keepAlive = keepAliveUntilRetry || (allowReconnect && shouldAutoReconnect(hadLink)))
         _snapshots.value = _snapshots.value.copy(
             link = LinkState.Failed(reason),
             carLife = CarLifeState.Idle,
         )
         // 失败也走自动重连（同样受 hadLink / 用户断开 / 自动连接开关 / 次数上限约束），
         // 否则"车机主动关控制通道"这类场景会一直停在 Failed 等人点。
-        scheduleAutoReconnect("失败: $reason", hadLink)
+        if (allowReconnect) scheduleAutoReconnect("失败: $reason", hadLink)
     }
 
     private fun push(link: LinkState? = null, carLife: CarLifeState? = null) {
@@ -2489,52 +2530,23 @@ object HyperCarRepo {
         }
     }
 
-    /**
-     * 抓上一次运行的崩溃线索（只有 Shizuku 就绪时能读 logcat）。
-     *
-     * Rust 侧 panic 会经 `nativeInitLogger` 装的 panic hook 打到 logcat（tag HyperCar-Core），
-     * 系统崩溃记录在 crash 缓冲区，原生 abort 的证据（`Fatal signal`/`Abort message`）在
-     * DEBUG/libc 里。抓回来写进日志后，不用 adb 也能看到「谁崩的、崩在哪」。
-     *
-     * 注意别用 `logcat -d -t 600` 这种「全量尾巴」：这台机器 logcat 每秒上千行，
-     * 600 行只覆盖半秒，崩溃那一瞬很容易被冲掉（2026-10-23 20:44 就是这样漏掉的）。
-     * 改成按 tag 精确抓、窗口放大，并只留真正像崩溃的行。指纹文件去重。
-     */
+    /** Only this package's recent platform exit records; unrelated system crashes are excluded. */
     private suspend fun captureCrashArtifacts() {
-        if (!ShizukuTools.isReady) return
-        val dump = runCatching {
-            ShizukuTools.exec(
-                "logcat -d -s HyperCar-Core:V -t 600; " +
-                    "logcat -b crash -d -t 150; " +
-                    "logcat -d -t 5000 -s DEBUG:V libc:V",
-                8_000,
-            )
-        }.getOrNull() ?: return
-        val interesting = listOf(
-            "PANIC",
-            "panicked at",
-            "Fatal signal",
-            "Abort message",
-            "libhypercar_core",
-            "tombstone",
-            "Process: io.github.hypercar",
-            "ANR in io.github.hypercar",
-        )
-        val lines = (dump.out + "\n" + dump.err)
-            .lineSequence()
-            .map { it.trim() }
-            .filter { it.isNotEmpty() && interesting.any { key -> it.contains(key) } }
-            .distinct()
-            .toList()
-            .takeLast(40)
-        if (lines.isEmpty()) return
-        val dir = appCtx?.filesDir ?: return
-        val marker = java.io.File(dir, "crash-capture.txt")
-        val fingerprint = lines.joinToString("\n").hashCode().toString()
-        if (runCatching { marker.readText() }.getOrNull() == fingerprint) return
-        runCatching { marker.writeText(fingerprint) }
-        log("CRASH: 上一次运行的崩溃线索（${lines.size} 行）")
-        lines.forEach { log("CRASH| $it") }
+        val ctx = appCtx ?: return
+        val manager = ctx.getSystemService(android.app.ActivityManager::class.java) ?: return
+        val marker = ctx.filesDir.resolve("process-exit-last.txt")
+        val reported = runCatching { marker.readText().trim().toLong() }.getOrDefault(0L)
+        val cutoff = System.currentTimeMillis() - 24 * 60 * 60 * 1_000L
+        val exits = runCatching { manager.getHistoricalProcessExitReasons(ctx.packageName, 0, 8) }
+            .onFailure { log("PROCESS_EXIT: 无法读取本应用退出原因：${it.message}") }.getOrDefault(emptyList())
+            .filter { it.timestamp > maxOf(reported, cutoff) &&
+                (it.processName == ctx.packageName || it.processName.startsWith(ctx.packageName + ":")) }
+            .sortedBy { it.timestamp }
+        for (entry in exits) {
+            val time = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.ROOT).format(java.util.Date(entry.timestamp))
+            log("PROCESS_EXIT: 本应用历史退出 time=$time pid=${entry.pid} process=${entry.processName} reasonCode=${entry.reason} status=${entry.status} importance=${entry.importance} description=${entry.description?.take(240)}；需与本轮时间核对，不推断崩溃")
+        }
+        exits.lastOrNull()?.let { runCatching { marker.writeText(it.timestamp.toString()) } }
     }
 
     /** 单行日志的限流状态（仅 [logRateLock] 内访问）。 */

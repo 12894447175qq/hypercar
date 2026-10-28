@@ -820,6 +820,9 @@ class Iap2SenderSession(
     ) {
         val baseline = MfiLengthMemory.baseline(profile.mfiPreferredChallengeBytes)
         val windowOf = MFI_ATTEMPTS.toMap()
+        if (MfiLengthMemory.repairLegacyAudiHistory(context, receiverKey)) {
+            log("iap2 MFi 已修复本车旧版歧义记忆；重新从档案首选长度开始，不改变其他车机")
+        }
         val memory = MfiLengthMemory.forPreference(context, receiverKey, profile.mfiPreferredChallengeBytes)
         val order = MfiLengthMemory.orderAttempts(baseline, memory)
         if (!memory.isEmpty) {
@@ -828,7 +831,9 @@ class Iap2SenderSession(
                     " → 本轮顺序 ${order.joinToString("/")}B",
             )
         }
+        var outstandingTimedOutChallenge = false
         for ((position, size) in order.withIndex()) {
+            if (!channel.isAlive) return
             // 已知「静默过」的档位缩短窗口：它已经失败过一次，没必要再等满
             val baseWindow = windowOf[size] ?: MFI_ATTEMPTS.last().second
             val windowMillis =
@@ -849,9 +854,7 @@ class Iap2SenderSession(
                 val frame = recvFrame(remaining)
                 if (frame == null) {
                     if (!channel.isAlive) {
-                        log("iap2 MFi 挑战期间链路断开（${size}B，对端不接受该长度）——记入该车机被拒档位")
-                        // 硬拒绝：链路级证据，推翻「该长度=上次成功」的记忆（防迟到应答误记锁死）
-                        MfiLengthMemory.recordHardRejected(context, receiverKey, size)
+                        log("iap2 MFi 等待 ${size}B 时链路关闭；无法区分本地取消与远端原因，未写入拒绝记忆")
                         return
                     }
                     continue
@@ -875,13 +878,22 @@ class Iap2SenderSession(
                 if (gotResponse || gotFailure) break
             }
             if (gotResponse) {
-                MfiLengthMemory.recordSuccess(context, receiverKey, size)
+                if (!channel.isAlive) return // A queued response after local close cannot change history.
+                if (!outstandingTimedOutChallenge) {
+                    MfiLengthMemory.recordSuccess(context, receiverKey, size)
+                    log("iap2 MFi 单一待决挑战 ${size}B 获应答，已保存长度记忆（未校验证书链）")
+                } else {
+                    log("iap2 MFi 应答可能属于先前超时挑战；本轮继续协商，未把 ${size}B 记为成功")
+                }
                 return
             }
+            if (!channel.isAlive) return
             if (gotFailure) {
-                MfiLengthMemory.recordRejected(context, receiverKey, size)
+                if (!outstandingTimedOutChallenge) MfiLengthMemory.recordHardRejected(context, receiverKey, size)
+                else log("iap2 MFi 拒绝应答归属不明，未改写长度记忆")
             } else {
                 MfiLengthMemory.recordSilent(context, receiverKey, size)
+                outstandingTimedOutChallenge = true
             }
             if (position < order.size - 1) {
                 log("iap2 MFi ${size}B 无应答，改用 ${order[position + 1]}B 重试")

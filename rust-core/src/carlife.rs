@@ -138,6 +138,8 @@ pub struct CarLifeConfig {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    /// Delay encoder INIT until AirPlay has refreshed its display geometry.
+    pub wait_for_airplay: bool,
     /// 特性配置里的 `voice`：1 = 车机提供语音/麦克风（需要 HU 推 VR 麦克风数据），
     /// 0 = 车机不提供语音 → MD 回落到**手机自己的麦克风**。
     pub voice: u32,
@@ -154,6 +156,7 @@ pub struct CarLifeHub {
     cfg: CarLifeConfig,
     /// 当前编码分辨率共享单元（与 AirPlay 协商/触摸换算共用）。
     encoder_size: Arc<Mutex<(u32, u32)>>,
+    video_ready: tokio::sync::watch::Sender<bool>,
     /// VR 通道麦克风帧（HU → MD）
     mic_tx: mpsc::UnboundedSender<Vec<u8>>,
     /// 麦克风帧时间戳基准
@@ -166,8 +169,9 @@ impl CarLifeHub {
         let (touch_tx, _) = mpsc::unbounded_channel();
         let (mic_tx, _) = mpsc::unbounded_channel();
         let size = (cfg.width.max(2), cfg.height.max(2));
+        let (video_ready, _) = tokio::sync::watch::channel(!cfg.wait_for_airplay);
         emit_log("CARLIFE: 联动关闭，仅协商车机传输；不监听、不拨号任何 CarLife 端口");
-        (Self { events, touch_tx, cfg, encoder_size: Arc::new(Mutex::new(size)),
+        (Self { events, touch_tx, cfg, encoder_size: Arc::new(Mutex::new(size)), video_ready,
             mic_tx, mic_start: std::time::Instant::now() }, event_rx)
     }
 
@@ -179,6 +183,7 @@ impl CarLifeHub {
         let (touch_tx, touch_rx) = mpsc::unbounded_channel();
         let (mic_tx, mic_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let voice = cfg.voice;
+        let (video_ready, _) = tokio::sync::watch::channel(!cfg.wait_for_airplay);
         let first_frame = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // 初始值取设置；AirPlay 的 /info 报到车机真实尺寸后会覆盖它，
         // 手机在 INIT_DONE 里回报实际编码尺寸后再次覆盖。
@@ -200,6 +205,7 @@ impl CarLifeHub {
             let size = encoder_size.clone();
             let stop_c = stop.clone();
             let frame_c = first_frame.clone();
+            let ready_c = video_ready.subscribe();
             move |stream| {
                 handle_cmd_client(
                     stream,
@@ -211,6 +217,7 @@ impl CarLifeHub {
                     bt_name.clone(),
                     stop_c.clone(),
                     frame_c.clone(),
+                    ready_c.clone(),
                 )
             }
         });
@@ -242,11 +249,17 @@ impl CarLifeHub {
                 touch_tx,
                 cfg,
                 encoder_size,
+                video_ready,
                 mic_tx,
                 mic_start: std::time::Instant::now(),
             },
             event_rx,
         ))
+    }
+
+    pub fn allow_video_init(&self) {
+        self.video_ready.send_replace(true);
+        emit_log("CARLIFE: AirPlay 视频已就绪，允许按已确定的车机尺寸初始化编码器");
     }
 
     /// 编码分辨率共享单元的句柄（AirPlay 协商据此请求编码尺寸，触摸换算读它）。
@@ -271,6 +284,7 @@ impl CarLifeHub {
         let (touch_tx, touch_rx) = mpsc::unbounded_channel();
         let (mic_tx, mut mic_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let voice = cfg.voice;
+        let (video_ready, _) = tokio::sync::watch::channel(!cfg.wait_for_airplay);
         let first_frame = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let encoder_size: Arc<Mutex<(u32, u32)>> =
             Arc::new(Mutex::new((cfg.width.max(2), cfg.height.max(2))));
@@ -285,6 +299,7 @@ impl CarLifeHub {
             let bt_address = cfg.bt_address.clone();
             let bt_name = cfg.bt_name.clone();
             let frame_c = first_frame.clone();
+            let ready_c = video_ready.subscribe();
             spawn_scoped(stop.clone(), async move {
                 let mut throttle = DialLogThrottle::new();
                 loop {
@@ -303,6 +318,7 @@ impl CarLifeHub {
                                     bt_name.clone(),
                                     stop_c.clone(),
                                     frame_c.clone(),
+                                    ready_c.clone(),
                                 )
                                 .await;
                                 emit_log("CARLIFE: CMD 通道断开，1s 后重连");
@@ -335,6 +351,7 @@ impl CarLifeHub {
             let stop_c = stop.clone();
             let host = md_host.clone();
             let frame_c = first_frame.clone();
+
             spawn_scoped(stop.clone(), async move {
                 // 官方实现（CConnectionSetupModule.cpp）是**握手前**就把 VIDEO 建好：
                 // CMD → VIDEO → MEDIA → TTS → VR → CTRL。所以这里不再延迟 VIDEO。
@@ -470,6 +487,7 @@ impl CarLifeHub {
                 touch_tx,
                 cfg,
                 encoder_size,
+                video_ready,
                 mic_tx,
                 mic_start: std::time::Instant::now(),
             },
@@ -735,6 +753,7 @@ async fn handle_cmd_client(
     bt_name: String,
     stop: Arc<SessionStop>,
     first_frame: Arc<std::sync::atomic::AtomicBool>,
+    mut video_ready: tokio::sync::watch::Receiver<bool>,
 ) {
     let (mut rd, mut wr) = stream.into_split();
     let mut hs = Handshake::default();
@@ -922,6 +941,16 @@ async fn handle_cmd_client(
                 CMD_MD_AUTHEN_RESULT => {
                     emit_log("CARLIFE: [Phase 5] ← MD_AUTHEN_RESULT —— 连接建立");
                     if !hs.encoder_init_sent {
+                        if !*video_ready.borrow() {
+                            emit_log("CARLIFE: 等待 AirPlay 视频就绪后再发送 VIDEO_ENCODER_INIT，避免旧分辨率抢先初始化");
+                        }
+                        while !*video_ready.borrow() {
+                            tokio::select! {
+                                _ = stop.notified() => return,
+                                changed = video_ready.changed() => if changed.is_err() { return; },
+                            }
+                        }
+
                         // 用**当前**编码分辨率（/info 已按车机真实尺寸写入），
                         // 但要先规整成手机编码器更稳的尺寸：宽度封顶 1920、宽高 16 对齐。
                         // 2560×744（744/16=46.5）这类值在部分机型上会让 MediaCodec 静默失败，
