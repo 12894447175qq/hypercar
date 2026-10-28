@@ -96,7 +96,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 - 配置四项签名 Secrets 后，继续构建并验证正式签名 APK；缺少签名的 fork 普通推送只完成验证。
 - 正式版本由 `appVersionName` + run_number 组成：`0.1.1.<N>`，`versionCode = 5*10000 + N`。
-  本地不传构建号时为 `0.1.1 / 50000`，高于旧版 `10050`、`20000`、`30000` 和 `40000`。
+  本地不传构建号时为 `0.1.1.3 / 50003`，高于旧测试版本；覆盖安装还必须使用与现装版本相同的签名。
 - 发布仍需提交标题末尾的发布标记或手动勾选 publish；普通修复推送不会创建 Release。
 - 必需 Secrets：`KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD`；可选
   `EXPECTED_CERT_SHA256`。显式发布时缺任一材料即失败，绝不以 debug 签名替代正式版。

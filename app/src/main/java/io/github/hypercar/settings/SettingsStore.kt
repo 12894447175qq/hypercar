@@ -267,10 +267,12 @@ object SettingsStore {
         deviceBluetoothMac: String,
         identityPath: String,
         mdHost: String? = null,
+        carLifeEnabled: Boolean = true,
     ): String {
         fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
         return buildString {
             append("{")
+            append("\"carlife_enabled\":").append(carLifeEnabled).append(",")
             append("\"device_id\":\"").append(esc(deviceBluetoothMac)).append("\",")
             append("\"car_ip\":\"").append(esc(carIp)).append("\",")
             append("\"airplay_port\":").append(airplayPort).append(",")

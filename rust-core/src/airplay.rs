@@ -3,8 +3,8 @@
 //! 流程（cardeck 真车验证的顺序，Audi MIB3 / BMW iD8.5 通用骨架）：
 //!  1. `GET /info`（带空 bplist 体 + plist Content-Type，老固件对缺体的 /info 回 400/455）
 //!  2. `/pair-verify` M1..M4（本机 ed25519 长期身份）→ 控制通道密钥
-//!  3. modesChanged（声明持有主屏/主音频资源；跳过它 Audi 对屏幕流 SETUP 直接 400）
-//!  4. 会话级 `SETUP /setup`（deviceID 必须是本机真实蓝牙 MAC；et 仅未配对会话带）
+//!  3. 会话级 `SETUP /setup`（先建立会话，MIB3 在此之前拒绝资源命令）
+//!  4. SETUP 后刷新 /info，再 modesChanged（在屏幕流 SETUP 前声明资源）
 //!  5. 连接事件通道（SETUP 应答 eventPort；车机在此通道 POST /command）
 //!  6. 屏幕流 `SETUP /`（type 110，uuid 必须取 /info displays[].uuid）→ dataPort
 //!  7. 音频流 `SETUP /`（type 100 PCM 48k，spf=352）→ dataPort/controlPort
@@ -31,6 +31,10 @@ use crate::rtsp::{ControlCipher, RtspChannel};
 use crate::screen::{ScreenCipher, ScreenSender};
 use crate::timing::TimingServer;
 use crate::{emit_iap, emit_log, emit_state};
+
+#[cfg(test)]
+#[path = "negotiation_tests.rs"]
+mod negotiation_tests;
 
 /// Rust 需要新 socket 时回调 Kotlin（必须绑定车机网络，否则流量走手机）。
 pub trait SocketProvider: Send + Sync {
@@ -90,18 +94,15 @@ pub async fn negotiate(
 
     // ---- 1. /info（**best-effort**，不可用不致命）----
     //
-    // 2026-10-25 车友日志（BMW 17713 / MGU-86，AirTunes/450.14）定谳：
-    // 在**未配对的连接**上 GET/POST /info 全部回 `455 Method Not Valid In This State`，
-    // 旧实现把这里当致命错误直接退出引擎（6 轮重试、每轮 3 次 /info、全部 455）。
-    // cardeck 的真车记录同样如此：「车机对未配对连接上的 /info 应答 455」，
-    // 正确顺序是 **先 pair-setup/pair-verify，再查 /info**（配对后的 /info 也常被
-    // 455/403 拒，所以它只是"增强"：拿不到显示尺寸/features 就用设置值）。
-    let mut info = match fetch_info(&channel).await {
+    // Only read the receiver public key before pairing; it distinguishes receivers
+    // sharing an IP. MIB3 may reject this until a media session exists, so failure
+    // is nonfatal and full geometry is always refreshed after the initial SETUP.
+    let info = match fetch_info(&channel).await {
         Ok(v) => v,
         Err(e) => {
             emit_log(&format!(
                 "AIRPLAY: /info 不可用（{e}）——未配对连接上被 455 拒是已知行为，\
-                 继续走 pair-verify（显示尺寸/能力先用设置值），配对后会再试一次"
+                 继续走 pair-verify（显示尺寸/能力先用设置值），会话 SETUP 后会再试一次"
             ));
             Value::dict(vec![])
         }
@@ -235,19 +236,8 @@ pub async fn negotiate(
         }
     }
 
-    // ---- 2.5 /info 兜底：配对后再试一次 ----
-    // 配对前被 455 拒是常态（2026-10-25 日志：3 次尝试 455）；配对成功后车机状态机
-    // 才允许 /info 的场景存在（cardeck 记录：活跃会话内的 /info 也常被 455/403 拒，
-    // 所以这里只当"可能补全"，失败不影响后续 SETUP）。
-    if info.as_dict().map(|d| d.is_empty()).unwrap_or(true) {
-        match fetch_info(&channel).await {
-            Ok(v) if v.as_dict().map(|d| !d.is_empty()).unwrap_or(false) => {
-                info = v;
-                emit_log("AIRPLAY: 配对后 /info 成功——补全显示尺寸/能力");
-            }
-            _ => emit_log("AIRPLAY: 配对后 /info 仍不可用——沿用设置分辨率与默认能力继续"),
-        }
-    }
+    let MediaSession { info, timing, event_port, keep_alive_port } =
+        setup_media_session(&channel, p, info, shared_secret.is_some(), stop.clone()).await?;
 
     // ---- 2.6 用 /info 结果校准显示尺寸与能力（上面拿不到就全用兜底）----
     let keep_alive_stats = p.keep_alive_stats
@@ -255,19 +245,7 @@ pub async fn negotiate(
             .get("keepAliveSendStatsAsBody")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-    let display = info
-        .get("displays")
-        .and_then(Value::as_array)
-        .and_then(|a| a.first());
-    let display_uuid = display.and_then(|d| uuid_text(d.get("uuid")));
-    let (disp_w, disp_h) = display
-        .map(|d| {
-            (
-                d.get("width").and_then(Value::as_int).unwrap_or(0) as u32,
-                d.get("height").and_then(Value::as_int).unwrap_or(0) as u32,
-            )
-        })
-        .unwrap_or((0, 0));
+    let (display_uuid, disp_w, disp_h) = receiver_display(&info);
     // 车机能力位图：判断是否支持 HEVC 等能力，只能靠它（我们无法向 CarLife 指定 codec）
     let car_features = info.get("features").and_then(Value::as_int).unwrap_or(0);
     emit_log(&format!(
@@ -291,36 +269,6 @@ pub async fn negotiate(
             p.width, p.height
         ));
     }
-
-    // ---- 3. modesChanged ----
-    assert_modes(&channel).await?;
-
-    // ---- 4. 计时服务 + 会话级 SETUP ----
-    let timing = TimingServer::start(stop.clone()).map_err(|e| format!("计时服务启动失败: {e}"))?;
-    let body = build_session_setup(&p.device_id, timing.port, shared_secret.is_some());
-    let resp = channel
-        .request(
-            "SETUP",
-            "/setup",
-            &body,
-            "application/x-apple-binary-plist",
-            &[],
-            Duration::from_secs(10),
-        )
-        .await?;
-    if resp.status() != 200 {
-        return Err(format!(
-            "会话 SETUP 被拒 [{}]（deviceID={}；接收端若启用设备过滤请选择该地址）",
-            resp.first_line,
-            p.device_id
-        ));
-    }
-    let root = bplist::parse(&resp.body).map_err(|e| format!("SETUP 应答解析失败: {e}"))?;
-    let event_port = port_of(root.get("eventPort"));
-    let keep_alive_port = port_of(root.get("keepAlivePort"));
-    emit_log(&format!(
-        "AIRPLAY: ✓ 会话 SETUP eventPort={event_port} keepAlive={keep_alive_port:?}"
-    ));
 
     // ---- 5. 事件通道 ----
     if event_port == 0 {
@@ -498,6 +446,77 @@ pub async fn negotiate(
 
 // ---------------------------------------------------------------- /info
 
+fn receiver_display(info: &Value) -> (Option<String>, u32, u32) {
+    let display = info.get("displays").and_then(Value::as_array).and_then(|v| v.first());
+    let Some(display) = display else { return (None, 0, 0); };
+    let dimension = |pixel_key: &str, legacy_key: &str| {
+        [pixel_key, legacy_key].iter().find_map(|key| {
+            display.get(key).and_then(Value::as_int)
+                .and_then(|value| u32::try_from(value).ok()).filter(|v| *v > 0)
+        }).unwrap_or(0)
+    };
+    let uuid = ["uuid", "UUID", "displayUUID"].iter()
+        .find_map(|key| uuid_text(display.get(key)));
+    (uuid, dimension("widthPixels", "width"), dimension("heightPixels", "height"))
+}
+
+struct MediaSession {
+    info: Value,
+    timing: TimingServer,
+    event_port: u16,
+    keep_alive_port: u16,
+}
+
+/// Post-pairing media bootstrap, exercised against a stateful TCP receiver in tests.
+async fn setup_media_session(
+    channel: &Arc<RtspChannel>,
+    p: &AirplayParams,
+    mut info: Value,
+    encrypted: bool,
+    stop: Arc<SessionStop>,
+) -> Result<MediaSession, String> {
+    // ---- 3. 计时服务 + 会话级 SETUP ----
+    let timing = TimingServer::start(stop.clone()).map_err(|e| format!("计时服务启动失败: {e}"))?;
+    let body = build_session_setup(&p.device_id, timing.port, encrypted);
+    let resp = channel
+        .request(
+            "SETUP",
+            "/setup",
+            &body,
+            "application/x-apple-binary-plist",
+            &[],
+            Duration::from_secs(10),
+        )
+        .await?;
+    if resp.status() != 200 {
+        return Err(format!(
+            "会话 SETUP 被拒 [{}]（deviceID={}；接收端若启用设备过滤请选择该地址）",
+            resp.first_line,
+            p.device_id
+        ));
+    }
+    let root = bplist::parse(&resp.body).map_err(|e| format!("SETUP 应答解析失败: {e}"))?;
+    let event_port = port_of(root.get("eventPort"));
+    let keep_alive_port = port_of(root.get("keepAlivePort"));
+    emit_log(&format!(
+        "AIRPLAY: ✓ 会话 SETUP eventPort={event_port} keepAlive={keep_alive_port:?}"
+    ));
+
+    // Refresh after the session exists: MIB3 can reject /info before SETUP.
+    if event_port == 0 { return Err("SETUP 未返回 eventPort".to_string()); }
+    match fetch_info(channel).await {
+        Ok(v) if v.as_dict().is_some_and(|d| !d.is_empty()) => {
+            info = v;
+            emit_log("AIRPLAY: 会话 SETUP 后 /info 已刷新");
+        }
+        Ok(_) => emit_log("AIRPLAY: 会话 SETUP 后 /info 为空，保留已知能力"),
+        Err(e) => emit_log(&format!("AIRPLAY: 会话 SETUP 后 /info 仍不可用，保留已知能力：{e}")),
+    }
+    // MIB3 needs a session before /command, but resources before the screen SETUP.
+    assert_modes(channel).await?;
+    Ok(MediaSession { info, timing, event_port, keep_alive_port })
+}
+
 async fn fetch_info(channel: &Arc<RtspChannel>) -> Result<Value, String> {
     let body = bplist::encode(&Value::dict(vec![]));
     // /info 的方法在各代固件上不一样：
@@ -541,42 +560,8 @@ async fn fetch_info(channel: &Arc<RtspChannel>) -> Result<Value, String> {
         }
         return bplist::parse(&resp.body).map_err(|e| format!("/info 解析失败: {e}"));
     }
-    // ---- 侦察：这台车机到底认什么 ----
-    // 455 只说明「这个状态下不接受 /info」，但没告诉我们它接受什么。
-    // 依次试 AirPlay 1 的经典入口，把每次的状态行原样记进日志——下一次上车就能定位。
-    // 只做记录，不改变后续流程（后面照样按失败返回）。
-    let probes: [(&str, &str); 4] = [
-        ("OPTIONS", "*"),
-        ("GET", "/server-info"),
-        ("POST", "/pair-setup"),
-        ("POST", "/pair-verify"),
-    ];
-    let mut recon = Vec::new();
-    for (method, path) in probes {
-        let body = if method == "POST" { bplist::encode(&Value::dict(vec![])) } else { Vec::new() };
-        let probe_extra: Vec<(&str, String)> = vec![
-            ("X-Apple-ProtocolVersion", "1".to_string()),
-            ("X-Apple-Device-ID", "0x0".to_string()),
-        ];
-        match channel
-            .request(method, path, &body, "application/x-apple-binary-plist", &probe_extra, Duration::from_secs(5))
-            .await
-        {
-            Ok(r) => {
-                let mut head: Vec<String> = r.headers.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                head.sort();
-                let note = format!("{method} {path} → [{}] 头部[{}]", r.first_line, if head.is_empty() { "无".to_string() } else { head.join(", ") });
-                emit_log(&format!("AIRPLAY 侦察: {note}"));
-                recon.push(note);
-            }
-            Err(e) => {
-                let note = format!("{method} {path} → 传输错误: {e}");
-                emit_log(&format!("AIRPLAY 侦察: {note}"));
-                recon.push(note);
-            }
-        }
-    }
-    emit_log(&format!("AIRPLAY 侦察结论: {}", recon.join(" | ")));
+    // Capability discovery must never send malformed authentication requests.
+
     Err(format!("/info 三次尝试都被拒：{}", failures.join("；")))
 }
 

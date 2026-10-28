@@ -97,7 +97,7 @@ docs/          架构、CarLife 协议、协商对比、编译指南、车机档
 | [docs/HEADUNIT-PROFILES.md](docs/HEADUNIT-PROFILES.md) | 车机档案字段、**新增品牌四步走**、**远程下发（改 JSON 不发版）** |
 | [docs/IPHONE-HCI-CAPTURE.md](docs/IPHONE-HCI-CAPTURE.md) | **iPhone HCI 抓包手册**（描述文件 → sysdiagnose → .pklg） |
 | [docs/BUILD.md](docs/BUILD.md) | 编译环境、本地出包、CI 标记 |
-| [docs/DIAGNOSTIC-LOGGING.md](docs/DIAGNOSTIC-LOGGING.md) | 50000 测试包安装、日志保存和车测后导出 |
+| [docs/DIAGNOSTIC-LOGGING.md](docs/DIAGNOSTIC-LOGGING.md) | 当前测试包安装与签名限制、日志保存和车测后导出 |
 | [docs/VIVO-MIB3.md](docs/VIVO-MIB3.md) | vivo / Jovi 已知阻塞与 MIB3 验收顺序 |
 
 ## 快速开始

@@ -121,6 +121,10 @@ class CarLifeWakeSession(val source: CarLifeSource) {
 
 /** /proc/net/tcp{,6}: inspect LISTEN UID without consuming CarLife's single accept(). */
 object CarLifePorts {
+    val standardPorts = listOf(7240, 8240, 9240, 9241, 9242, 9340)
+    enum class State { NOT_LISTENING, OWNED, FOREIGN, UNKNOWN }
+    enum class Action { DIAL, LISTEN, WAIT, NEEDS_ACCESS, CONFLICT, INCOMPLETE }
+    data class Inspection(val state: State, val listeners: List<Listener> = emptyList())
     data class Listener(val port: Int, val uid: Int, val address: String)
     data class SocketRow(val port: Int, val uid: Int, val address: String, val state: String)
     fun readable(table: String): Boolean = table.lineSequence().any {
@@ -142,5 +146,30 @@ object CarLifePorts {
             "00000000", "0100007F", "00000000000000000000000000000000", "0000000000000000FFFF00000100007F",
         ) }
         return local.isNotEmpty() && local.all { it.uid == expectedUid }
+    }
+
+    /** A failed read never proves either an empty port or a foreign owner. */
+    fun inspect(table: String?, port: Int, expectedUid: Int): Inspection {
+        if (table == null || !readable(table)) return Inspection(State.UNKNOWN)
+        val listeners = parse(table).filter { it.port == port }
+        if (listeners.isEmpty()) return Inspection(State.NOT_LISTENING)
+        return Inspection(if (owned(listeners, port, expectedUid)) State.OWNED else State.FOREIGN, listeners)
+    }
+
+    /** Dial mode opens all six channels, so every destination must have the same trusted UID. */
+    fun serverReady(inspections: Map<Int, Inspection>): Boolean =
+        standardPorts.all { inspections[it]?.state == State.OWNED }
+
+    /** A proven server source (vivo) must never fall back to competing listeners. */
+    fun action(inspections: Map<Int, Inspection>, serverRequired: Boolean, expired: Boolean): Action {
+        val states = standardPorts.map { inspections[it]?.state ?: State.UNKNOWN }
+        return when {
+            State.FOREIGN in states -> Action.CONFLICT
+            State.UNKNOWN in states -> Action.NEEDS_ACCESS
+            states.all { it == State.OWNED } -> Action.DIAL
+            !expired -> Action.WAIT
+            !serverRequired && states.all { it == State.NOT_LISTENING } -> Action.LISTEN
+            else -> Action.INCOMPLETE
+        }
     }
 }

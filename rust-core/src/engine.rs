@@ -54,10 +54,13 @@ pub struct EngineConfig {
     #[serde(default)]
     pub keep_alive_stats: bool,
     pub identity_path: String,
+    /// False is an AirPlay-only diagnostic session, with no CarLife sockets.
+    #[serde(default = "default_true")]
+    pub carlife_enabled: bool,
     /// 非空 = CarLife 走**主动连接模式**：不发监听，改为逐个拨 `md_host` 的标准端口。
     ///
-    /// 小米 CarLife/CarWith「车辆热点 → 开始连接」后是 MD 在监听（7240/8240/…），
-    /// 等车机连入；Android 上（HU 与 MD 同机）保持 `None`，仍用回环监听。
+    /// vivo 原厂渲染端及部分 CarLife/CarWith 模式是 MD 监听标准端口，
+    /// Kotlin 核实来源 UID 后传入回环地址；客户端来源才保持 `None` 由 HU 监听。
     #[serde(default)]
     pub md_host: Option<String>,
     /// 接收端 `/info` 报 0x0 时的**触摸显示空间**宽/高（0 = 用协商的屏幕尺寸）。
@@ -115,24 +118,28 @@ pub async fn run_engine(
         bt_address: cfg.device_id.clone(),
         bt_name: "BMW".to_string(),
     };
-    let (hub, mut life_events) = match cfg.md_host.clone() {
-        Some(host) => CarLifeHub::connect(life_cfg, host, stop.clone())?,
-        None => match CarLifeHub::start(life_cfg.clone(), stop.clone()) {
-            Ok(v) => v,
-            // **端口被本机 CarLife 占了 = 它才是监听方**：小米 CarLife/CarWith 在
-            // 「车辆热点 → 开始连接」后自己 bind 7240~9340 等车机连入。此时我们改当客户端，
-            // 直接拨 127.0.0.1 即可同机打通（2026-10-25 验证：两个进程抢 7240 会双双卡死）。
-            #[cfg(not(target_os = "android"))]
-            Err(e) if e.contains("Address already in use") || e.contains("os error 98") => {
-                emit_log(
-                    "CARLIFE: 7240 已被本机 CarLife/CarWith 监听占用——自动改走「主动拨号 127.0.0.1」",
-                );
-                CarLifeHub::connect(life_cfg, "127.0.0.1".to_string(), stop.clone())?
-            }
-            // Android 的 md_host 必须由 Kotlin 的 UID/LISTEN 校验决定。
-            // bind 冲突也可能来自残留任务或其他程序，不能据此盲拨 127.0.0.1。
-            Err(e) => return Err(format!("{e}；请核对本轮端口归属与旧任务退出状态")),
-        },
+    let (hub, mut life_events) = if !cfg.carlife_enabled {
+        CarLifeHub::disabled(life_cfg)
+    } else {
+        match cfg.md_host.clone() {
+            Some(host) => CarLifeHub::connect(life_cfg, host, stop.clone())?,
+            None => match CarLifeHub::start(life_cfg.clone(), stop.clone()) {
+                Ok(v) => v,
+                // **端口被本机 CarLife 占了 = 它才是监听方**：小米 CarLife/CarWith 在
+                // 「车辆热点 → 开始连接」后自己 bind 7240~9340 等车机连入。此时我们改当客户端，
+                // 直接拨 127.0.0.1 即可同机打通（2026-10-25 验证：两个进程抢 7240 会双双卡死）。
+                #[cfg(not(target_os = "android"))]
+                Err(e) if e.contains("Address already in use") || e.contains("os error 98") => {
+                    emit_log(
+                        "CARLIFE: 7240 已被本机 CarLife/CarWith 监听占用——自动改走「主动拨号 127.0.0.1」",
+                    );
+                    CarLifeHub::connect(life_cfg, "127.0.0.1".to_string(), stop.clone())?
+                }
+                // Android 的 md_host 必须由 Kotlin 的 UID/LISTEN 校验决定。
+                // bind 冲突也可能来自残留任务或其他程序，不能据此盲拨 127.0.0.1。
+                Err(e) => return Err(format!("{e}；请核对本轮端口归属与旧任务退出状态")),
+            },
+        }
     };
     let hub = Arc::new(hub);
 
@@ -497,7 +504,7 @@ pub async fn run_engine(
         airplay_port: cfg.airplay_port,
         device_id: cfg.device_id.clone(),
         identity_path: cfg.identity_path.clone(),
-        enable_audio: cfg.enable_audio,
+        enable_audio: cfg.enable_audio && cfg.carlife_enabled,
         keep_alive_stats: cfg.keep_alive_stats,
         width: cfg.width,
         height: cfg.height,

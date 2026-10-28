@@ -929,6 +929,7 @@ async fn run(args: Args) -> Result<(), String> {
     };
 
     let cfg = engine::EngineConfig {
+        carlife_enabled: true,
         device_id: args.device_id.clone(),
         car_ip,
         airplay_port: addr.port(),

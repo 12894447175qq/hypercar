@@ -12,9 +12,10 @@ val appVersionName = "0.1.1"
 
 // CI 构建号：`-Phypercar.buildNumber=<github.run_number>`（CI 每次 push 传入）。
 //   versionName = 0.1.1.<N>、versionCode = base*10000 + N —— 每次推送 +1，可覆盖安装。
-// 本地不传 -P 时为 0.1.1 / 50000，可升级旧的 100xx/20000/30000/40000 构建。
+// 本地车测版本 0.1.1.3 / 50003；CI 仍按 run_number 累计。
 val buildNumber: Int? = providers.gradleProperty("hypercar.buildNumber").orNull?.toIntOrNull()
 val baseVersionCode = 5
+val localBuildNumber = 3
 
 android {
     namespace = "io.github.hypercar"
@@ -28,8 +29,8 @@ android {
         // targetSdk 34：与 cardeck 一致——Android 15+ 对 mediaProjection FGS 的
         // 额外 AppOps 校验、以及悬浮窗可见性补充条款都不触发（HyperOS4 实测宽容）。
         targetSdk = 34
-        versionCode = buildNumber?.let { baseVersionCode * 10_000 + it } ?: baseVersionCode * 10_000
-        versionName = buildNumber?.let { "$appVersionName.$it" } ?: appVersionName
+        versionCode = baseVersionCode * 10_000 + (buildNumber ?: localBuildNumber)
+        versionName = "$appVersionName.${buildNumber ?: localBuildNumber}"
 
         ndk {
             abiFilters += "arm64-v8a"

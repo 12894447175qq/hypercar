@@ -198,7 +198,7 @@ private fun ShizukuSection() {
     }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        SectionLabel(text = "Shizuku（可选增强）")
+        SectionLabel(text = "Shizuku（连接增强 / 来源核验）")
         GlassPanel(
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
         ) {
@@ -302,8 +302,8 @@ private fun ShizukuState.hint(): String = when (this) {
     ShizukuState.NotRunning ->
         "需要先打开 Shizuku 并启动服务（无线调试配对，或 root 启动）。"
     ShizukuState.NotInstalled ->
-        "Shizuku 是可选的：装上后能免除每个热点首次的系统确认框，并在包名不对时兜底拉起 CarLife。" +
-            "不装也能用；真实蓝牙 MAC 可手动填写，不依赖 Shizuku。"
+        "Shizuku 可用于静默连接热点、核验原厂来源端口和辅助拉起所选来源。" +
+            "关闭 CarLife 联动时可免 Shizuku 测试车机传输；vivo 取源需要它核验原厂端口归属。真实蓝牙 MAC 也可手动填写。"
 }
 
 /* ---------- 设备身份（蓝牙 MAC） ---------- */
@@ -916,7 +916,7 @@ private fun ResolutionSection() {
         GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)) {
             SwitchRow(
                 title = "启用 CarLife 联动",
-                subtitle = "默认关闭。开启后 HyperCar 会拉起 CarLife 并尝试驱动投屏；但小米 CarLife 一激活就会抢占蓝牙，实测会把 CarPlay 的 iAP2 链路顶断。",
+                subtitle = "默认关闭。开启后使用所选来源提供车载画面；vivo 取源需要已授权的 Shizuku 核验连接目标。关闭时只测试车机传输。小米来源启动可能影响车机蓝牙。",
                 checked = carlifeOn,
                 onCheckedChange = {
                     carlifeOn = it

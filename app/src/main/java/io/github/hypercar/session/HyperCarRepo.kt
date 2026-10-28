@@ -165,6 +165,11 @@ object HyperCarRepo {
     }
     private fun retryAirplayOrFail(detail: String, ownerTrace: ConnectionTrace? = connectionTrace) {
         if (connectionTrace !== ownerTrace || !sessionLive.get()) return
+        if (detail.startsWith("CarLife 网关端口") || detail.startsWith("CarLife CMD 7240 绑定失败")) {
+            log("SOURCE: 本机端口冲突，不重复重启 AirPlay；保留占用方，停止本轮连接")
+            fail(detail)
+            return
+        }
         // 车机主动关掉控制通道时**不要重试同一个端点**：它紧接着会把 7000 的监听也关掉，
         // 之后每次重试都是 ECONNREFUSED（2026-10-25 22:32 现场：6 轮 × 2.5s 全是拒连，
         // 既没意义，还占着「等车机重新发起 iAP2」的时间窗）。
@@ -199,6 +204,19 @@ object HyperCarRepo {
             delay(AIRPLAY_RETRY_DELAY_MILLIS)
             if (!sessionLive.get() || connectionTrace !== ownerTrace) return@launch
             val context = appContext() ?: return@launch
+            if (sessionMdHost != null) {
+                try {
+                    resolveCarLifeEndpoint()
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    if (sessionLive.get() && connectionTrace === ownerTrace) {
+                        fail("原厂 CarLife 端口尚未恢复，停止重试：${error.message}")
+                    }
+                    return@launch
+                }
+                if (!sessionLive.get() || connectionTrace !== ownerTrace) return@launch
+            }
             val fd = openControlFd(context, host!!, port)
             if (fd == null || fd < 0) {
                 retryAirplayOrFail("控制端口重连失败 $host:$port", ownerTrace)
@@ -211,7 +229,7 @@ object HyperCarRepo {
             val identityFile = context.filesDir.resolve("controller_identity.txt")
             ensurePairingIdentity(context, identityFile)
             val identityPath = identityFile.absolutePath
-            val json = SettingsStore.engineConfigJson(host, port, sessionDeviceMac, identityPath, sessionMdHost)
+            val json = SettingsStore.engineConfigJson(host, port, sessionDeviceMac, identityPath, sessionMdHost, carLifeSession != null)
             log("CORE: 重试 nativeStart（$host:$port fd=$fd，第 $attempt 次）")
             val started = startNative(json, fd, ownerTrace)
             log("CORE: 重试 nativeStart 返回 $started")
@@ -525,6 +543,7 @@ object HyperCarRepo {
             connectionTrace?.event("preflight.begin", "waitingPreviousCleanup=${carLifeCleanupJob?.isActive == true}")
             scannedCarSubnets.clear()
             carLifeCleanupJob?.join()
+            stopNative() // Wait for the previous session's registered tasks and sockets.
             currentCoroutineContext().ensureActive()
             carLifeSession = if (SettingsStore.carlifeEnabled || SettingsStore.carlifeFirst) {
                 resolveCarLifeSource()?.let(::CarLifeWakeSession)
@@ -540,8 +559,12 @@ object HyperCarRepo {
                     return
                 }
             }
+            if (carLifeSession?.source?.usesBoundRenderer == true && !ShizukuTools.isReady) {
+                fail("vivo 取源需要启动 Shizuku 并授权 Hypercar，以核验原厂 CarLife 端口归属；仅测试车机传输可关闭 CarLife 联动")
+                return
+            }
             connectionTrace?.event("preflight.end", "source=${carLifeSession?.source?.enginePackage ?: "disabled"} shizuku=${ShizukuTools.isReady}")
-            // Shizuku 从「必须」降级为「可选增强」：没有它照样能连，只是两条路径降级——
+            // 车机传输侧 Shizuku 是可选增强；vivo 来源核验已在上方单独要求授权。
             //  WiFi 走 WifiNetworkSpecifier（热点首连弹一次系统确认框）+ deviceID 用稳定伪 MAC。
             if (!ShizukuTools.isReady) {
                 // 降级模式预检：权限缺失/定位服务关闭时提前失败并给出可操作原因，
@@ -762,6 +785,13 @@ object HyperCarRepo {
                 if (!sessionLive.get() || carLifeSession?.hasRenderer != true) return
             }
 
+            // Finish source readiness before opening a car control socket: a live
+            // socket must not sit idle while we wait for vendor initialization.
+            val effectiveMdHost = resolveCarLifeEndpoint()
+            currentCoroutineContext().ensureActive()
+            carLifeDialMode = effectiveMdHost != null
+            sessionMdHost = effectiveMdHost
+
             // ---- 连 AirPlay 控制端口并移交 FD ----
             push(link = LinkState.Negotiating("连接车机 AirPlay 端口"))
             var port = 0
@@ -847,51 +877,16 @@ object HyperCarRepo {
 
             // ---- 启动 Rust 引擎（协商在 Rust 内继续）----
             push(link = LinkState.Negotiating("Rust 核心层协商 AirPlay 会话"))
-            // 探测优先：CarLife 若已经在 7240 上监听，就把引擎切成「主动拨号」，
-            // 绝不能再让它去 bind（否则它永远抢不到端口）。探测窗口 ~2.5s（刚被唤醒时
-            // 需要一点启动时间；客户端型 CarLife 不监听，最多白等这一小段）。
-            // 探测窗口 2.5s → **30s**：CarLife（com.baidu.carlife.xiaomi）被唤醒后启动较慢，
-            // 日志实测从广播到开始监听 7240 常要十几秒（2026-10-26 00:24 现场）。
-            // 窗口短了就会误判「无人监听」，转去 HU 监听模式——那样我们占住 7240，
-            // 反而把慢启动的 CarLife 挡在门外。等待期间每 4s 补发一次唤醒广播。
-            // ⚠ 关掉联动时**必须跳过这个 30s 等待**：CarLife 不会被拉起，7240 永远不会监听，
-            // 而车机侧 CarPlay 只等十几秒就拆链路（2026-10-26 16:48 现场：iAP2 Phase 1 全过、
-            // 之后一直"仍在等 CarLife 监听 7240"到第 16s，车机 LINK closed，AirPlay 根本没开始）。
-            val mdHost = if (!SettingsStore.carlifeEnabled && !SettingsStore.carlifeFirst) {
-                log("CARLIFE: 联动已关闭——跳过 7240 探测，引擎直接以 HU 身份监听并马上协商 AirPlay")
-                null
-            } else {
-                probeLocalCarLifeMd(timeoutMillis = 30_000L) { attempt ->
-                    if (attempt % 8 == 0) {   // 8 × 200ms ≈ 1.6s → 每 ~1.6s 之后 4s 补一次
-                        log("CARLIFE: 仍在等 CarLife 监听 7240（第 ${attempt * 200 / 1000}s），补发唤醒广播")
-                        wakeLocalCarLife()
-                    }
-                }
-            }
-            // 只有 7240 在监听还不够：CarLife 被系统/后台拉起、服务还没起全时，
-            // 7240 能连、8240/9240 却一律 refused，于是拨号模式连了个"空壳"，
-            // 之后一直 `连 MD … Connection refused` 死循环（2026-10-26 01:11 现场）。
-            // **仍然只用零接触探测**（bind 冲突）：绝不能再 Socket().connect(8240)——
-            // 那会把 CarLife 的视频 accept 抢走，后面 Rust 拨进去一帧都收不到。
-            val mediaOk = mdHost == null || ownedCarLifePort(CARLIFE_VIDEO_PORT)
-            if (mdHost != null && !mediaOk) {
-                log("CARLIFE: 命令端口存在，但 $CARLIFE_VIDEO_PORT 未由所选引擎监听；停止取源")
-            }
-            if (((mdHost == null && isLocalPortListening(CARLIFE_CMD_PORT)) || (mdHost != null && !mediaOk)) && carLifeSession != null) {
-                fail("CarLife 7240 端口归属不匹配或无法核实；不连接其他应用，请检查 Shizuku/端口占用")
-                return
-            }
-            val effectiveMdHost = if (mediaOk) mdHost else null
-            carLifeDialMode = effectiveMdHost != null
-            sessionMdHost = effectiveMdHost
             if (effectiveMdHost != null) {
                 log("CARLIFE: ✓ 探测到本机 CarLife 正在监听 127.0.0.1:7240 → 引擎走「主动拨号」模式")
+            } else if (carLifeSession == null) {
+                log("CARLIFE: 仅验证车机传输，本轮不创建 CarLife 网关")
             } else {
-                log("CARLIFE: 7240 无人监听（或端口不全）→ 由 HU 监听（客户端型 CarLife/盒子会连进来）")
+                log("CARLIFE: 来源未监听标准端口 → 原子创建 HU 网关，等待所选客户端来源接入")
             }
             // 下发配置原样打一行（不含密钥）：分辨率/帧率/md_host/voice 一目了然，
             val identityPath = context.filesDir.resolve("controller_identity.txt").absolutePath
-            val json = SettingsStore.engineConfigJson(apHost, port, deviceMac, identityPath, effectiveMdHost)
+            val json = SettingsStore.engineConfigJson(apHost, port, deviceMac, identityPath, effectiveMdHost, carLifeSession != null)
             // 免得再靠猜「这次到底请求了多大尺寸、是监听还是拨号」
             log("CORE +${stageMs()}ms 引擎配置：$json")
             // 前后各记一行：原生崩溃（Rust panic 越过 JNI → SIGABRT）会直接把进程带走，
@@ -1685,46 +1680,77 @@ object HyperCarRepo {
     private fun selectedEnginePackage(): String? = carLifeSession?.source?.enginePackage
         ?: resolveCarLifeSource()?.enginePackage
 
-    private suspend fun ownedCarLifePort(port: Int): Boolean {
-        val owner = carLifeSession ?: return false
-        if (!owner.isOpen || !ShizukuTools.isReady) return false
-        val uid = runCatching { appContext()?.packageManager?.getApplicationInfo(owner.source.enginePackage, 0)?.uid }
-            .getOrNull() ?: return false
-        val result = runCatching { ShizukuTools.exec("cat /proc/net/tcp /proc/net/tcp6", 4_000) }.getOrNull()
-        if (result == null || result.code != 0 || !CarLifePorts.readable(result.out)) {
-            connectionTrace?.sample("source.port.$port.unknown") {
-                "expectedUid=$uid procExit=${result?.code} detail=${result?.err?.take(180)} accepted=false"
-            }
-            return false
+    private suspend fun inspectCarLifePorts(): Map<Int, CarLifePorts.Inspection> {
+        val owner = carLifeSession
+        val uid = owner?.let {
+            runCatching { appContext()?.packageManager?.getApplicationInfo(it.source.enginePackage, 0)?.uid }.getOrNull()
         }
-        if (carLifeSession !== owner || !owner.isOpen) return false
-        val rows = CarLifePorts.sockets(result.out).filter { it.port == port }
-        val listeners = CarLifePorts.parse(result.out).filter { it.port == port }
-        val accepted = CarLifePorts.owned(listeners, port, uid)
-        val state = when {
-            accepted -> "owned"
-            listeners.isNotEmpty() -> "foreign"
-            else -> "not_listening"
+        val result = if (owner?.isOpen == true && uid != null && ShizukuTools.isReady) {
+            runCatching { ShizukuTools.exec("cat /proc/net/tcp /proc/net/tcp6", 4_000) }.getOrNull()
+        } else null
+        val table = result?.takeIf { it.code == 0 }?.out
+        val valid = owner != null && carLifeSession === owner && owner.isOpen && uid != null
+        val ports = CarLifePorts.standardPorts.associateWith { port ->
+            CarLifePorts.inspect(if (valid) table else null, port, uid ?: -1)
         }
-        connectionTrace?.sample("source.port.$port.$state") {
-            "expectedUid=$uid listeners=${listeners.take(4)} tcpStates=${rows.map { it.state }.distinct()} accepted=$accepted"
+        connectionTrace?.sample("source.ports") {
+            "package=${owner?.source?.enginePackage} expectedUid=$uid shizuku=${ShizukuTools.isReady} " +
+                "procExit=${result?.code} states=${ports.mapValues { it.value.state }} " +
+                "listeners=${ports.values.flatMap { it.listeners }.take(12)}"
         }
-        if (accepted) owner.markUsed()
-        return accepted
+        return ports
     }
-    /**
-     * 探测本机 CarLife（MD）是否在 `127.0.0.1:7240` 监听。
-     *
-     * 小米 CarLife / CarWith 的「车辆热点」模式是 **MD 自己 bind 7240..9340** 等车机连入；
-     * 我们若先去 bind，它必然 `EADDRINUSE`、界面永远 Waiting。所以唤醒后先探一下：
-     *  - 命中 → 把 `md_host=127.0.0.1` 传给引擎，走「主动拨号」（我们当车机）；
-     *  - 未命中 → 引擎照旧自己监听（客户端型 CarLife 会连进来）。
-     *
-     * 窗口默认 2.5s：刚被广播唤醒的 CarLife 需要一点启动时间；客户端型 CarLife 不监听，
-     * 最多白等这一小段（与 AirPlay 握手相比可接受）。
-     *
-     * [onAttempt] 用于等待期间补发唤醒广播（CarLife 启动慢，单次广播容易错过）。
-     */
+
+    private suspend fun ownedCarLifePort(port: Int): Boolean {
+        val owned = inspectCarLifePorts()[port]?.state == CarLifePorts.State.OWNED
+        if (owned) carLifeSession?.markUsed()
+        return owned
+    }
+
+    /** vivo is a proven MD server; never compete with it by binding its ports. */
+    private suspend fun resolveCarLifeEndpoint(): String? {
+        val owner = carLifeSession ?: run {
+            log("SOURCE: CarLife 联动关闭，仅验证车机传输，不探测或占用 7240..9340")
+            return null
+        }
+        val timeout = if (owner.source.usesBoundRenderer) 8_000L else 30_000L
+        val deadline = SystemClock.uptimeMillis() + timeout
+        while (owner.isOpen && carLifeSession === owner && sessionLive.get()) {
+            currentCoroutineContext().ensureActive()
+            val ports = inspectCarLifePorts()
+            when (CarLifePorts.action(ports, owner.source.usesBoundRenderer, SystemClock.uptimeMillis() >= deadline)) {
+                CarLifePorts.Action.CONFLICT -> error(
+                    "CarLife 端口不属于所选来源或未监听本机回环：${ports.filterValues { it.state == CarLifePorts.State.FOREIGN }.keys}；未连接该服务，也未停止占用方"
+                )
+                CarLifePorts.Action.DIAL -> {
+                    owner.markUsed()
+                    log("SOURCE: 所选来源 ${owner.source.enginePackage} 的六个端口归属均已核实，使用拨号模式；Hypercar 不监听 7240")
+                    return "127.0.0.1"
+                }
+                CarLifePorts.Action.NEEDS_ACCESS -> {
+                    check(!owner.source.usesBoundRenderer) {
+                        "无法核实 vivo CarLife 端口归属，请确认 Shizuku 已启动且已授权 Hypercar；未盲连或抢占原厂端口"
+                    }
+                    for (port in CarLifePorts.standardPorts) {
+                        check(!isLocalPortListening(port)) {
+                            "CarLife 端口 $port 不可用但归属未知，请启动并授权 Shizuku 后重试；未抢占端口"
+                        }
+                    }
+                    return null // Client source; Rust reserves the whole set atomically.
+                }
+                CarLifePorts.Action.LISTEN -> return null
+                CarLifePorts.Action.INCOMPLETE -> error(
+                    "CarLife 服务或端口仅部分就绪：${ports.mapValues { it.value.state }}；未改为竞争监听，请检查原厂初始化状态"
+                )
+                CarLifePorts.Action.WAIT -> Unit
+            }
+            delay(500)
+        }
+        currentCoroutineContext().ensureActive()
+        check(owner.isOpen && carLifeSession === owner && sessionLive.get()) { "CarLife 会话已结束" }
+        return null
+    }
+
     /**
      * **零接触**判断本机某端口是否已有人 LISTEN。
      *
@@ -1758,25 +1784,6 @@ object HyperCarRepo {
     }
     /** 单次零接触探测 127.0.0.1:7240 是否在监听（唤醒流程里用，不要阻塞）。 */
     private suspend fun probeCarLifeOnce(): Boolean = ownedCarLifePort(CARLIFE_CMD_PORT)
-
-    private suspend fun probeLocalCarLifeMd(
-        timeoutMillis: Long = CARLIFE_PROBE_TIMEOUT_MILLIS,
-        onAttempt: (suspend (Int) -> Unit)? = null,
-    ): String? {
-        val deadline = SystemClock.uptimeMillis() + timeoutMillis
-        var attempts = 0
-        while (SystemClock.uptimeMillis() < deadline && sessionLive.get() && carLifeSession?.isOpen == true) {
-            attempts++
-            onAttempt?.invoke(attempts)
-            if (probeCarLifeOnce()) {
-                log("CARLIFE: 第 $attempts 次零接触探测命中 127.0.0.1:$CARLIFE_CMD_PORT（CarLife 在监听）")
-                return "127.0.0.1"
-            }
-            currentCoroutineContext().ensureActive()
-            delay(200)
-        }
-        return null
-    }
 
     private fun prepareLocalCarLifeRenderer() {
         val owner = carLifeSession ?: return
@@ -3048,8 +3055,6 @@ object HyperCarRepo {
 
     /** CarLife CMD 端口（MD 监听时我们改拨它）与探测窗口。 */
     private const val CARLIFE_CMD_PORT = 7240
-    private const val CARLIFE_PROBE_TIMEOUT_MILLIS = 2_500L
-    private const val CARLIFE_VIDEO_PORT = 8240
 
     /** 单个候选网络上连 AirPlay 控制端口的超时（多网络轮试，单次不能给太久）。 */
     private const val CONTROL_CONNECT_TIMEOUT_MILLIS = 2_500L

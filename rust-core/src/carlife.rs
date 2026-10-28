@@ -28,6 +28,10 @@
 //! （action 0=DOWN/1=UP/2=MOVE）；HARD_KEY 0x68008：`CarlifeCarHardKeyCode{1:keycode}`。
 //! 两者早期都发过裸 BE 结构，手机按 protobuf 解不出来 → 整段无效。
 
+#[cfg(test)]
+#[path = "gateway_tests.rs"]
+mod gateway_tests;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -157,6 +161,16 @@ pub struct CarLifeHub {
 }
 
 impl CarLifeHub {
+    pub fn disabled(cfg: CarLifeConfig) -> (Self, mpsc::UnboundedReceiver<CarLifeEvent>) {
+        let (events, event_rx) = mpsc::unbounded_channel();
+        let (touch_tx, _) = mpsc::unbounded_channel();
+        let (mic_tx, _) = mpsc::unbounded_channel();
+        let size = (cfg.width.max(2), cfg.height.max(2));
+        emit_log("CARLIFE: 联动关闭，仅协商车机传输；不监听、不拨号任何 CarLife 端口");
+        (Self { events, touch_tx, cfg, encoder_size: Arc::new(Mutex::new(size)),
+            mic_tx, mic_start: std::time::Instant::now() }, event_rx)
+    }
+
     pub fn start(
         cfg: CarLifeConfig,
         stop: Arc<SessionStop>,
@@ -171,9 +185,13 @@ impl CarLifeHub {
         let encoder_size: Arc<Mutex<(u32, u32)>> =
             Arc::new(Mutex::new((cfg.width.max(2), cfg.height.max(2))));
 
+        // Reserve every channel before spawning anything. A late conflict must
+        // release CMD as well, not leave a half-running gateway behind.
+        if stop.is_cancelled() { return Err("CarLife 会话已取消".into()); }
+        let [cmd_listener, video_listener, media_listener, tts_listener, vr_listener, ctrl_listener] =
+            reserve_listener_set([PORT_CMD, PORT_VIDEO, PORT_MEDIA, PORT_TTS, PORT_VR, PORT_CTRL])?;
+
         // ---- CMD 7240：14 步握手 ----
-        let cmd_listener =
-            bind_tcp(PORT_CMD).map_err(|e| format!("CarLife CMD 7240 绑定失败: {e}"))?;
         spawn_single_client_server(cmd_listener, stop.clone(), "CMD", {
             let events = events.clone();
             let fps = cfg.fps;
@@ -198,16 +216,16 @@ impl CarLifeHub {
         });
 
         // ---- VIDEO 8240 ----
-        spawn_media_channel(PORT_VIDEO, "VIDEO", events.clone(), stop.clone(), MediaKind::Video, first_frame.clone());
+        spawn_media_channel(video_listener, "VIDEO", events.clone(), stop.clone(), MediaKind::Video, first_frame.clone());
         // ---- MEDIA 9240 ----
-        spawn_media_channel(PORT_MEDIA, "MEDIA", events.clone(), stop.clone(), MediaKind::Media, first_frame.clone());
+        spawn_media_channel(media_listener, "MEDIA", events.clone(), stop.clone(), MediaKind::Media, first_frame.clone());
         // ---- TTS 9241 ----
-        spawn_media_channel(PORT_TTS, "TTS", events.clone(), stop.clone(), MediaKind::Tts, first_frame.clone());
+        spawn_media_channel(tts_listener, "TTS", events.clone(), stop.clone(), MediaKind::Tts, first_frame.clone());
         // ---- VR 9242：只读保活，不消费 ----
-        spawn_vr_listener(PORT_VR, "VR", mic_rx, stop.clone());
+        spawn_vr_listener(vr_listener, "VR", mic_rx, stop.clone());
 
         // ---- CTRL 9340：触摸/硬按键出向（8 字节 CMD 头）----
-        spawn_ctrl_channel(PORT_CTRL, touch_rx, stop.clone());
+        spawn_ctrl_channel(ctrl_listener, touch_rx, stop.clone());
 
         emit_state("carlife_waiting", "CarLife 网关就绪，等待本机 app 接入");
         emit_log(&format!(
@@ -1257,20 +1275,13 @@ enum MediaKind {
 }
 
 fn spawn_media_channel(
-    port: u16,
+    listener: TcpListener,
     name: &'static str,
     events: mpsc::UnboundedSender<CarLifeEvent>,
     stop: Arc<SessionStop>,
     kind: MediaKind,
     first_frame: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let listener = match bind_tcp(port) {
-        Ok(l) => l,
-        Err(e) => {
-            emit_log(&format!("CARLIFE: {name} {port} 绑定失败: {e}"));
-            return;
-        }
-    };
     spawn_single_client_server(listener, stop, name, move |stream| {
         handle_media_client(stream, events.clone(), kind, name, first_frame.clone())
     });
@@ -1552,7 +1563,7 @@ fn read_varint(bytes: &[u8]) -> (Option<u64>, usize) {
 // ---------------------------------------------------------------- CTRL 通道
 
 fn spawn_ctrl_channel(
-    port: u16,
+    listener: TcpListener,
     mut touch_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     stop: Arc<SessionStop>,
 ) {
@@ -1580,13 +1591,6 @@ fn spawn_ctrl_channel(
         });
     }
 
-    let listener = match bind_tcp(port) {
-        Ok(l) => l,
-        Err(e) => {
-            emit_log(&format!("CARLIFE: CTRL {port} 绑定失败: {e}"));
-            return;
-        }
-    };
     spawn_scoped(stop.clone(), async move {
         loop {
             tokio::select! {
@@ -1844,6 +1848,16 @@ fn lan_ipv4_hint() -> String {
     "127.0.0.1".to_string()
 }
 
+fn reserve_listener_set(ports: [u16; 6]) -> Result<[TcpListener; 6], String> {
+    let mut listeners = Vec::with_capacity(ports.len());
+    for port in ports {
+        listeners.push(bind_tcp(port).map_err(|error| {
+            format!("CarLife 网关端口 {port} 绑定失败: {error}；本轮全部监听已回滚")
+        })?);
+    }
+    Ok(listeners.try_into().unwrap_or_else(|_| unreachable!()))
+}
+
 fn bind_tcp(port: u16) -> Result<TcpListener, std::io::Error> {
     // 绑定地址：**0.0.0.0**——手机上 CarLife（com.miui.carlink）是以"找主机"的方式工作，
     // 它会按 UDP 7999 的应答去连 `<局域网IP>:7240`，而不是 127.0.0.1；只绑回环它就连不进来
@@ -1940,15 +1954,11 @@ async fn vr_loop(
 
 /// 监听版 VR 通道（Android 同机回环）：接受后进入 [`vr_loop`]。
 fn spawn_vr_listener(
-    port: u16,
+    listener: TcpListener,
     name: &'static str,
     mut mic_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     stop: Arc<SessionStop>,
 ) {
-    let listener = match bind_tcp(port) {
-        Ok(l) => l,
-        Err(_) => return,
-    };
     spawn_scoped(stop.clone(), async move {
         loop {
             tokio::select! {
