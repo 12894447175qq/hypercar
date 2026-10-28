@@ -1,0 +1,107 @@
+{
+  "versionName": "0.1.1.6",
+  "versionCode": 50006,
+  "applicationId": "io.github.hypercar",
+  "minSdk": 31,
+  "targetSdk": 34,
+  "abi": "arm64-v8a",
+  "builtAtUtc": "2026-10-28T15:22:07.916791+00:00",
+  "sourceCommit": "bbe638c00490ae96c50101ade5a4bed88ccbb781",
+  "sourceWorktreeCleanAtPackaging": true,
+  "apk": "HyperCar-0.1.1.6-v50006-vivo-MIB3-mac-test.apk",
+  "certificateSha256": "01020c4ff672bdef9550f9c740285fdaf1f4ae0d70e9296050c0815d1570d5af",
+  "nativeLibrarySha256": "4571ca19fb209102ffb33896773cdbc6a7c6517def31ca5af8f9e7d05c651ac0",
+  "validation": {
+    "android": {
+      "tests": 81,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "suites": 18,
+    "classes": [
+      "io.github.hypercar.core.ConnectionKeepAliveTest",
+      "io.github.hypercar.core.ConnectionServiceContractTest",
+      "io.github.hypercar.core.ProjectLinksTest",
+      "io.github.hypercar.diagnostics.DiagnosticLoggingTest",
+      "io.github.hypercar.headunit.RemoteProfilesTest",
+      "io.github.hypercar.iap2.EndpointOriginTest",
+      "io.github.hypercar.iap2.EveningMfiReplayTest",
+      "io.github.hypercar.iap2.Iap2AudiSessionTest",
+      "io.github.hypercar.iap2.MfiLengthMemoryTest",
+      "io.github.hypercar.iap2.VirtualIap2SessionTest",
+      "io.github.hypercar.net.AirplayDnsRecordsTest",
+      "io.github.hypercar.net.CarHotspotSecurityTest",
+      "io.github.hypercar.net.CarWifiBootstrapTest",
+      "io.github.hypercar.session.CarLifePortPolicyTest",
+      "io.github.hypercar.session.CarLifeSourceTest",
+      "io.github.hypercar.session.NativeSessionGateTest",
+      "io.github.hypercar.session.RendererBindingStateTest",
+      "io.github.hypercar.session.SourceRecoveryControllerTest"
+    ],
+    "lint": {
+      "Warning": 30,
+      "Information": 2
+    },
+    "rust": {
+      "tests": 35,
+      "passed": true
+    },
+    "videoDecode": {
+      "checks": [
+        {
+          "case": "same-size",
+          "sourceFrames": 18,
+          "mixedFrames": 29,
+          "sourcePixelsMatch": true,
+          "mixedSha256": "e0cce1a7efbd98c42011563b6bf2575f98b934e39a71948f161c1c9151cf2021"
+        },
+        {
+          "case": "changed-size",
+          "sourceFrames": 18,
+          "mixedFrames": 30,
+          "sourcePixelsMatch": true,
+          "mixedSha256": "a8dca41fd3059d5a26cbddd7f493c7ff7fc1d9c989a66eb4556b6eb37c79ed6c"
+        }
+      ],
+      "decoder": "ffmpeg version 7.1 Copyright (c) 2000-2024 the FFmpeg developers",
+      "realVehicleTest": false,
+      "input": "generated baseline H264 fixture, not current vivo capture"
+    },
+    "phoneOrVehicleTest": "not run"
+  },
+  "checks": {
+    "apkSignatureVerified": true,
+    "zipAlignment16KiB": true,
+    "elfLoadAlignment16KiB": true,
+    "packagedNativeMatchesRebuild": true,
+    "embeddedVcsMatchesSource": true,
+    "androidArm64Api31Build": true,
+    "releaseMinificationBuild": true,
+    "jniEntrypointsAndDexCallbacksPresent": true,
+    "cargoCheck": true
+  },
+  "preserved": {
+    "source": "com.baidu.carlife.vivo",
+    "sixPortUidCheck": true,
+    "vendorComponentsDisabled": false,
+    "phoneConnected": false,
+    "vivoJoviSourcePreserved": true
+  },
+  "vehicleAcceptance": "pending user test; Jovi actual display/audio/touch/reconnect not confirmed",
+  "releasePublished": false,
+  "files": {
+    "HyperCar-0.1.1.6-v50006-vivo-MIB3-mac-test.apk": {
+      "bytes": 4562046,
+      "sha256": "0df7c9b06e81f1a4d25a6988a90285b6e85ed5f3bdab4fd2165374b90b7ef76f"
+    },
+    "mapping.txt.gz": {
+      "bytes": 2001394,
+      "sha256": "56c40a4a646b28d6258c7a51e8f16125bbee3cc3b351233c0a8c9236b6105873"
+    },
+    "INSTALL.md": {
+      "bytes": 1457,
+      "sha256": "24bbfee0880f4be691c58d8ff4a4a1c764b6342dd31478aa71be5390af930e0c"
+    }
+  }
+}
