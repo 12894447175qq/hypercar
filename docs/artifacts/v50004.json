@@ -1,0 +1,104 @@
+{
+  "versionName": "0.1.1.4",
+  "versionCode": 50004,
+  "applicationId": "io.github.hypercar",
+  "minSdk": 31,
+  "targetSdk": 34,
+  "abi": "arm64-v8a",
+  "builtAtUtc": "2026-10-28T07:30:42.014014+00:00",
+  "sourceCommit": "b337d0f5be1129919652c36eab6f8ca2d36bb43f",
+  "sourceBase": "5ea3964d8a55e9ef43632b2d6a09d796988e0173",
+  "sourceWorktreeCleanAtPackaging": true,
+  "apk": "HyperCar-0.1.1.4-v50004-vivo-MIB3-mac-test.apk",
+  "unsignedApk": "HyperCar-0.1.1.4-v50004-vivo-MIB3-unsigned.apk",
+  "certificateSha256": "01020c4ff672bdef9550f9c740285fdaf1f4ae0d70e9296050c0815d1570d5af",
+  "signing": "Retained Mac test key, matching v50003; different from historical Windows v50002",
+  "installed50002CertificateSha256": "35b28aaa5780a1c0f41f7b0515a018a71cf883dc942f580a3a3f33964ba8f3ba",
+  "canCoverInstalled50002": false,
+  "canCoverSameSignature50003": true,
+  "nativeLibrarySha256": "022b07414068672fe809d1ae25aba65cae30223db85902bc57e7272fd4712f4f",
+  "validation": {
+    "android": {
+      "suites": 14,
+      "tests": 64,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "classes": [
+        "io.github.hypercar.core.ConnectionServiceContractTest",
+        "io.github.hypercar.core.ProjectLinksTest",
+        "io.github.hypercar.diagnostics.DiagnosticLoggingTest",
+        "io.github.hypercar.headunit.RemoteProfilesTest",
+        "io.github.hypercar.iap2.EndpointOriginTest",
+        "io.github.hypercar.iap2.Iap2AudiSessionTest",
+        "io.github.hypercar.iap2.MfiLengthMemoryTest",
+        "io.github.hypercar.iap2.VirtualIap2SessionTest",
+        "io.github.hypercar.net.AirplayDnsRecordsTest",
+        "io.github.hypercar.net.CarHotspotSecurityTest",
+        "io.github.hypercar.net.CarWifiBootstrapTest",
+        "io.github.hypercar.session.CarLifePortPolicyTest",
+        "io.github.hypercar.session.CarLifeSourceTest",
+        "io.github.hypercar.session.NativeSessionGateTest"
+      ]
+    },
+    "lint": {
+      "Warning": 30,
+      "Information": 2
+    },
+    "rust": {
+      "tests": 31,
+      "failures": 0
+    },
+    "phoneTest": "not run",
+    "vehicleTest": "not run"
+  },
+  "checks": {
+    "cargoCheck": true,
+    "androidArm64Build": true,
+    "releaseMinificationBuild": true,
+    "apkSignatureVerified": true,
+    "zipAlignment16KiBVerified": true,
+    "packagedNativeLibraryMatchesRebuild": true,
+    "mappingMatchesReleaseBuild": true,
+    "embeddedVcsMatchesSourceCommit": true,
+    "oldOrderRedThenGreen": true,
+    "audioSetupAndRecordTimeoutsTested": true,
+    "cancellationTested": true,
+    "persistentPrintableLoggingTested": true,
+    "independentAgentReview": false
+  },
+  "preserved": {
+    "vivoSource": "com.baidu.carlife.vivo",
+    "joviBinderRenderer": true,
+    "sixPortUidOwnershipCheck": true,
+    "vendorComponentsDisabled": false,
+    "phoneConnected": false,
+    "phoneDataModified": false
+  },
+  "runtimeRequirement": "Selected vivo source still requires running/authorized Shizuku for port ownership checks.",
+  "knownUnresolved": [
+    "Original 50002 key required for same-signature coverage update.",
+    "Jovi full desktop initialization and real MIB3 display/audio/touch/reconnect remain unverified.",
+    "Battery use and Windows hub build not measured or executed."
+  ],
+  "releasePublished": false,
+  "localDeliveryDirectory": "/Users/xiaolongyitiao/project/hypercar/release/v50004",
+  "files": {
+    "HyperCar-0.1.1.4-v50004-vivo-MIB3-mac-test.apk": {
+      "bytes": 4532705,
+      "sha256": "68401304b8e78a638776f7e239f47083cef354bd8759298b212d78bd63db3cff"
+    },
+    "HyperCar-0.1.1.4-v50004-vivo-MIB3-unsigned.apk": {
+      "bytes": 4519526,
+      "sha256": "f4cafe8b7b8fd76aa4fb3b941a4c2c8ab4e83e7e28eb33b7c1853235d34d34a3"
+    },
+    "mapping.txt.gz": {
+      "bytes": 1996258,
+      "sha256": "11865daed6037d97d5b88e518750ef5be71a9f92554fe2b7301c3a90942fbed8"
+    },
+    "INSTALL.md": {
+      "bytes": 2302,
+      "sha256": "142dd47b5e1ecd583f8d3c9b7f5e2bc7929eff3854ac1822678daedf44b72aa8"
+    }
+  }
+}
