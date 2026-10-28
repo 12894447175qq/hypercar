@@ -254,7 +254,11 @@ pub async fn run_engine(
                     } => {
                         sender = r;
                         ready = None;
-                        if sender.is_none() { return; }
+                        if sender.is_none() {
+                            emit_log("VIDEO: sender_unavailable，协商未完成或视频交接已关闭");
+                            return;
+                        }
+                        emit_log("VIDEO: pump_ready，已接收屏幕发送器；等待来源完整 SPS/PPS/IDR，等待页不算来源首帧");
                     }
                     ev = video_rx.recv() => match ev {
                         Some(CarLifeEvent::EncoderResolution { width, height }) => {
@@ -346,9 +350,15 @@ pub async fn run_engine(
                             match s.send_video_annexb(&data).await {
                                 Ok(true) => {
                                     last_real_frame = Some(std::time::Instant::now());
-                                    let mut st = stats.lock();
-                                    st.frames += 1;
-                                    st.bytes += data.len() as u64;
+                                    let frames = {
+                                        let mut st = stats.lock();
+                                        st.frames += 1;
+                                        st.bytes += data.len() as u64;
+                                        st.frames
+                                    };
+                                    if frames == 1 {
+                                        emit_log(&format!("VIDEO: first_source_frame_written bytes={} size={}x{}；非等待页；接收端是否解码显示仍需实车核对", data.len(), source.size.0, source.size.1));
+                                    }
                                 }
                                 Ok(false) => {
                                     source.require_keyframe();
@@ -405,6 +415,11 @@ pub async fn run_engine(
             let mut sent_packets: u64 = 0;
             let mut rate_mark = std::time::Instant::now();
             let mut mixed = vec![0i16; SPF * 2];
+            let mut pcm_errors = 0u64;
+            let mut sync_errors = 0u64;
+            let mut last_pcm_error: Option<std::time::Instant> = None;
+            let mut last_sync_error: Option<std::time::Instant> = None;
+            let mut nonzero_sent = false;
             loop {
                 tokio::select! {
                     _ = stop_a.notified() => return,
@@ -414,7 +429,12 @@ pub async fn run_engine(
                             None => std::future::pending().await,
                         }
                     } => {
-                        if let Some(a) = r.flatten() { out = Some(a); }
+                        if let Some(a) = r.flatten() {
+                            emit_log("AUDIO: pump_ready，音频 RECORD 已成功；开始 PCM48k/SPF352 推流，车机是否有声仍需确认");
+                            out = Some(a);
+                        } else {
+                            emit_log("AUDIO: sender_unavailable，音频关闭或协商未完成，见前置音频日志");
+                        }
                         ready = None;
                     }
                     ev = audio_rx.recv() => match ev {
@@ -446,7 +466,13 @@ pub async fn run_engine(
                         // RTP↔NTP 同步包（每秒；缺它车机照收 UDP 但喇叭无声）。
                         // 时间基与 TimingServer 的 timesync 应答同源（进程级单调钟）。
                         if let Some(a) = out.as_mut() {
-                            let _ = a.send_sync_now(crate::timing::monotonic_nanos()).await;
+                            if let Err(error) = a.send_sync_now(crate::timing::monotonic_nanos()).await {
+                                sync_errors += 1;
+                                if last_sync_error.map_or(true, |last| last.elapsed() >= Duration::from_secs(5)) {
+                                    emit_log(&format!("AUDIO: sync_write_failed errors={sync_errors} kind={:?} os={:?}: {error}", error.kind(), error.raw_os_error()));
+                                    last_sync_error = Some(std::time::Instant::now());
+                                }
+                            }
                         }
                     }
                     _ = tick.tick() => {
@@ -473,7 +499,24 @@ pub async fn run_engine(
                         if let Some(a) = out.as_mut() {
                             // 静音时也发包：保持 RTP 时钟连续（车机按包排播）
                             let before = a.packets_sent();
-                            let _ = a.send_pcm(&mixed).await;
+                            match a.send_pcm(&mixed).await {
+                                Ok(()) => {
+                                    if before == 0 && a.packets_sent() > 0 {
+                                        emit_log("AUDIO: first_rtp_packet_written；UDP 写出不等于车机扬声器播放");
+                                    }
+                                    if !nonzero_sent && a.packets_sent() > before && mixed.iter().any(|sample| *sample != 0) {
+                                        nonzero_sent = true;
+                                        emit_log("AUDIO: first_nonzero_pcm_written；已写出非静音样本，仍需核对车机声音");
+                                    }
+                                }
+                                Err(error) => {
+                                    pcm_errors += 1;
+                                    if last_pcm_error.map_or(true, |last| last.elapsed() >= Duration::from_secs(5)) {
+                                        emit_log(&format!("AUDIO: pcm_write_failed errors={pcm_errors} packets={} kind={:?} os={:?}: {error}", a.packets_sent(), error.kind(), error.raw_os_error()));
+                                        last_pcm_error = Some(std::time::Instant::now());
+                                    }
+                                }
+                            }
                             sent_packets += a.packets_sent().saturating_sub(before);
                         }
                         // 每秒报一次实际发包速率：48000/352 ≈ 136/s。低于它就是漏拍，
@@ -481,7 +524,7 @@ pub async fn run_engine(
                         if rate_mark.elapsed() >= Duration::from_secs(1) {
                             let secs = rate_mark.elapsed().as_secs_f64().max(0.001);
                             emit_log(&format!(
-                                "AUDIO: 发包 {:.0}/s（应 {:.0}/s） 队列 media={}ms tts={}ms",
+                                "AUDIO: 发包 {:.0}/s（应 {:.0}/s） 队列 media={}ms tts={}ms pcmErrors={pcm_errors} syncErrors={sync_errors}",
                                 sent_packets as f64 / secs,
                                 TARGET_RATE as f64 / SPF as f64,
                                 media_mix.len() * 1000 / (TARGET_RATE as usize).max(1) / 2,

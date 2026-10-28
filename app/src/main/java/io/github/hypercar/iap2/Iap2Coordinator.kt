@@ -28,7 +28,22 @@ data class CarPlayEndpoint(
     val gateway: String?,
     val fromInvite: Boolean = false,
     val securityType: Int? = null,
-)
+    /** Diagnostic address origin only; does not select or trust the endpoint. */
+    val origin: String = if (fromInvite) "ctrl_invite" else "unknown",
+) {
+    /** Preserve the origin of the addresses actually retained, even when credentials arrive later. */
+    fun merge(incoming: CarPlayEndpoint): CarPlayEndpoint = incoming.copy(
+        ssid = incoming.ssid ?: ssid,
+        passphrase = incoming.passphrase ?: passphrase,
+        airPlayPort = if (incoming.airPlayPort > 0) incoming.airPlayPort else airPlayPort,
+        deviceIdentifier = incoming.deviceIdentifier ?: deviceIdentifier,
+        publicKeyHex = incoming.publicKeyHex ?: publicKeyHex,
+        sourceVersion = incoming.sourceVersion ?: sourceVersion,
+        ipAddresses = incoming.ipAddresses.ifEmpty { ipAddresses },
+        gateway = incoming.gateway ?: gateway,
+        origin = if (incoming.ipAddresses.isNotEmpty()) incoming.origin else origin,
+    )
+}
 
 /**
  * iAP2 协商层对外门面（Orchestrator 的唯一入口）。

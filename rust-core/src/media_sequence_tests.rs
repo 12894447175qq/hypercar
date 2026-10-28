@@ -691,3 +691,45 @@ async fn event_channel_is_encrypted_and_retained_after_video_handoff() {
     drain(&stop).await;
     server.await.unwrap();
 }
+
+#[test]
+fn malformed_audio_responses_have_distinct_diagnostic_causes() {
+    assert!(audio_response_ports(b"not a plist")
+        .unwrap_err()
+        .starts_with("plist_parse_failed"));
+    assert_eq!(
+        audio_response_ports(&bplist::encode(&Value::dict(vec![]))).unwrap_err(),
+        "missing_audio_stream"
+    );
+    let response = |port| {
+        bplist::encode(&Value::dict(vec![(
+            "streams",
+            Value::array(vec![Value::dict(vec![
+                ("dataPort", Value::int(port)),
+                ("controlPort", Value::int(6011)),
+            ])]),
+        )]))
+    };
+    for port in [0, 65536] {
+        assert_eq!(
+            audio_response_ports(&response(port)).unwrap_err(),
+            "missing_or_invalid_audio_data_port"
+        );
+    }
+    // Standard binary plist uses an eight-byte signed integer for -1.
+    // Do not use the local compact integer encoder to generate this negative fixture.
+    let negative = &[
+        0x62, 0x70, 0x6c, 0x69, 0x73, 0x74, 0x30, 0x30, 0xd1, 0x01, 0x02, 0x57, 0x73, 0x74, 0x72,
+        0x65, 0x61, 0x6d, 0x73, 0xa1, 0x03, 0xd2, 0x04, 0x05, 0x06, 0x07, 0x58, 0x64, 0x61, 0x74,
+        0x61, 0x50, 0x6f, 0x72, 0x74, 0x5b, 0x63, 0x6f, 0x6e, 0x74, 0x72, 0x6f, 0x6c, 0x50, 0x6f,
+        0x72, 0x74, 0x13, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x11, 0x17, 0x7b, 0x08,
+        0x0b, 0x13, 0x15, 0x1a, 0x23, 0x2f, 0x38, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3b,
+    ];
+    assert_eq!(
+        audio_response_ports(negative).unwrap_err(),
+        "missing_or_invalid_audio_data_port"
+    );
+    assert_eq!(audio_response_ports(&response(6010)).unwrap(), (6010, 6011));
+}

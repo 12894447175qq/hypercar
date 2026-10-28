@@ -73,6 +73,7 @@ object HyperCarRepo {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val nativeGate = NativeSessionGate()
+    private val mediaEvidence = io.github.hypercar.diagnostics.MediaEvidence()
     private var virtualIap: VirtualIap2Session? = null
     private var virtualIapJob: Job? = null
 
@@ -88,6 +89,7 @@ object HyperCarRepo {
         return try {
             nativeGate.startIf({ sessionLive.get() && connectionTrace === ownerTrace }) { generation ->
                 closeVirtualIap()
+                mediaEvidence.begin(generation)
                 ownerTrace?.event("native.start", "generation=$generation")
                 transferred = true
                 RustCoreBridge.nativeStart(config, fd, socketProvider, generation)
@@ -98,7 +100,11 @@ object HyperCarRepo {
     }
 
     private fun stopNative() {
-        nativeGate.stop { closeVirtualIap(); RustCoreBridge.nativeStop() }
+        nativeGate.stop {
+            connectionTrace?.event("native.stop.summary", mediaEvidence.summary())
+            closeVirtualIap()
+            RustCoreBridge.nativeStop()
+        }
     }
     @Volatile private var connectionTrace: ConnectionTrace? = null
     @Volatile private var sourceCheckTrace: ConnectionTrace? = null
@@ -126,7 +132,7 @@ object HyperCarRepo {
     private var joinedNetwork: Network? = null
     private val scannedCarSubnets = java.util.Collections.synchronizedSet(HashSet<String>())
 
-    /** AirPlay 会话是否已建立（冗余端点去重，cardeck「推流中忽略 0x5703/0x4301」教训）。 */
+    /** 引擎运行去重保护；nativeStart 后即置位，不代表 RECORD 或车机显示成功。 */
     @Volatile
     private var streaming = false
 
@@ -195,7 +201,7 @@ object HyperCarRepo {
         airplayAttempts++
         val attempt = airplayAttempts
         log(
-            "SESSION: AirPlay 协商失败（$detail）——保留 iAP2 链路（车机继续显示 CarPlay），" +
+            "SESSION: AirPlay 协商失败（$detail）——保留 iAP2 链路（车机是否显示仍需确认），" +
                 "第 $attempt/$AIRPLAY_MAX_ATTEMPTS 次原地重试",
         )
         push(link = LinkState.Negotiating("AirPlay 重试 $attempt/$AIRPLAY_MAX_ATTEMPTS"))
@@ -497,7 +503,7 @@ object HyperCarRepo {
 
     fun disconnect() {
         val ownerTrace = connectionTrace
-        connectionTrace?.event("disconnect.request", "connecting=$connecting streaming=$streaming live=${sessionLive.get()}")
+        connectionTrace?.event("disconnect.request", "connecting=$connecting engineRunning=$streaming live=${sessionLive.get()}")
         stopVivoSourceCheck()
         carLifeSession?.close()
         runCatching { stopNative() }
@@ -741,10 +747,11 @@ object HyperCarRepo {
                     endpoint.fromInvite ->
                         log("MDNS: 端点来自 ctrl 邀请（${endpoint.ipAddresses}）——跳过 mDNS 查询")
                     haveEndpoint ->
-                        log("MDNS: 0x4301 已给出端点 ${endpoint.ipAddresses}:${endpoint.airPlayPort}——跳过 mDNS 查询")
+                        log("MDNS: 已有端点 origin=${endpoint.origin} ${endpoint.ipAddresses}:${endpoint.airPlayPort}——跳过重复查询")
                 }
                 null
             }
+            log("SESSION: 使用端点 origin=${if (mdnsEndpoint != null) "mdns" else endpoint.origin} host=${mdnsEndpoint?.host ?: host} network=$boundNetwork")
             val apHost = mdnsEndpoint?.host ?: host
             val candidatePorts = if (mdnsEndpoint != null) {
                 listOf(mdnsEndpoint.port)
@@ -1018,7 +1025,7 @@ object HyperCarRepo {
      */
     private fun releaseSessionResources() {
         val trace = connectionTrace
-        trace?.event("cleanup.begin", "nativeStreaming=$streaming binding=${carLifeSession?.hasRenderer} wifi=$boundNetwork iap2=${iap2 != null}")
+        trace?.event("cleanup.begin", "engineRunning=$streaming binding=${carLifeSession?.hasRenderer} wifi=$boundNetwork iap2=${iap2 != null}")
         carLifeSession?.close()
         val wasDialMode = carLifeDialMode
         carLifeDialMode = false
@@ -1132,6 +1139,7 @@ object HyperCarRepo {
             ipAddresses = listOf(gateway),
             gateway = gateway,
             securityType = seen?.securityType,
+            origin = "gateway_fallback",
         )
     }
 
@@ -1284,6 +1292,7 @@ object HyperCarRepo {
         sourceVersion = null,
         ipAddresses = listOf(host),
         gateway = host,
+        origin = "tcp_probe",
     )
 
     /**
@@ -1383,6 +1392,7 @@ object HyperCarRepo {
                     sourceVersion = null,
                     ipAddresses = listOf(gateway),
                     gateway = gateway,
+                    origin = "gateway_tcp_probe",
                 )
             }
             log("WIFI: \"$ssid\" 的网关 $gateway:$GATEWAY_FALLBACK_PORT 无响应——继续等车机 0x4301")
@@ -1535,6 +1545,7 @@ object HyperCarRepo {
 
         private fun onCurrentState(generation: Long, state: String, detail: String) {
             if (!sessionLive.get()) return
+            mediaEvidence.state(state)
             connectionTrace?.event("native.$state", "generation=$generation $detail") ?: log("CORE: [$state] $detail")
             when (state) {
                 "starting" -> {
@@ -1647,6 +1658,7 @@ object HyperCarRepo {
         }
 
         private fun onCurrentStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {
+            mediaEvidence.stats(frames, audioPlaying)
             // 用 update（CAS）而不是读-改-写：每秒一次，与 log() 的读-改-写并发会吞掉日志行。
             if (frames > lastVideoFrames) lastFrameProgressAt = SystemClock.elapsedRealtime()
             lastVideoFrames = frames
@@ -2091,7 +2103,7 @@ object HyperCarRepo {
                 currentCoroutineContext().ensureActive()
                 if (mdns != null) {
                     log("MDNS: 车机热点已绑定并公告控制服务 → ${mdns.host}:${mdns.port}，直接推进（无需 0x4301）")
-                    base.copy(ssid = ssid, ipAddresses = listOf(mdns.host), airPlayPort = mdns.port, gateway = mdns.host)
+                    base.copy(ssid = ssid, ipAddresses = listOf(mdns.host), airPlayPort = mdns.port, gateway = mdns.host, origin = "mdns")
                 } else {
                     probeGatewayAsCarHotspot(context, ssid)?.let { mergeEndpoint(base, it) }
                         ?: if ((ssid == seen?.ssid || ssid == SettingsStore.trustedCarSsid(targetMac)) && scannedCarSubnets.add(ssid)) {
@@ -2163,6 +2175,7 @@ object HyperCarRepo {
                         sourceVersion = null,
                         ipAddresses = listOf(host),
                         gateway = host,
+                        origin = "remembered_endpoint",
                     )
                 } else {
                     log("SESSION: 上次的端点 ${host}:${port} 连不上（换了网段/车机换了地址）——回退到发现流程")
@@ -2264,7 +2277,7 @@ object HyperCarRepo {
                     )
                 }
             }
-            log("SESSION: 端点就绪 ips=${usable?.ipAddresses} port=${usable?.airPlayPort}")
+            log("SESSION: 端点就绪 origin=${usable?.origin} ips=${usable?.ipAddresses} port=${usable?.airPlayPort}")
             usable
         } finally {
             callbacks.close()
@@ -2273,17 +2286,7 @@ object HyperCarRepo {
 
     /** 合并两次端点回调：0x5703 给热点凭据、0x4301 给端口与地址，字段各自补齐。 */
     private fun mergeEndpoint(old: CarPlayEndpoint?, incoming: CarPlayEndpoint): CarPlayEndpoint {
-        if (old == null) return incoming
-        return incoming.copy(
-            ssid = incoming.ssid ?: old.ssid,
-            passphrase = incoming.passphrase ?: old.passphrase,
-            airPlayPort = if (incoming.airPlayPort > 0) incoming.airPlayPort else old.airPlayPort,
-            deviceIdentifier = incoming.deviceIdentifier ?: old.deviceIdentifier,
-            publicKeyHex = incoming.publicKeyHex ?: old.publicKeyHex,
-            sourceVersion = incoming.sourceVersion ?: old.sourceVersion,
-            ipAddresses = incoming.ipAddresses.ifEmpty { old.ipAddresses },
-            gateway = incoming.gateway ?: old.gateway,
-        )
+        return old?.merge(incoming) ?: incoming
     }
 
     private fun fail(reason: String) {

@@ -94,4 +94,35 @@ class DiagnosticLoggingTest {
             assertFalse(log.snapshotLines().any { it.contains('\uFFFD') })
         }
     }
+
+    @Test fun binaryAndMultilineMessagesRemainOnePrintablePersistedRecord() {
+        val file = File(temporary.root, "binary.log")
+        val input = "UDP payload=end\u0000\r\npassword=secret\u001b"
+        val safe = LogSanitizer.clean(input)
+        assertTrue(safe.contains("\\u0000\\r\\n"))
+        assertFalse(safe.contains("secret"))
+        assertFalse(safe.any { it.code < 32 && it != '\t' })
+        RollingLogFile(file, 2048).use { log -> log.append(safe) }
+        RollingLogFile(file, 2048).use { log ->
+            assertEquals(listOf(safe), log.snapshotLines())
+        }
+    }
+
+    @Test fun engineStartAndMediaEvidenceCannotClaimVehicleDisplay() {
+        val evidence = MediaEvidence()
+        evidence.begin(7)
+        evidence.state("starting")
+        assertTrue(evidence.summary().contains("engineStarted=true"))
+        assertTrue(evidence.summary().contains("recordCompleted=false"))
+        evidence.state("connected")
+        evidence.state("carlife_active")
+        evidence.stats(42, true)
+        assertTrue(evidence.summary().contains("recordCompleted=true"))
+        assertTrue(evidence.summary().contains("sourceFrames=42"))
+        assertTrue(evidence.summary().contains("vehicleDisplay=unverified"))
+        evidence.begin(8)
+        assertTrue(evidence.summary().contains("recordCompleted=false"))
+        assertTrue(evidence.summary().contains("sourceFrames=0"))
+        assertTrue(evidence.summary().contains("lastAudioSending=false"))
+    }
 }

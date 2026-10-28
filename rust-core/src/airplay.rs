@@ -104,7 +104,7 @@ impl PendingAudioSetup {
                 return;
             };
             emit_log("AIRPLAY: 音频流已加入，补发 RECORD 激活（MIB3 兼容路径）");
-            if let Err(error) = record(&self.channel).await {
+            if let Err(error) = record(&self.channel, "audio").await {
                 emit_log(&format!("AIRPLAY: 音频 RECORD 失败，未启动音频推流，保留视频：{error}"));
                 return;
             }
@@ -442,7 +442,7 @@ async fn negotiate_media(
 
     // Activate the video session first. The caller can start its pump as soon as
     // this function returns; optional audio is deliberately not awaited here.
-    record(&channel).await?;
+    record(&channel, "video").await?;
     emit_log("AIRPLAY: ✓ RECORD 完成——视频会话已激活，立即交付持续视频发送器");
     emit_state("connected", "AirPlay 会话已激活；车机显示与声音仍需确认");
 
@@ -466,7 +466,8 @@ async fn negotiate_media(
     })
 }
 
-async fn record(channel: &RtspChannel) -> Result<(), String> {
+async fn record(channel: &RtspChannel, purpose: &str) -> Result<(), String> {
+    emit_log(&format!("MEDIA: stage={purpose}_record begin"));
     let response = channel.request(
         "RECORD", "/", &bplist::encode(&Value::dict(vec![])),
         "application/x-apple-binary-plist", &[], Duration::from_secs(5),
@@ -474,6 +475,7 @@ async fn record(channel: &RtspChannel) -> Result<(), String> {
     if response.status() != 200 {
         return Err(format!("RECORD 被拒 [{}]", response.first_line));
     }
+    emit_log(&format!("MEDIA: stage={purpose}_record success"));
     Ok(())
 }
 
@@ -556,7 +558,7 @@ async fn setup_media_session(
         let (read_key, write_key) = derive_event_keys(shared);
         ControlCipher::new(read_key, write_key)
     });
-    let (event_channel, event_rx) = RtspChannel::spawn(read, write, cipher, stop);
+    let (event_channel, event_rx) = RtspChannel::spawn_named(read, write, cipher, stop, "event");
     emit_log("AIRPLAY: ✓ 事件通道已连接，开始声明主屏/主音频资源");
     assert_modes(channel).await?;
     Ok(MediaSession { info, timing, event_channel, event_rx, keep_alive_port })
@@ -835,14 +837,13 @@ async fn negotiate_audio(
         emit_log(&format!("AIRPLAY: 音频流被拒 [{}]", resp.first_line));
         return None;
     }
-    let root = bplist::parse(&resp.body).ok()?;
-    let stream = root.get("streams").and_then(Value::as_array)?.first()?;
-    let data_port = port_of(stream.get("dataPort"));
-    let control_port = port_of(stream.get("controlPort"));
-    if data_port == 0 {
-        emit_log("AIRPLAY: 音频流未返回 dataPort");
-        return None;
-    }
+    let (data_port, control_port) = match audio_response_ports(&resp.body) {
+        Ok(ports) => ports,
+        Err(error) => {
+            emit_log(&format!("AIRPLAY: 音频 SETUP 应答无效：{error} bodyBytes={}", resp.body.len()));
+            return None;
+        }
+    };
     let key = match shared {
         Some(s) => stream_key(s, conn_id as u64),
         None => {
@@ -850,16 +851,35 @@ async fn negotiate_audio(
             return None;
         }
     };
-    let udp = factory.open_udp(&p.car_ip, data_port)?;
+    let udp = match factory.open_udp(&p.car_ip, data_port) {
+        Some(socket) => socket,
+        None => {
+            emit_log(&format!("AIRPLAY: 音频数据 UDP 打开失败 host={} dataPort={data_port}；核对绑定网络", p.car_ip));
+            return None;
+        }
+    };
     let sync = if control_port != 0 {
         factory.open_udp(&p.car_ip, control_port)
     } else {
         None
     };
+    if control_port != 0 && sync.is_none() {
+        emit_log(&format!("AIRPLAY: 音频同步 UDP 打开失败 controlPort={control_port}，继续音频但同步未建立"));
+    }
     emit_log(&format!(
         "AIRPLAY: ✓ 音频流就绪 data={data_port} control={control_port}（PCM48k/SPF352）"
     ));
     Some(AudioOut::new(udp, sync, key, 100))
+}
+
+fn audio_response_ports(body: &[u8]) -> Result<(u16, u16), String> {
+    let root = bplist::parse(body).map_err(|error| format!("plist_parse_failed: {error}"))?;
+    let stream = root.get("streams").and_then(Value::as_array).and_then(|streams| streams.first())
+        .ok_or_else(|| "missing_audio_stream".to_string())?;
+    let data_port = stream.get("dataPort").and_then(Value::as_int)
+        .and_then(|port| u16::try_from(port).ok()).filter(|port| *port > 0)
+        .ok_or_else(|| "missing_or_invalid_audio_data_port".to_string())?;
+    Ok((data_port, port_of(stream.get("controlPort"))))
 }
 
 // ---------------------------------------------------------------- 心跳
@@ -881,6 +901,7 @@ fn spawn_keepalive_loops(
                 emit_log("AIRPLAY: keepAlive UDP 端口不可用");
                 return;
             };
+            emit_log(&format!("HEARTBEAT: UDP ready host={car_ip} port={keep_alive_port} intervalMs=5000"));
             let mut n: u32 = 0;
             loop {
                 tokio::select! {
@@ -892,17 +913,20 @@ fn spawn_keepalive_loops(
                     emit_log(&format!("AIRPLAY: UDP keepAlive 写失败 kind={:?} os={:?}: {e}", e.kind(), e.raw_os_error()));
                     return;
                 }
+                if n == 1 || n % 12 == 0 { emit_log(&format!("HEARTBEAT: UDP sent={n} port={keep_alive_port}")); }
             }
         });
     }
 
     spawn_scoped(stop.clone(), async move {
+        emit_log("HEARTBEAT: feedback ready intervalMs=1000 timeoutMs=3000");
+        let mut sent = 0u64;
         loop {
             tokio::select! {
                 _ = stop.notified() => return,
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
-            if let Err(error) = channel
+            let response = channel
                 .request(
                     "POST",
                     "/feedback",
@@ -911,8 +935,14 @@ fn spawn_keepalive_loops(
                     &[],
                     Duration::from_secs(3),
                 )
-                .await
-            {
+                .await;
+            if let Ok(ref reply) = response {
+                sent += 1;
+                if sent == 1 || sent % 30 == 0 || reply.status() != 200 {
+                    emit_log(&format!("HEARTBEAT: feedback replies={sent} status={}", reply.status()));
+                }
+            }
+            if let Err(error) = response {
                 let detail = format!("AirPlay feedback 失败：{error}");
                 emit_log(&detail);
                 emit_state("ended", &detail);

@@ -57,6 +57,54 @@ internal object LogSanitizer {
         val safe = bearer.replace(credentials.replace(wifiCommand.replace(message) {
             "${it.groupValues[1]} [arguments redacted]"
         }) { "${it.groupValues[1]}<redacted>" }) { "${it.groupValues[1]}<redacted>" }
-        return if (safe.length <= 2_048) safe else safe.take(2_048) + " [truncated chars=${safe.length}]"
+        val printable = buildString {
+            for (char in safe) when {
+                char == '\n' -> append("\\n")
+                char == '\r' -> append("\\r")
+                char.code < 32 && char != '\t' -> append("\\u" + char.code.toString(16).padStart(4, '0'))
+                char == '\u007f' -> append("\\u007f")
+                else -> append(char)
+            }
+        }
+        return if (printable.length <= 2_048) printable else printable.take(2_048) + " [truncated chars=${printable.length}]"
     }
+}
+
+/** Observation only: it must never drive retries, source selection or the connection UI. */
+internal class MediaEvidence {
+    private var generation = 0L
+    private var lastState = "none"
+    private var engineStarted = false
+    private var recordCompleted = false
+    private var sourceHandshake = false
+    private var sourceFrames = 0L
+    private var audioSending = false
+
+    @Synchronized fun begin(value: Long) {
+        generation = value
+        lastState = "native_start_requested"
+        engineStarted = false
+        recordCompleted = false
+        sourceHandshake = false
+        sourceFrames = 0
+        audioSending = false
+    }
+
+    @Synchronized fun state(value: String) {
+        lastState = value
+        when (value) {
+            "starting" -> engineStarted = true
+            "connected" -> recordCompleted = true
+            "carlife_active" -> sourceHandshake = true
+        }
+    }
+
+    @Synchronized fun stats(frames: Long, audio: Boolean) {
+        sourceFrames = frames
+        audioSending = audio
+    }
+
+    @Synchronized fun summary(): String =
+        "generation=$generation lastState=$lastState engineStarted=$engineStarted recordCompleted=$recordCompleted " +
+            "sourceHandshake=$sourceHandshake sourceFrames=$sourceFrames lastAudioSending=$audioSending vehicleDisplay=unverified"
 }

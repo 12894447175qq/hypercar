@@ -802,6 +802,7 @@ class Iap2SenderSession(
             // 网关不在 iAP2 消息里；上层入网后从 DHCP/链路信息取
             gateway = null,
             securityType = wifi?.securityType ?: startSession?.wirelessAp?.securityType,
+            origin = if (startSession != null) "iap2_4301" else "iap2_5703_credentials",
         )
 
     // ---- MFi 挑战 ----
