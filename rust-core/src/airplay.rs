@@ -4,11 +4,11 @@
 //!  1. `GET /info`（带空 bplist 体 + plist Content-Type，老固件对缺体的 /info 回 400/455）
 //!  2. `/pair-verify` M1..M4（本机 ed25519 长期身份）→ 控制通道密钥
 //!  3. 会话级 `SETUP /setup`（先建立会话，MIB3 在此之前拒绝资源命令）
-//!  4. SETUP 后刷新 /info，再 modesChanged（在屏幕流 SETUP 前声明资源）
-//!  5. 连接事件通道（SETUP 应答 eventPort；车机在此通道 POST /command）
+//!  4. SETUP 后刷新 /info，连接事件通道并准备加密收发
+//!  5. modesChanged 声明资源（事件通道就绪后、屏幕流 SETUP 前）
 //!  6. 屏幕流 `SETUP /`（type 110，uuid 必须取 /info displays[].uuid）→ dataPort
-//!  7. 音频流 `SETUP /`（type 100 PCM 48k，spf=352）→ dataPort/controlPort
-//!  8. `RECORD` 激活 → 三条相互独立的心跳：
+//!  7. 首次 `RECORD` 激活 → 立即交付视频发送器并启动独立心跳
+//!  8. 后台音频 SETUP → 补发 RECORD 成功后交付音频；失败不阻塞视频：
 //!     UDP keepAlive 5s（4B；间隔必须小于车机 10s 看门狗——等长必输）
 //!     RTSP /feedback 1s（车机 ~3s 看门狗）
 //!     屏幕流 keepAlive 帧 1s（在视频 pump 内节流；缺它 Audi MMI 3315 10.2s 拆轮）
@@ -35,6 +35,10 @@ use crate::{emit_iap, emit_log, emit_state};
 #[cfg(test)]
 #[path = "negotiation_tests.rs"]
 mod negotiation_tests;
+
+#[cfg(test)]
+#[path = "media_sequence_tests.rs"]
+mod media_sequence_tests;
 
 /// Rust 需要新 socket 时回调 Kotlin（必须绑定车机网络，否则流量走手机）。
 pub trait SocketProvider: Send + Sync {
@@ -74,12 +78,45 @@ pub struct TouchInput {
 
 pub struct AirplayOutcome {
     pub screen: ScreenSender,
-    pub audio: Option<AudioOut>,
+    pub audio: Option<PendingAudioSetup>,
     pub keep_alive_stats: bool,
     pub timing: TimingServer,
 }
 
-/// 跑完整个 AirPlay 协商，返回屏幕/音频发送器（交给 pump 任务）。
+/// Audio starts only after the caller has handed the screen to its video pump.
+/// Every worker belongs to this session, so late replies cannot activate a new one.
+pub struct PendingAudioSetup {
+    channel: Arc<RtspChannel>,
+    factory: Arc<dyn SocketProvider>,
+    shared_secret: Option<[u8; 32]>,
+    params: AirplayParams,
+    stop: Arc<SessionStop>,
+}
+
+impl PendingAudioSetup {
+    pub fn start(self, ready: tokio::sync::oneshot::Sender<AudioOut>) {
+        spawn_scoped(self.stop.clone(), async move {
+            emit_log("AIRPLAY: 后台协商音频；持续视频与心跳不等待音频应答");
+            let Some(audio) = negotiate_audio(
+                &self.channel, &self.factory, self.shared_secret.as_ref(), &self.params,
+            ).await else {
+                emit_log("AIRPLAY: 音频不可用，保留视频会话");
+                return;
+            };
+            emit_log("AIRPLAY: 音频流已加入，补发 RECORD 激活（MIB3 兼容路径）");
+            if let Err(error) = record(&self.channel).await {
+                emit_log(&format!("AIRPLAY: 音频 RECORD 失败，未启动音频推流，保留视频：{error}"));
+                return;
+            }
+            // The outer session select is cancellation-biased, including late SETUP/RECORD replies.
+            if self.stop.is_cancelled() { return; }
+            emit_log("AIRPLAY: ✓ 音频 RECORD 完成，交付音频发送器");
+            let _ = ready.send(audio);
+        });
+    }
+}
+
+/// 完成视频会话协商，返回屏幕发送器和可选的后台音频协商任务。
 pub async fn negotiate(
     read: OwnedReadHalf,
     write: OwnedWriteHalf,
@@ -236,8 +273,24 @@ pub async fn negotiate(
         }
     }
 
-    let MediaSession { info, timing, event_port, keep_alive_port } =
-        setup_media_session(&channel, p, info, shared_secret.is_some(), stop.clone()).await?;
+    negotiate_media(channel, p, info, shared_secret, factory, touch_tx, key_tx, iap_rx, stop).await
+}
+
+/// Post-pairing media negotiation. Kept separate so the wire order can be
+/// exercised against a stateful receiver without replacing the media protocol.
+async fn negotiate_media(
+    channel: Arc<RtspChannel>,
+    p: &AirplayParams,
+    info: Value,
+    shared_secret: Option<[u8; 32]>,
+    factory: Arc<dyn SocketProvider>,
+    touch_tx: mpsc::UnboundedSender<TouchInput>,
+    key_tx: mpsc::UnboundedSender<u32>,
+    iap_rx: mpsc::Receiver<Vec<u8>>,
+    stop: Arc<SessionStop>,
+) -> Result<AirplayOutcome, String> {
+    let MediaSession { info, timing, event_channel, event_rx, keep_alive_port } =
+        setup_media_session(&channel, p, info, shared_secret.as_ref(), &*factory, stop.clone()).await?;
 
     // ---- 2.6 用 /info 结果校准显示尺寸与能力（上面拿不到就全用兜底）----
     let keep_alive_stats = p.keep_alive_stats
@@ -270,19 +323,6 @@ pub async fn negotiate(
         ));
     }
 
-    // ---- 5. 事件通道 ----
-    if event_port == 0 {
-        return Err("SETUP 未返回 eventPort".to_string());
-    }
-    let event_stream = factory
-        .open_tcp(&p.car_ip, event_port, 5_000)
-        .ok_or_else(|| format!("事件通道连接失败 {}:{event_port}", p.car_ip))?;
-    let (ev_r, ev_w) = event_stream.into_split();
-    let (event_channel, event_rx) = RtspChannel::spawn(ev_r, ev_w, None, stop.clone());
-    if let Some(shared) = &shared_secret {
-        let (read_key, write_key) = derive_event_keys(shared);
-        event_channel.set_cipher(ControlCipher::new(read_key, write_key));
-    }
     // 事件通道必须活到会话结束：`RtspChannel` 的 `Drop` 会 abort 读任务并关闭 socket。
     // 之前这里只是临时变量，函数返回时就被丢弃 → 事件通道刚连上即被我们自己关掉，
     // 接收端（WinPlay）的 close 回调把 eventSock 清回 null，触摸全进 pendingEvents
@@ -400,33 +440,11 @@ pub async fn negotiate(
     spawn_iap_sender(channel.clone(), iap_rx, stop.clone());
     emit_state("iap_ready", "主屏 SETUP 已完成，可启动虚拟 iAP2 控制链路");
 
-    // ---- 7. （音频挪到 RECORD 之后，见第 8 步）----
-    // 宝马这台（AirTunes/450.14）在屏幕流 SETUP 后约 1.5s 就关控制通道；
-    // 若这段时间还在做音频 SETUP，RECORD 永远发不出去（21:13 现场）。
-
-    // ---- 8. RECORD + 心跳 ----
-    let rec = channel
-        .request(
-            "RECORD",
-            "/",
-            &bplist::encode(&Value::dict(vec![])),
-            "application/x-apple-binary-plist",
-            &[],
-            Duration::from_secs(5),
-        )
-        .await?;
-    if rec.status() != 200 {
-        return Err(format!("RECORD 被拒 [{}]", rec.first_line));
-    }
-    emit_log("AIRPLAY: ✓ RECORD 完成——会话已激活");
-    emit_state("connected", "AirPlay 会话已激活");
-
-    // ---- 9. 音频流 SETUP（会话已激活后再试；失败只记录）----
-    let audio = if p.enable_audio {
-        negotiate_audio(&channel, &factory, shared_secret.as_ref(), p).await
-    } else {
-        None
-    };
+    // Activate the video session first. The caller can start its pump as soon as
+    // this function returns; optional audio is deliberately not awaited here.
+    record(&channel).await?;
+    emit_log("AIRPLAY: ✓ RECORD 完成——视频会话已激活，立即交付持续视频发送器");
+    emit_state("connected", "AirPlay 会话已激活；车机显示与声音仍需确认");
 
     spawn_keepalive_loops(
         channel.clone(),
@@ -436,12 +454,27 @@ pub async fn negotiate(
         stop.clone(),
     );
 
+    let audio = p.enable_audio.then(|| PendingAudioSetup {
+        channel, factory, shared_secret, params: p.clone(), stop,
+    });
+
     Ok(AirplayOutcome {
         screen,
         audio,
         keep_alive_stats,
         timing,
     })
+}
+
+async fn record(channel: &RtspChannel) -> Result<(), String> {
+    let response = channel.request(
+        "RECORD", "/", &bplist::encode(&Value::dict(vec![])),
+        "application/x-apple-binary-plist", &[], Duration::from_secs(5),
+    ).await?;
+    if response.status() != 200 {
+        return Err(format!("RECORD 被拒 [{}]", response.first_line));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- /info
@@ -463,7 +496,8 @@ fn receiver_display(info: &Value) -> (Option<String>, u32, u32) {
 struct MediaSession {
     info: Value,
     timing: TimingServer,
-    event_port: u16,
+    event_channel: Arc<RtspChannel>,
+    event_rx: mpsc::UnboundedReceiver<crate::rtsp::RtspMessage>,
     keep_alive_port: u16,
 }
 
@@ -472,12 +506,13 @@ async fn setup_media_session(
     channel: &Arc<RtspChannel>,
     p: &AirplayParams,
     mut info: Value,
-    encrypted: bool,
+    shared_secret: Option<&[u8; 32]>,
+    factory: &dyn SocketProvider,
     stop: Arc<SessionStop>,
 ) -> Result<MediaSession, String> {
     // ---- 3. 计时服务 + 会话级 SETUP ----
     let timing = TimingServer::start(stop.clone()).map_err(|e| format!("计时服务启动失败: {e}"))?;
-    let body = build_session_setup(&p.device_id, timing.port, encrypted);
+    let body = build_session_setup(&p.device_id, timing.port, shared_secret.is_some());
     let resp = channel
         .request(
             "SETUP",
@@ -512,9 +547,19 @@ async fn setup_media_session(
         Ok(_) => emit_log("AIRPLAY: 会话 SETUP 后 /info 为空，保留已知能力"),
         Err(e) => emit_log(&format!("AIRPLAY: 会话 SETUP 后 /info 仍不可用，保留已知能力：{e}")),
     }
-    // MIB3 needs a session before /command, but resources before the screen SETUP.
+    // Prepare the reverse channel before claiming resources, matching the same-car
+    // CarDeck trace. A session SETUP still precedes every resource command.
+    let event_stream = factory.open_tcp(&p.car_ip, event_port, 5_000)
+        .ok_or_else(|| format!("事件通道连接失败 {}:{event_port}", p.car_ip))?;
+    let (read, write) = event_stream.into_split();
+    let cipher = shared_secret.map(|shared| {
+        let (read_key, write_key) = derive_event_keys(shared);
+        ControlCipher::new(read_key, write_key)
+    });
+    let (event_channel, event_rx) = RtspChannel::spawn(read, write, cipher, stop);
+    emit_log("AIRPLAY: ✓ 事件通道已连接，开始声明主屏/主音频资源");
     assert_modes(channel).await?;
-    Ok(MediaSession { info, timing, event_port, keep_alive_port })
+    Ok(MediaSession { info, timing, event_channel, event_rx, keep_alive_port })
 }
 
 async fn fetch_info(channel: &Arc<RtspChannel>) -> Result<Value, String> {

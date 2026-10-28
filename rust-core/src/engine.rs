@@ -534,7 +534,7 @@ pub async fn run_engine(
     // 屏幕/音频发送器交给泵
     let _ = screen_ready_tx.send(outcome.screen);
     if let Some(audio) = outcome.audio {
-        let _ = audio_out_tx.send(audio);
+        audio.start(audio_out_tx);
     }
 
     // ---- 统计心跳（1s）----

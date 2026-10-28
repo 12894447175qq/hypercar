@@ -1,5 +1,6 @@
 //! Stateful MIB3 receiver: commands require an initial SETUP, not just pairing.
 use super::{receiver_display, setup_media_session, AirplayParams};
+use super::media_sequence_tests::LoopbackSockets;
 use crate::{bplist::{self, Value}, rtsp::{parse_rtsp_messages, RtspMessage}, session::SessionStop};
 use std::{sync::Arc, time::Duration};
 use parking_lot::Mutex;
@@ -31,6 +32,8 @@ async fn mib3_requires_session_setup_before_resource_command() {
     let stop = SessionStop::new(50003);
     let (read, write) = client.into_split();
     let (channel, _) = crate::rtsp::RtspChannel::spawn(read, write, None, stop.clone());
+    let event_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let event_port = event_listener.local_addr().unwrap().port();
     let server = tokio::spawn(async move {
         let mut buffered = Vec::new();
         let first = request(&mut receiver, &mut buffered).await;
@@ -39,7 +42,7 @@ async fn mib3_requires_session_setup_before_resource_command() {
             return false;
         }
         reply(&mut receiver, &first, "200 OK", bplist::encode(&Value::dict(vec![
-            ("eventPort", Value::int(5001)), ("keepAlivePort", Value::int(5020)),
+            ("eventPort", Value::int(event_port as i64)), ("keepAlivePort", Value::int(5020)),
         ]))).await;
         let info = request(&mut receiver, &mut buffered).await;
         assert!(info.first_line.contains(" /info "));
@@ -49,6 +52,7 @@ async fn mib3_requires_session_setup_before_resource_command() {
                 ("heightPixels", Value::int(654)),
             ])])),
         ]))).await;
+        let (_event, _) = event_listener.accept().await.unwrap();
         let command = request(&mut receiver, &mut buffered).await;
         assert_eq!(command.first_line, "POST /command RTSP/1.0");
         assert_eq!(bplist::parse(&command.body).unwrap().get("type").and_then(Value::as_str), Some("modesChanged"));
@@ -61,7 +65,7 @@ async fn mib3_requires_session_setup_before_resource_command() {
         enable_audio: false, keep_alive_stats: false, width: 2560, height: 744,
         touch_display: None, encoder_size: Arc::new(Mutex::new((2560, 744))),
     };
-    let outcome = setup_media_session(&channel, &params, Value::dict(vec![]), true, stop.clone()).await;
+    let outcome = setup_media_session(&channel, &params, Value::dict(vec![]), Some(&[9; 32]), &LoopbackSockets, stop.clone()).await;
     let correct_order = server.await.unwrap();
     stop.cancel();
     tokio::time::timeout(Duration::from_secs(2), stop.wait_idle()).await.unwrap();
@@ -97,16 +101,19 @@ async fn unavailable_info_does_not_probe_authentication_or_erase_known_geometry(
     let stop = SessionStop::new(50004);
     let (r, w) = client.into_split();
     let (channel, _) = crate::rtsp::RtspChannel::spawn(r, w, None, stop.clone());
+    let event_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let event_port = event_listener.local_addr().unwrap().port();
     let server = tokio::spawn(async move {
         let mut buffered = Vec::new();
         let setup = request(&mut receiver, &mut buffered).await;
         assert_eq!(setup.first_line, "SETUP /setup RTSP/1.0");
-        reply(&mut receiver, &setup, "200 OK", bplist::encode(&Value::dict(vec![("eventPort", Value::int(5001))]))).await;
+        reply(&mut receiver, &setup, "200 OK", bplist::encode(&Value::dict(vec![("eventPort", Value::int(event_port as i64))]))).await;
         for _ in 0..3 {
             let info = request(&mut receiver, &mut buffered).await;
             assert!(info.first_line.contains(" /info "), "capability lookup mutated authentication");
             reply(&mut receiver, &info, "455 Method Not Valid In This State", vec![]).await;
         }
+        let (_event, _) = event_listener.accept().await.unwrap();
         let modes = request(&mut receiver, &mut buffered).await;
         assert_eq!(modes.first_line, "POST /command RTSP/1.0");
         reply(&mut receiver, &modes, "200 OK", vec![]).await;
@@ -119,7 +126,7 @@ async fn unavailable_info_does_not_probe_authentication_or_erase_known_geometry(
     let known = Value::dict(vec![("displays", Value::array(vec![Value::dict(vec![
         ("uuid", Value::str("known")), ("width", Value::int(640)), ("height", Value::int(480)),
     ])]))]);
-    let outcome = setup_media_session(&channel, &params, known, false, stop.clone()).await;
+    let outcome = setup_media_session(&channel, &params, known, None, &LoopbackSockets, stop.clone()).await;
     server.await.unwrap();
     stop.cancel();
     tokio::time::timeout(Duration::from_secs(2), stop.wait_idle()).await.unwrap();

@@ -12,10 +12,10 @@ val appVersionName = "0.1.1"
 
 // CI 构建号：`-Phypercar.buildNumber=<github.run_number>`（CI 每次 push 传入）。
 //   versionName = 0.1.1.<N>、versionCode = base*10000 + N —— 每次推送 +1，可覆盖安装。
-// 本地车测版本 0.1.1.3 / 50003；CI 仍按 run_number 累计。
+// 本地车测版本 0.1.1.4 / 50004；CI 仍按 run_number 累计。
 val buildNumber: Int? = providers.gradleProperty("hypercar.buildNumber").orNull?.toIntOrNull()
 val baseVersionCode = 5
-val localBuildNumber = 3
+val localBuildNumber = 4
 
 android {
     namespace = "io.github.hypercar"
