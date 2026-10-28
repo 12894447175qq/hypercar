@@ -27,7 +27,7 @@
 #
 # 正式构建缺少签名即失败；未配置签名的 fork 普通推送只提供独立标识的测试 APK。
 # debug 证书签出去的包，日后换正式证书时所有用户必须卸载重装（签名是不可逆决定）。
-# Gradle 侧还有第二道闸：传了 -Phypercar.buildNumber 却没有 keystore.properties 就构建失败。
+# Gradle 侧还有第二道闸：CI 编号 release 或 requireReleaseSigning=true 缺少签名配置就失败。
 name: Validate and Build APK
 
 on:
@@ -232,7 +232,7 @@ jobs:
         run: |
           set -eu
           chmod +x gradlew
-          ./gradlew :app:assembleRelease "-Phypercar.buildNumber=$BUILD_NUMBER" --stacktrace
+          ./gradlew :app:assembleRelease "-Phypercar.buildNumber=$BUILD_NUMBER" -Phypercar.requireReleaseSigning=true --stacktrace
 
       - name: 校验签名并打包
         if: steps.signing.outputs.ready == 'true'

@@ -17,6 +17,28 @@ val buildNumber: Int? = providers.gradleProperty("hypercar.buildNumber").orNull?
 val baseVersionCode = 5
 val localBuildNumber = 4
 
+// Local test APKs must not need signing questions or machine-specific setup.
+// A configured key always wins. CI/formal builds still require that configuration.
+val signingPropertiesFile = rootProject.file("keystore.properties")
+val hasConfiguredSigning = signingPropertiesFile.exists()
+val ciBuild = providers.environmentVariable("CI").orNull.equals("true", ignoreCase = true)
+val releaseRequested = gradle.startParameter.taskNames.any {
+    it.endsWith("assembleRelease", ignoreCase = true) || it.endsWith("bundleRelease", ignoreCase = true)
+}
+val requireConfiguredSigning = providers.gradleProperty("hypercar.requireReleaseSigning")
+    .orNull.equals("true", ignoreCase = true) || (ciBuild && (buildNumber != null || releaseRequested))
+
+if (requireConfiguredSigning && !hasConfiguredSigning) {
+    throw GradleException("SIGNING: missing_required_config — CI/正式构建需要 keystore.properties；本地车测包可不配置签名。")
+}
+logger.lifecycle(
+    when {
+        hasConfiguredSigning -> "SIGNING: mode=configured — 复用本地已有签名配置，不询问密钥。"
+        ciBuild -> "SIGNING: mode=ci-test — 未配置正式签名，仅允许测试构建。"
+        else -> "SIGNING: mode=local-test — 自动复用 Android 测试签名，缺失时由构建工具生成；无需提供密钥。"
+    },
+)
+
 android {
     namespace = "io.github.hypercar"
     compileSdk = 35
@@ -50,17 +72,12 @@ android {
 
     signingConfigs {
         create("release") {
-            val ks = rootProject.file("keystore.properties")
-            // 第二道闸（CarDeck 同款）：CI 传了构建号（=要出正式版）却没配 keystore
-            // 材料时直接失败——绝不让「带构建号的正式版」退回 debug 签名流出去。
-            if (buildNumber != null && !ks.exists()) {
-                throw GradleException(
-                    "收到 -Phypercar.buildNumber=$buildNumber 但仓库根没有 keystore.properties——" +
-                        "正式签名是不可逆决定，不允许 debug 签名的「正式版」流出去（见 .github/workflows/android-ci.yml）",
-                )
-            }
-            if (ks.exists()) {
-                val props = Properties().apply { ks.inputStream().use { load(it) } }
+            if (hasConfiguredSigning) {
+                val props = Properties().apply { signingPropertiesFile.inputStream().use { load(it) } }
+                val required = listOf("storePassword", "keyAlias")
+                if (required.any { props.getProperty(it).isNullOrBlank() }) {
+                    throw GradleException("SIGNING: incomplete_config — 本地签名配置不完整，未替换已有签名。")
+                }
                 // 接到局部 val：storeFile 是可变属性，直接读会触发 smart cast 拒绝
                 val sf = rootProject.file(props.getProperty("storeFile") ?: "hypercar.jks")
                 storeFile = sf
@@ -69,7 +86,7 @@ android {
                     ?: if (sf.name.endsWith(".p12", true) || sf.name.endsWith(".pfx", true)) "PKCS12" else "JKS"
                 storePassword = props.getProperty("storePassword")
                 keyAlias = props.getProperty("keyAlias")
-                keyPassword = props.getProperty("keyPassword")
+                keyPassword = props.getProperty("keyPassword") ?: props.getProperty("storePassword")
             }
         }
     }
@@ -82,8 +99,10 @@ android {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            if (rootProject.file("keystore.properties").exists()) {
-                signingConfig = signingConfigs.getByName("release")
+            signingConfig = when {
+                hasConfiguredSigning -> signingConfigs.getByName("release")
+                !ciBuild -> signingConfigs.getByName("debug")
+                else -> null
             }
         }
         debug {

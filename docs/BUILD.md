@@ -27,7 +27,7 @@ cargo test   # 纯函数（bplist/tlv8/srp/封帧）可在宿主跑单测
 ### 1.1 一键构建（Windows，已装 JDK17 / SDK35 / NDK / rust）
 
 ```powershell
-pwsh -File tools\build-local.ps1 -Release -BuildNumber <N>   # 全量：Rust + APK
+pwsh -File tools\build-local.ps1 -Release -SkipHub -BuildNumber <N>   # Rust + 安卓 APK，无需询问密钥
 pwsh -File tools\build-local.ps1 -Release -SkipRust          # 只改 Kotlin 时
 ```
 
@@ -62,7 +62,7 @@ cargo build --release      # 产物 target/release/hypercar-hub.exe
 gradle wrapper --gradle-version 8.7
 
 ./gradlew :app:assembleDebug        # 调试包
-./gradlew :app:assembleRelease      # 正式包（需 keystore.properties）
+./gradlew :app:assembleRelease      # 本地自动复用已配置签名；无配置则生成可安装测试包
 ```
 
 安装（先杀进程再装，避免确认弹窗落到后台）：
@@ -70,6 +70,23 @@ gradle wrapper --gradle-version 8.7
 ```bash
 adb shell am force-stop io.github.hypercar
 adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+### 2.1 本地签名自动处理
+
+日常车测打包不需要提供密钥或回答签名问题。已有 `keystore.properties` 时继续复用；
+没有时，Gradle 自动使用本机 Android 默认测试密钥，缺失则由构建工具生成，以后重复使用。
+本地 `-Phypercar.buildNumber=5` 对应 `0.1.1.5 / 50005`，构建号不再要求提供正式签名。
+Windows 脚本同样自动处理，不会因缺少签名配置只输出未签名 APK。
+
+每台电脑的默认测试密钥可能不同；打包照常完成，安装时若签名不一致，准确标注覆盖限制。
+不能由此自动卸载应用、清数据或重新生成已有密钥。显式签名配置损坏时明确报错，不静默换掉已有签名。
+密钥和密码不加入 Git。正式构建可显式使用 `-Phypercar.requireReleaseSigning=true`，缺少配置会失败。
+
+签名策略回归（先完成 arm64 原生库构建）：
+
+```bash
+python3 tools/tests/local_signing_smoke.py --build-apk
 ```
 
 ## 3. 前置条件（手机端）
@@ -100,7 +117,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 - 发布仍需提交标题末尾的发布标记或手动勾选 publish；普通修复推送不会创建 Release。
 - 必需 Secrets：`KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD`；可选
   `EXPECTED_CERT_SHA256`。显式发布时缺任一材料即失败，绝不以 debug 签名替代正式版。
-- Gradle 仍拒绝在没有 `keystore.properties` 时接收 `-Phypercar.buildNumber`。
+- CI 的编号 release 构建及显式 `-Phypercar.requireReleaseSigning=true` 仍要求 `keystore.properties`；本地编号测试包可自动签名。
 - 已安装应用只能被同签名的新包覆盖。测试 APK 与原包签名不同就不要卸载原包或清数据；
   配对身份和设置需要保留，正式升级应使用匹配的签名材料。
 

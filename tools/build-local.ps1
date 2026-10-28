@@ -16,7 +16,7 @@
    2. Maven 仓库偶发挂死：~/.gradle/init.d/00-mirrors.gradle 已配华为云/腾讯云镜像。
 
 .PARAMETER Release
-  出 release 包。需要仓库根存在 keystore.properties，否则只会产出未签名包。
+  出压缩 release 包。有 keystore.properties 时复用配置；否则自动使用本机测试签名，无需询问密钥。
 
 .PARAMETER SkipRust
   跳过 Rust 交叉编译（只改 Kotlin 时用，直接复用上次编好的 .so）。
@@ -24,12 +24,12 @@
 .PARAMETER SkipHub
 跳过 PC 侧 hub 的宿主构建（默认会重新构建并覆盖 tools\hypercar-hub.exe）
 .PARAMETER BuildNumber
-  正式包构建号（同 CI 的 run_number）：versionName 变成 0.1.0.<N>、versionCode=10000+N。
-  本地出正式包时给一个不小于当前线上版本的号，才能覆盖安装。需要 keystore.properties。
+  本地构建号：versionName=0.1.1.<N>、versionCode=50000+N。
+  只控制版本，不要求本地提供密钥；覆盖安装还取决于签名是否一致。
 
 .EXAMPLE
   pwsh -File tools\build-local.ps1
-  pwsh -File tools\build-local.ps1 -Release -BuildNumber 10500
+  pwsh -File tools\build-local.ps1 -Release -SkipHub -BuildNumber 5
   pwsh -File tools\build-local.ps1 -SkipRust
 #>
 param(
@@ -167,16 +167,12 @@ if (-not $SkipRust) {
 
 $task = if ($Release) { ':app:assembleRelease' } else { ':app:assembleDebug' }
 if ($Release -and -not (Test-Path (Join-Path $root 'keystore.properties'))) {
-  Write-Warning "没有 keystore.properties：release 产物是未签名包（app-release-unsigned.apk），装不上。"
+  Write-Host "未配置本地签名：Gradle 将自动复用/生成 Android 测试签名，输出可安装测试 APK。" -ForegroundColor Cyan
 }
 
 $gradleArgs = @($task, '--console=plain')
 if ($BuildNumber -gt 0) {
-  # 与 CI 同一套版本号规则：versionName=0.1.0.<N>、versionCode=10000+N。
-  # 本地出正式包时给一个 ≥ 当前 CI run_number 的数字，才能覆盖安装线上包。
-  if (-not (Test-Path (Join-Path $root 'keystore.properties'))) {
-    throw "-BuildNumber 需要正式签名材料（keystore.properties），否则 Gradle 会按设计直接失败"
-  }
+  # 构建号只控制版本；本地缺少签名配置时也能自动出测试包。
   $gradleArgs += "-Phypercar.buildNumber=$BuildNumber"
 }
 
