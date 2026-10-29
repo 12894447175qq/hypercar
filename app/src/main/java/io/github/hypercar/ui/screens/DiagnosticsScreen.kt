@@ -113,6 +113,7 @@ fun DiagnosticsScreen(
                 color = MintGreen,
             )
         }
+        ComprehensiveDiagnosticPanel()
         ExportPathHint(path = lastExportPath, onCopyPath = { toast = "路径已复制" })
         LogList(
             logs = logs,

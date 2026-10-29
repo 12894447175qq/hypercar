@@ -1022,11 +1022,27 @@ fn spawn_iap_sender(
 ) {
     spawn_scoped(stop.clone(), async move {
         let mut sent = 0u64;
+        let mut reclaim_started=false;
+        let mut command_failed=false;
         while let Some(command) = packets.recv().await {
             let packet = match command {
                 crate::media_start::IapCommand::Packet(bytes) => bytes,
                 crate::media_start::IapCommand::ControlReady => {
+                    if command_failed {emit_log("IAP: control_ready deferred because an earlier command was not acknowledged; video retained");continue;}
                     readiness.control_ready();
+                    if !reclaim_started {
+                        reclaim_started=true;
+                        let reclaim_channel=channel.clone();
+                        spawn_scoped(stop.clone(),async move {
+                            for delay in [1500,2500,8000,18000] {
+                                tokio::time::sleep(Duration::from_millis(delay)).await;
+                                match assert_modes(&reclaim_channel).await {
+                                    Ok(())=>emit_log("AIRPLAY: control-ready resource reclaim acknowledged; display not verified"),
+                                    Err(e)=>emit_log(&format!("AIRPLAY: resource reclaim failed: {e}; media retained")),
+                                }
+                            }
+                        });
+                    }
                     emit_log("IAP: control_ready prior_commands_acknowledged=true certificateChainValidated=false");
                     continue;
                 }
@@ -1041,15 +1057,15 @@ fn spawn_iap_sender(
                 "application/x-apple-binary-plist", &[], Duration::from_secs(10)).await;
             match response {
                 Ok(reply) if reply.status() == 200 => {
+                    if let Some(payload)=iap_reply_payload(&reply.body) {emit_iap(&payload);}
                     sent += 1;
                     if sent <= 8 || sent % 30 == 0 { emit_log(&format!("IAP: control_command_ack count={sent} status=200")); }
                 }
                 other => {
                     let reason = match other { Ok(reply) => reply.first_line, Err(error) => error };
                     let detail = format!("虚拟 iAP2 控制事务失败: {reason}");
-                    emit_state("ended", &detail);
-                    stop.cancel();
-                    return;
+                    command_failed=true;
+                    emit_log(&format!("{detail}；控制应答失败不直接关闭媒体，反馈心跳继续判断连接状态"));
                 }
             }
         }
@@ -1158,6 +1174,12 @@ fn spawn_event_dispatcher(
                             &mut tip_down,
                             &mut touch_logged,
                         );
+                    }
+                }
+                "forceKeyFrame" => {
+                    match crate::video_recovery::request(stop.id) {
+                        Some(hardware)=>{emit_state("video_keyframe_requested",if hardware {"hardware"}else{"source_restart"});},
+                        None=>emit_log("VIDEO: keyframe request coalesced/limited/cancelled"),
                     }
                 }
                 "hidSetInputMode" | "ping" | "fps" => {}
@@ -1535,4 +1557,53 @@ fn split_annexb_frames(data: &'static [u8]) -> Vec<&'static [u8]> {
         }
     }
     frames
+}
+
+fn iap_reply_payload(body:&[u8])->Option<Vec<u8>> {
+    if body.len()>65_536{return None;}
+    if body.starts_with(&[0xff,0x5a]) || body.starts_with(&[0xff,0x55]) {return Some(body.to_vec());}
+    let root=bplist::parse(body).ok()?;
+    let bytes=root.get("params")?.get("data")?.as_bytes()?;
+    if bytes.starts_with(&[0xff,0x5a]) || bytes.starts_with(&[0xff,0x55]) {Some(bytes.to_vec())}else{None}
+}
+
+#[cfg(test)] mod control_recovery_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt,AsyncWriteExt};
+    async fn request(socket:&mut tokio::net::TcpStream)->crate::rtsp::RtspMessage {
+        tokio::time::timeout(Duration::from_secs(3),async {
+            let mut buffer=Vec::new();loop {
+                let mut chunk=[0;4096];let n=socket.read(&mut chunk).await.unwrap();assert!(n>0);buffer.extend_from_slice(&chunk[..n]);
+                if let Some(r)=crate::rtsp::parse_rtsp_messages(&mut buffer).pop(){return r;}
+            }
+        }).await.unwrap()
+    }
+    #[test] fn control_response_accepts_only_bounded_iap_payloads() {
+        let packet=vec![0xff,0x55,2,0,0xee,0x10];assert_eq!(iap_reply_payload(&packet),Some(packet.clone()));
+        let body=bplist::encode(&Value::dict(vec![("params",Value::dict(vec![("data",Value::Data(packet.clone()))]))]));
+        assert_eq!(iap_reply_payload(&body),Some(packet));assert_eq!(iap_reply_payload(b"error"),None);assert_eq!(iap_reply_payload(&vec![0xff;65537]),None);
+    }
+    #[tokio::test] async fn failed_iap_command_preserves_media_and_does_not_falsely_release_audio() {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client=tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();let(mut peer,_)=listener.accept().await.unwrap();
+        let(r,w)=client.into_split();let stop=SessionStop::new(812);let(channel,_)=RtspChannel::spawn(r,w,None,stop.clone());
+        let(tx,rx)=mpsc::channel(4);let readiness=crate::media_start::MediaReadiness::new();spawn_iap_sender(channel,rx,stop.clone(),readiness.clone());
+        tx.send(crate::media_start::IapCommand::Packet(vec![1])).await.unwrap();let first=request(&mut peer).await;
+        peer.write_all(format!("RTSP/1.0 500 Failed\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",first.cseq().unwrap()).as_bytes()).await.unwrap();
+        tx.send(crate::media_start::IapCommand::ControlReady).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(!stop.is_cancelled());assert!(!readiness.snapshot().control);
+        tx.send(crate::media_start::IapCommand::Packet(vec![2])).await.unwrap();let next=request(&mut peer).await;assert_ne!(next.cseq(),first.cseq());
+        stop.cancel();tokio::time::timeout(Duration::from_secs(1),stop.wait_idle()).await.unwrap();
+    }
+    #[tokio::test] async fn resources_are_reasserted_after_control_ready_and_stop_with_session() {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client=tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();let(mut peer,_)=listener.accept().await.unwrap();
+        let(r,w)=client.into_split();let stop=SessionStop::new(813);let(channel,_)=RtspChannel::spawn(r,w,None,stop.clone());
+        let(tx,rx)=mpsc::channel(4);spawn_iap_sender(channel,rx,stop.clone(),crate::media_start::MediaReadiness::new());
+        tx.send(crate::media_start::IapCommand::ControlReady).await.unwrap();let reclaim=request(&mut peer).await;
+        assert_eq!(bplist::parse(&reclaim.body).unwrap().get("type").and_then(Value::as_str),Some("modesChanged"));
+        stop.cancel();tokio::time::timeout(Duration::from_secs(1),stop.wait_idle()).await.unwrap();
+        assert_eq!(peer.read(&mut [0u8;1]).await.unwrap(),0);
+    }
 }

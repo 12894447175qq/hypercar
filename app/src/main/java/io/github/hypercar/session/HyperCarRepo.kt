@@ -68,6 +68,126 @@ import kotlinx.coroutines.withTimeoutOrNull
  */
 object HyperCarRepo {
 
+    private val diagnosticOwned = AtomicBoolean(false)
+    @Volatile private var diagnosticRetiringJob: Job? = null
+    @Volatile private var diagnosticWait: kotlinx.coroutines.CompletableDeferred<Unit>? = null
+    @Volatile private var diagnosticOptions: org.json.JSONObject? = null
+    @Volatile private var codecWorker: Pair<Long, io.github.hypercar.diagnostics.HardwareVideoTranscoder>? = null
+    private var batchController: io.github.hypercar.diagnostics.DiagnosticBatchController? = null
+
+    @Synchronized internal fun comprehensiveDiagnostics(context:Context):io.github.hypercar.diagnostics.DiagnosticBatchController {
+        init(context)
+        return batchController ?: io.github.hypercar.diagnostics.DiagnosticBatchController(
+            java.io.File(context.filesDir,"video-diagnostics"),io.github.hypercar.BuildConfig.VERSION_NAME+"/"+io.github.hypercar.BuildConfig.VERSION_CODE,
+            object : io.github.hypercar.diagnostics.DiagnosticPorts {
+                override suspend fun claim() {
+                    synchronized(HyperCarRepo) {
+                        check(!connecting && !streaming && !sessionLive.get() && !cleanupInProgress && diagnosticRetiringJob?.isCompleted!=false) {"请先停止普通连接，并等待旧任务退出，再开始综合诊断"}
+                        check(diagnosticOwned.compareAndSet(false,true)) {"已有诊断正在运行"}
+                    }
+                    try {
+                        stopVivoSourceCheck();sourceRecovery.cancel();reconnectJob?.cancel();stopNative();awaitCodecExit()
+                        check(withTimeoutOrNull(16_000){while(!RustCoreBridge.nativeIsIdle())delay(50);true}==true) {"旧会话未退出"}
+                        val ticket=HyperCarService.request(context,keepAliveTicket);keepAliveTicket=ticket
+                        check(withTimeoutOrNull(8_000){ticket.ready.await();true}==true) {"综合诊断前台保活未就绪"}
+                    }catch(e:Exception){releaseKeepAlive();diagnosticOwned.set(false);throw e}
+                }
+                override fun release() {diagnosticWait=null;diagnosticOptions=null;releaseKeepAlive();diagnosticOwned.set(false)}
+                override suspend fun stop() {
+                    diagnosticWait=null;userDisconnectRequested=true
+                    val job=connectJob ?: diagnosticRetiringJob;connectJob=null;diagnosticRetiringJob=job
+                    carLifeSession?.close();wakeJob?.cancel();stopNative();job?.cancel()
+                    val joined=try {withTimeoutOrNull(16_000){job?.join();true}==true} finally {runDisconnect("综合诊断案例结束")}
+                    if(joined)diagnosticRetiringJob=null
+                    check(joined) {"连接任务尚未退出，已停止本轮，禁止重叠启动"}
+                    stopNative();codecWorker?.second?.close()
+                    awaitCodecExit()
+                    check(withTimeoutOrNull(16_000){while(!RustCoreBridge.nativeIsIdle())delay(50);true}==true) {"原生任务尚未释放，禁止开始下一轮"}
+                    carLifeCleanupJob?.join();diagnosticOptions=null
+                }
+                private suspend fun local(directory:java.io.File,input:java.io.File?,policy:io.github.hypercar.diagnostics.VideoStrategy) {
+                    directory.mkdirs()
+                    val ticket=HyperCarService.request(context,keepAliveTicket);keepAliveTicket=ticket
+                    check(withTimeoutOrNull(8_000){ticket.ready.await();true}==true) {"前台保活未就绪"}
+                    carLifeCleanupJob?.join();sessionLive.set(true);userDisconnectRequested=false
+                    connectionTrace=ConnectionTrace("video-diagnostic",::log,SystemClock::elapsedRealtime)
+                    val result=kotlinx.coroutines.CompletableDeferred<Unit>();diagnosticWait=result
+                    var md:String?=null
+                    if(input==null) {
+                        val source=resolveCarLifeSource()
+                        check(source?.usesBoundRenderer==true) {"请选择已安装的 vivo CarLife/Jovi 来源"}
+                        check(ShizukuTools.isReady) {"请先启动 Shizuku 并授权，以核验六端口归属"}
+                        rendererPermissionError(context,source!!)?.let {error(it)}
+                        val owner=CarLifeWakeSession(source);carLifeSession=owner
+                        bindVivoRenderer(owner);check(owner.hasRenderer) {"原厂来源服务未就绪"}
+                        md=resolveCarLifeEndpoint();check(md=="127.0.0.1")
+                    }
+                    val json=org.json.JSONObject(SettingsStore.engineConfigJson("127.0.0.1",1,"02:00:00:00:00:01","",md,input==null))
+                        .put("enable_audio",false).put("wait_for_control",false).put("video_policy",policy.wire)
+                        .put("diagnostic_dir",directory.path).put("diagnostic_probe",input==null)
+                    if(input!=null)json.put("diagnostic_replay",input.path)
+                    diagnosticOptions=json
+                    check(startNative(json.toString(),-1)) {"原生预检未启动"}
+                    kotlinx.coroutines.withTimeout(75_000){result.await()}
+                }
+                override suspend fun probe(directory:java.io.File)=local(directory,null,io.github.hypercar.diagnostics.VideoStrategy.A)
+                override suspend fun replay(input:java.io.File,directory:java.io.File,policy:io.github.hypercar.diagnostics.VideoStrategy)=local(directory,input,policy)
+                override suspend fun decode(sample:java.io.File,metadata:java.io.File,directory:java.io.File)=io.github.hypercar.diagnostics.VideoDecoder.decode(sample,metadata,directory)
+                override suspend fun transcode(input:java.io.File,metadata:java.io.File,directory:java.io.File):java.io.File {
+                    val codec=org.json.JSONObject(metadata.readText()).getJSONObject("codec")
+                    val packets=io.github.hypercar.diagnostics.VideoEvidence.read(input)
+                    val output=java.util.Collections.synchronizedList(mutableListOf<io.github.hypercar.diagnostics.VideoEvidence.Packet>())
+                    val error=java.util.concurrent.atomic.AtomicReference<String?>(null)
+                    val total=java.util.concurrent.atomic.AtomicInteger()
+                    val worker=io.github.hypercar.diagnostics.HardwareVideoTranscoder(codec.getInt("width"),codec.getInt("height"),codec.getInt("width"),codec.getInt("height"),SettingsStore.carlifeFps,
+                        output={p->if(output.size>=90 || total.addAndGet(p.data.size)>io.github.hypercar.diagnostics.VideoEvidence.MAX_BYTES-2048)false else {output.add(p);true}},failed={error.compareAndSet(null,it)},trace={log("TRANSCODE-PREFLIGHT: $it")})
+                    try {
+                        worker.start()
+                        for(packet in packets){currentCoroutineContext().ensureActive();check(worker.offer(packet)) {error.get()?:"转码队列失败"};delay(40)}
+                        worker.finishInput();check(worker.awaitStopped(15_000)) {"硬件重编码超时"}
+                        error.get()?.let{error(it)}
+                        return java.io.File(directory,"transcoded.packets").also{io.github.hypercar.diagnostics.VideoEvidence.write(it,output.toList())}
+                    }finally{worker.close();worker.awaitStopped(12_000)}
+                }
+                override suspend fun connect(policy:io.github.hypercar.diagnostics.VideoStrategy,directory:java.io.File,audio:Boolean) {
+                    check(SettingsStore.carlifeEnabled && resolveCarLifeSource()?.usesBoundRenderer==true) {"车测需要启用 vivo 来源联动"}
+                    check(headUnitProfile.id==io.github.hypercar.headunit.HeadUnitProfiles.AUDI_MIB3.id) {"本次综合车测请先在设置选择 Audi MIB3 车型"}
+                    directory.mkdirs()
+                    diagnosticOptions=org.json.JSONObject().put("video_policy",policy.wire).put("diagnostic_dir",directory.path).put("enable_audio",audio)
+                    connectInternal(context,true,diagnostic=true)
+                    kotlinx.coroutines.withTimeout(120_000) {
+                        while(true) {
+                            when(val link=snapshots.value.link) {
+                                is LinkState.Connected->return@withTimeout
+                                is LinkState.Failed->error(link.reason)
+                                else->delay(100)
+                            }
+                        }
+                    }
+                }
+                override fun connectionHealthy() = snapshots.value.link is LinkState.Connected
+                override fun logs()=(diskLog()?.snapshotLines()?:snapshots.value.recentLogs).map(LogSanitizer::clean)
+                override fun save(policy:io.github.hypercar.diagnostics.VideoStrategy){SettingsStore.videoPolicy=policy.wire}
+                override suspend fun export(directory:java.io.File):String {
+                    val resolver=context.contentResolver
+                    val archiveName="hypercar-${directory.name}-${System.currentTimeMillis()}.zip"
+                    val values=android.content.ContentValues().apply {
+                        put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME,archiveName)
+                        put(android.provider.MediaStore.MediaColumns.MIME_TYPE,"application/zip")
+                        put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH,"Download/HyperCar")
+                        put(android.provider.MediaStore.MediaColumns.IS_PENDING,1)
+                    }
+                    val uri=resolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI,values)?:error("无法创建诊断包")
+                    try {
+                        val stream=resolver.openOutputStream(uri)?:error("无法写入诊断包")
+                        io.github.hypercar.diagnostics.VideoEvidence.archive(directory,stream)
+                        resolver.update(uri,android.content.ContentValues().apply{put(android.provider.MediaStore.MediaColumns.IS_PENDING,0)},null,null)
+                        return "下载/HyperCar/$archiveName"
+                    }catch(e:Exception){resolver.delete(uri,null,null);throw e}
+                }
+            },scope).also{batchController=it}
+    }
+
     private val _snapshots = MutableStateFlow(SessionSnapshot())
     val snapshots: StateFlow<SessionSnapshot> = _snapshots.asStateFlow()
 
@@ -84,6 +204,19 @@ object HyperCarRepo {
         virtualIap = null
     }
 
+    private suspend fun awaitCodecExit() {
+        val old=codecWorker ?: return
+        old.second.close()
+        check(withContext(Dispatchers.IO){old.second.awaitStopped(12_000)}) {"硬件编解码线程尚未退出，禁止重复创建"}
+        if(codecWorker===old)codecWorker=null
+    }
+
+    private suspend fun awaitNativeExit() {
+        check(withTimeoutOrNull(16_000){while(!RustCoreBridge.nativeIsIdle())delay(50);true}==true) {
+            "上轮原生 socket 尚未释放，停止本轮以免重复绑定来源"
+        }
+    }
+
     private fun startNative(config: String, fd: Int, ownerTrace: ConnectionTrace? = connectionTrace): Boolean {
         var transferred = false
         return try {
@@ -91,11 +224,20 @@ object HyperCarRepo {
                 closeVirtualIap()
                 mediaEvidence.begin(generation)
                 ownerTrace?.event("native.start", "generation=$generation")
+                val selected=org.json.JSONObject(config).put("video_policy",SettingsStore.videoPolicy)
+                diagnosticOptions?.let {overrides->overrides.keys().forEach {key->selected.put(key,overrides.get(key))}}
+                selected.optString("diagnostic_dir").takeIf{it.isNotBlank()}?.let {path ->
+                    val info=org.json.JSONObject(selected.toString()).apply {remove("identity_path");remove("device_id");remove("car_ip");remove("diagnostic_replay");remove("diagnostic_dir")}
+                    val battery=appContext()?.registerReceiver(null,android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
+                    info.put("generation",generation).put("startedAt",System.currentTimeMillis()).put("batteryPercent",battery?.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL,-1))
+                        .put("batteryTemperatureDeciC",battery?.getIntExtra(android.os.BatteryManager.EXTRA_TEMPERATURE,-1)).put("powerConclusion","未做功耗验收")
+                    java.io.File(path,"session-parameters.json").writeText(info.toString(2))
+                }
                 transferred = true
-                RustCoreBridge.nativeStart(config, fd, socketProvider, generation)
+                RustCoreBridge.nativeStart(selected.toString(), fd, socketProvider, generation)
             }
         } finally {
-            if (!transferred) runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
+            if (!transferred && fd >= 0) runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
         }
     }
 
@@ -103,6 +245,7 @@ object HyperCarRepo {
         nativeGate.stop {
             connectionTrace?.event("native.stop.summary", mediaEvidence.summary())
             closeVirtualIap()
+            codecWorker?.second?.close()
             RustCoreBridge.nativeStop()
         }
     }
@@ -171,6 +314,7 @@ object HyperCarRepo {
     }
     private fun retryAirplayOrFail(detail: String, ownerTrace: ConnectionTrace? = connectionTrace) {
         if (connectionTrace !== ownerTrace || !sessionLive.get()) return
+        if (diagnosticOwned.get()) {fail(detail,allowReconnect=false);return}
         if (detail.startsWith("CarLife 网关端口") || detail.startsWith("CarLife CMD 7240 绑定失败")) {
             log("SOURCE: 本机端口冲突，不重复重启 AirPlay；保留占用方，停止本轮连接")
             fail(detail)
@@ -208,6 +352,7 @@ object HyperCarRepo {
         runCatching { stopNative() }
         scope.launch {
             delay(AIRPLAY_RETRY_DELAY_MILLIS)
+            runCatching {awaitCodecExit();awaitNativeExit()}.onFailure {fail(it.message.orEmpty());return@launch}
             if (!sessionLive.get() || connectionTrace !== ownerTrace) return@launch
             val context = appContext() ?: return@launch
             if (sessionMdHost != null) {
@@ -462,9 +607,10 @@ object HyperCarRepo {
 
     fun connect(context: Context) = connectInternal(context, resetRecoveryBudget = true)
 
-    private fun connectInternal(context: Context, resetRecoveryBudget: Boolean) {
+    @Synchronized private fun connectInternal(context: Context, resetRecoveryBudget: Boolean, diagnostic:Boolean=false) {
+        if(diagnosticOwned.get() && !diagnostic) {log("DIAGNOSTIC: 综合诊断占用连接，忽略普通自动连接");return}
         init(context)
-        if (connecting || streaming || cleanupInProgress) {
+        if (connecting || streaming || cleanupInProgress || diagnosticRetiringJob?.isCompleted==false) {
             log("CONNECT: 已在连接、已连接或正在收尾，忽略重复触发")
             return
         }
@@ -491,6 +637,7 @@ object HyperCarRepo {
     }
 
     fun disconnect() {
+        if(diagnosticOwned.get()) {batchController?.cancel();return}
         val ownerTrace = connectionTrace
         connectionTrace?.event("disconnect.request", "connecting=$connecting engineRunning=$streaming live=${sessionLive.get()}")
         stopVivoSourceCheck()
@@ -546,6 +693,8 @@ object HyperCarRepo {
             scannedCarSubnets.clear()
             carLifeCleanupJob?.join()
             stopNative() // Wait for the previous session's registered tasks and sockets.
+            awaitCodecExit()
+            awaitNativeExit()
             currentCoroutineContext().ensureActive()
             carLifeSession = if (SettingsStore.carlifeEnabled || SettingsStore.carlifeFirst) {
                 resolveCarLifeSource()?.let(::CarLifeWakeSession)
@@ -937,7 +1086,7 @@ object HyperCarRepo {
         // 幂等：重复的断开事件（ACL 断开广播 + 引擎 ended + service 转交）只真正拆一次。
         // 但**状态必须回 Idle**——曾经这里直接 return，导致链路已断、界面还显示"已连接"。
         if (!sessionLive.compareAndSet(true, false)) {
-            if (userDisconnectRequested) releaseKeepAlive()
+            if (userDisconnectRequested && !diagnosticOwned.get()) releaseKeepAlive()
             _snapshots.update { s ->
                 if (s.link is LinkState.Connected) {
                     s.copy(link = LinkState.Idle, carLife = CarLifeState.Idle)
@@ -949,7 +1098,7 @@ object HyperCarRepo {
         }
         push(link = LinkState.Stopping)
         val hadLink = sessionHadLink
-        releaseSessionResources(keepAlive = shouldAutoReconnect(hadLink))
+        releaseSessionResources(keepAlive = diagnosticOwned.get() || shouldAutoReconnect(hadLink))
         log("SESSION: 已断开（$reason）")
         _snapshots.update { s ->
             s.copy(
@@ -974,7 +1123,7 @@ object HyperCarRepo {
      * iap2 监听一起停了（见 releaseSessionResources），若车机 ACL 一直没断，就再也不会
      * 有 ACL_CONNECTED 广播进来 —— 表现就是"断了之后再也连不上，必须手动点连接"。
      */
-    private fun shouldAutoReconnect(hadLink: Boolean): Boolean = hadLink && !userDisconnectRequested &&
+    private fun shouldAutoReconnect(hadLink: Boolean): Boolean = !diagnosticOwned.get() && hadLink && !userDisconnectRequested &&
         SettingsStore.autoConnect && reconnectAttempts < MAX_RECONNECT_ATTEMPTS
 
     private fun scheduleAutoReconnect(reason: String, hadLink: Boolean) {
@@ -1548,6 +1697,27 @@ object HyperCarRepo {
     // ---------------------------------------------------------------- Rust 回调
 
     private val rustListener = object : RustCoreBridge.EventListener {
+        override fun onTranscodeInput(generation:Long,sourceWidth:Int,sourceHeight:Int,targetWidth:Int,targetHeight:Int,ptsUs:Long,data:ByteArray):Boolean {
+            var accepted=false
+            nativeGate.ifCurrent(generation) {
+                if(!sessionLive.get())return@ifCurrent
+                var current=codecWorker
+                if(current==null || current.first!=generation) {
+                    current?.second?.close()
+                    val worker=io.github.hypercar.diagnostics.HardwareVideoTranscoder(sourceWidth,sourceHeight,targetWidth,targetHeight,SettingsStore.carlifeFps,
+                        output={p->nativeGate.isCurrent(generation) && RustCoreBridge.nativeSubmitTranscodedVideo(generation,targetWidth,targetHeight,p.ptsUs,p.data)},
+                        failed={reason->scope.launch {nativeGate.ifCurrent(generation){fail("硬件转码：$reason",allowReconnect=false)}}},trace={line->if(nativeGate.isCurrent(generation))log("TRANSCODE[$generation]: $line")})
+                    current=generation to worker;codecWorker=current;worker.start()
+                }
+                if(!current.second.matchesDimensions(sourceWidth,sourceHeight,targetWidth,targetHeight)) {
+                    log("VIDEO: 硬件转码尺寸改变，停止本轮以免复用旧编码器")
+                    return@ifCurrent
+                }
+                accepted=current.second.offer(io.github.hypercar.diagnostics.VideoEvidence.Packet(ptsUs,data))
+            }
+            return accepted
+        }
+
         override fun onState(generation: Long, state: String, detail: String) {
             nativeGate.ifCurrent(generation) { onCurrentState(generation, state, detail) }
         }
@@ -1556,7 +1726,15 @@ object HyperCarRepo {
             if (!sessionLive.get()) return
             mediaEvidence.state(state)
             connectionTrace?.event("native.$state", "generation=$generation $detail") ?: log("CORE: [$state] $detail")
+            diagnosticWait?.let {waiter ->
+                when(state) {
+                    "diagnostic_complete"->waiter.complete(Unit)
+                    "failed","ended","diagnostic_blocked","diagnostic_capture_failed"->waiter.completeExceptionally(IllegalStateException(detail))
+                }
+                return
+            }
             when (state) {
+                "video_keyframe_requested" -> {if(detail=="hardware")codecWorker?.takeIf{it.first==generation}?.second?.requestKeyframe()}
                 "starting" -> {
                     lastVideoFrames = 0L
                     lastFrameProgressAt = 0L
@@ -1852,6 +2030,7 @@ object HyperCarRepo {
         val trace = connectionTrace
         if (carLifeSession !== owner || !owner.isOpen) return
         val context = appContext() ?: return
+        if(diagnosticOwned.get()) {diagnosticWait?.completeExceptionally(IllegalStateException(reason));fail(reason,allowReconnect=false);return}
         sourceRecovery.lost(
             isCurrent = { connectionTrace === trace && carLifeSession === owner && owner.isOpen &&
                 sessionLive.get() && !userDisconnectRequested },
@@ -1888,6 +2067,7 @@ object HyperCarRepo {
 
     /** Runs the same source binding without a car; never changes the experimental startup setting. */
     fun startVivoSourceCheck(context: Context) {
+        if(diagnosticOwned.get()) {_sourceCheckStatus.value="综合诊断正在使用来源，请先停止该诊断";return}
         init(context)
         if (connecting || streaming) {
             _sourceCheckStatus.value = "请先停止车机连接，再检查来源"
@@ -2330,6 +2510,11 @@ object HyperCarRepo {
     }
 
     fun onKeepAliveLost(ticketId: Long) {
+        if(diagnosticOwned.get() && keepAliveTicket?.id==ticketId) {
+            log("DIAGNOSTIC: 前台保活丢失，停止批次并保留未确认结果")
+            batchController?.cancel()
+            return
+        }
         val ownerTrace = connectionTrace
         scope.launch {
             if (keepAliveTicket?.id == ticketId && connectionTrace === ownerTrace && sessionLive.get()) {
@@ -2339,13 +2524,14 @@ object HyperCarRepo {
     }
 
     private fun fail(reason: String, allowReconnect: Boolean = true, keepAliveUntilRetry: Boolean = false) {
+        diagnosticWait?.completeExceptionally(IllegalStateException(reason))
         connectionTrace?.event("connect.failed", "reason=$reason sourceBinding=${carLifeSession?.hasRenderer} videoFrames=$lastVideoFrames boundNetwork=$boundNetwork")
         sessionLive.set(false)
         log("SESSION 失败: $reason")
         val hadLink = sessionHadLink
         // 失败即停蓝牙/WiFi 侧（保留 Failed 状态给 UI）：否则 iAP2 出站循环会继续每 3s
         // 断一次车机音频配置文件，还占着 RFCOMM 监听，下一次上车也会被旧会话拖住。
-        releaseSessionResources(keepAlive = keepAliveUntilRetry || (allowReconnect && shouldAutoReconnect(hadLink)))
+        releaseSessionResources(keepAlive = diagnosticOwned.get() || keepAliveUntilRetry || (allowReconnect && shouldAutoReconnect(hadLink)))
         _snapshots.value = _snapshots.value.copy(
             link = LinkState.Failed(reason),
             carLife = CarLifeState.Idle,

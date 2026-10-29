@@ -67,6 +67,16 @@ mod srp6a;
 mod timing;
 #[path = "../../src/video_pipeline.rs"]
 mod video_pipeline;
+#[path = "../../src/video_compat.rs"]
+mod video_compat;
+#[path = "../../src/video_capture.rs"]
+mod video_capture;
+#[path = "../../src/diagnostic_video.rs"]
+mod diagnostic_video;
+#[path = "../../src/video_transform.rs"]
+mod video_transform;
+#[path = "../../src/video_recovery.rs"]
+mod video_recovery;
 #[path = "../../src/tlv8.rs"]
 mod tlv8;
 
@@ -932,6 +942,11 @@ async fn run(args: Args) -> Result<(), String> {
 
     let cfg = engine::EngineConfig {
         carlife_enabled: true,
+        wait_for_control: false,
+        video_policy: video_compat::VideoPolicy::Original,
+        diagnostic_dir: None,
+        diagnostic_probe: false,
+        diagnostic_replay: None,
         device_id: args.device_id.clone(),
         car_ip,
         airplay_port: addr.port(),
@@ -995,3 +1010,5 @@ async fn run(args: Args) -> Result<(), String> {
 
 
 
+
+pub(crate) fn emit_transcode(_:u32,_:u32,_:u32,_:u32,_:u32,_:u64,_:&[u8])->bool { false }

@@ -108,7 +108,9 @@ async fn switch_and_resume(initial: (u32, u32), label: &str) {
     let stats = Arc::new(Mutex::new(PumpStat::default()));
     let stop = SessionStop::new(8006);
     let readiness = MediaReadiness::new();
-    let pump = tokio::spawn(run_video_pump(initial, ready_rx, event_rx, stats.clone(), stop.clone(), readiness.clone()));
+    let sample_dir=std::env::temp_dir().join(format!("hc-source-epoch-{}",uuid::Uuid::new_v4()));
+    let options=VideoPumpOptions{capture_dir:Some(sample_dir.to_string_lossy().to_string()),capture_source:true,..Default::default()};
+    let pump = tokio::spawn(run_video_pump(initial, ready_rx, event_rx, stats.clone(), stop.clone(), readiness.clone(), options));
     ready.send(ScreenSender::new(writer, ScreenCipher::ChaCha(key), initial.0, initial.1, false)).ok().unwrap();
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert_eq!(stats.lock().frames, 0, "standby is not source video");
@@ -147,6 +149,11 @@ async fn switch_and_resume(initial: (u32, u32), label: &str) {
     assert!(static_frame, "a healthy static source was incorrectly replaced with standby");
     assert_eq!(captured.source_configs, 2, "one config per actual source epoch");
     assert_eq!(captured.source_frames, 18);
+    // Evidence is a complete first source epoch, never mixed with the waiting page or a later epoch.
+    for name in ["source","outgoing"] {
+        assert_eq!(crate::video_capture::read_packets(&sample_dir.join(format!("{name}.packets"))).unwrap().len(),9);
+    }
+    std::fs::remove_dir_all(sample_dir).unwrap();
     if let Ok(directory) = std::env::var("HYPERCAR_VIDEO_EVIDENCE") {
         let directory = std::path::Path::new(&directory);
         std::fs::write(directory.join(format!("{label}-mixed.h264")), captured.all).unwrap();
@@ -175,7 +182,7 @@ async fn negotiated_standby_is_not_replaced_by_stale_settings_or_encoder_request
     let (events, event_rx) = mpsc::unbounded_channel();
     let stats = Arc::new(Mutex::new(PumpStat::default()));
     let stop = SessionStop::new(8007);
-    let pump = tokio::spawn(run_video_pump((2560, 744), ready_rx, event_rx, stats, stop.clone(), MediaReadiness::new()));
+    let pump = tokio::spawn(run_video_pump((2560, 744), ready_rx, event_rx, stats, stop.clone(), MediaReadiness::new(), VideoPumpOptions::default()));
     ready.send(screen).ok().unwrap();
     tokio::time::sleep(Duration::from_millis(80)).await;
     events.send(CarLifeEvent::EncoderResolution { width: 1408, height: 656 }).unwrap();

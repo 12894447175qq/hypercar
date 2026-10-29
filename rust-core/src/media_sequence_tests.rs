@@ -657,6 +657,7 @@ async fn rejected_audio_record_does_not_publish_audio_or_close_video() {
 async fn cancel_audio(during_record: bool, before_start: bool) {
     let (task, receiver, stop) = fixture(true, Some([9; 32])).await;
     let (stage_tx, stage_rx) = tokio::sync::oneshot::channel();
+    let receiver_stop=stop.clone();
     let server = tokio::spawn(async move {
         let mut active = receiver.bootstrap(true).await.unwrap();
         if !before_start {
@@ -676,7 +677,13 @@ async fn cancel_audio(during_record: bool, before_start: bool) {
         tokio::time::timeout(Duration::from_secs(2), async {
             let mut buffered = Vec::new();
             loop {
-                let read = active.control.socket.read(&mut bytes).await.unwrap();
+                let read = match active.control.socket.read(&mut bytes).await {
+                    Ok(n)=>n,
+                    // macOS may reset a cancelled socket with an unread heartbeat reply.
+                    // Both EOF and reset are terminal; never ignore reset before cancellation.
+                    Err(e) if e.kind()==std::io::ErrorKind::ConnectionReset && receiver_stop.is_cancelled()=>break,
+                    Err(e)=>panic!("unexpected receiver failure before cancellation: {e}"),
+                };
                 if read == 0 { break; }
                 buffered.extend_from_slice(&bytes[..read]);
                 for message in parse_rtsp_messages(&mut buffered) {

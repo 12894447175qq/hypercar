@@ -33,6 +33,11 @@ mod srp6a;
 mod tlv8;
 mod timing;
 mod video_pipeline;
+mod video_compat;
+mod video_capture;
+mod diagnostic_video;
+mod video_transform;
+mod video_recovery;
 
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::Arc;
@@ -179,7 +184,7 @@ fn with_env<T>(
         Ok(env) => (env, false),
         Err(_) => (vm.attach_current_thread_as_daemon().ok()?, true),
     };
-    let result = f(&mut env);
+    let result = env.with_local_frame(32, |env| f(env));
     // **必须清理 Pending Java Exception**：JNI 调用失败（如方法签名不对 / 业务异常）后，
     // 异常会挂在这个线程上，下一次该线程的任何 JNI 调用（emit_log / openTcpFd …）都会
     // 立即失败甚至崩——必须 exception_clear 掉（2026-10-25 加固）。
@@ -378,7 +383,7 @@ fn native_start_impl(
             return JNI_FALSE;
         }
     };
-    if owned_stream.is_none() || generation <= 0 {
+    if (owned_stream.is_none() && !cfg.diagnostic_probe && cfg.diagnostic_replay.is_none()) || generation <= 0 {
         emit_log("controlFd 或 generation 非法");
         return JNI_FALSE;
     }
@@ -391,23 +396,22 @@ fn native_start_impl(
     // 的 IO 线程（Dispatchers.IO）直接调进来的，不是 tokio worker，没有线程局部 runtime。
     // 2026-10-23 20:44 的秒崩就死在这一行：日志停在「CORE: 调用 nativeStart」，之后
     // 一条 CORE 都没有（'there is no reactor running' panic → abort）。这里显式 enter()。
-    let control_stream = {
+    let control_stream = if let Some(std_stream) = owned_stream {
         let std_stream = {
-            let std_stream = owned_stream.unwrap();
             let _ = std_stream.set_nonblocking(true);
             let _ = std_stream.set_nodelay(true);
             std_stream
         };
         let _enter = TOKIO_RT.enter();
         match TcpStream::from_std(std_stream) {
-            Ok(s) => s,
+            Ok(s) => Some(s),
             Err(e) => {
                 emit_log(&format!("控制 FD 转换失败: {e}"));
                 return JNI_FALSE;
             }
         }
-    };
-    emit_log("nativeStart: 控制 FD 已注册到 tokio");
+    } else { None };
+    emit_log("nativeStart: socket 所有权检查完成");
 
     let vm = match env.get_java_vm() {
         Ok(vm) => vm,
@@ -437,7 +441,7 @@ fn native_start_impl(
       let _runtime = TOKIO_RT.enter();
       spawn_scoped(stop.clone(), async move {
         let _cleanup = CancelOnDrop(stop_run.clone());
-        emit_state("starting", "核心层引擎已启动");
+        emit_state(if cfg.diagnostic_probe || cfg.diagnostic_replay.is_some() {"diagnostic_starting"} else {"starting"}, "核心层引擎已启动");
         // 新会话接触 CarLife 之前，等待旧任务释放读写中的所有 socket。
         for previous in retired {
             if tokio::time::timeout(std::time::Duration::from_secs(15), previous.wait_idle()).await.is_err() {
@@ -447,9 +451,11 @@ fn native_start_impl(
         }
         RETIRING.lock().retain(|previous| !previous.is_idle());
         if stop_run.is_cancelled() { return; }
-        let result = engine::run_engine(
+        let result = if cfg.diagnostic_probe || cfg.diagnostic_replay.is_some() {
+            diagnostic_video::run(cfg, stop_run).await
+        } else { engine::run_engine(
             cfg,
-            control_stream,
+            control_stream.expect("normal session control socket"),
             factory,
             touch_tx_engine,
             touch_rx,
@@ -460,7 +466,7 @@ fn native_start_impl(
             iap_rx,
             stop_run,
         )
-        .await;
+        .await };
         if let Err(e) = &result {
             emit_log(&format!("引擎退出: {e}"));
             emit_state("failed", e);
@@ -637,3 +643,27 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeBuildIa
 
 
 
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeIsIdle(_env: JNIEnv, _class: JClass) -> jboolean {
+    let _lifecycle=LIFECYCLE.lock();
+    let current=ENGINE.lock().as_ref().is_none_or(|h|h.stop.is_idle());
+    if current && RETIRING.lock().iter().all(|s|s.is_idle()) {JNI_TRUE} else {JNI_FALSE}
+}
+
+pub(crate) fn emit_transcode(sw:u32,sh:u32,tw:u32,th:u32,pts:u64,data:&[u8])->bool {
+    if !session::callback_allowed() || data.len()>video_capture::MAX_PACKET {return false;}
+    let Some(global)=LISTENER.read().clone() else {return false};
+    with_env(|env| {
+        let bytes=env.byte_array_from_slice(data)?;
+        env.call_method(global.as_obj(),"onTranscodeInput","(JIIIIJ[B)Z",&[
+            session::current_id().into(),(sw as jint).into(),(sh as jint).into(),(tw as jint).into(),(th as jint).into(),(pts as jlong).into(),(&bytes).into()])?.z()
+    }).unwrap_or(false)
+}
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSubmitTranscodedVideo(
+    env:JNIEnv,_class:JClass,id:jlong,width:jint,height:jint,pts:jlong,data:JByteArray)->jboolean {
+    if env.get_array_length(&data).unwrap_or(0)>video_capture::MAX_PACKET as i32 {return JNI_FALSE;}
+    let Ok(data)=env.convert_byte_array(data) else {return JNI_FALSE};
+    if video_transform::submit(id,video_transform::Frame{width:width as u32,height:height as u32,pts:pts as u64,data}) {JNI_TRUE} else {JNI_FALSE}
+}

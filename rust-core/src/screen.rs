@@ -33,6 +33,8 @@ use crate::crypto::{chacha_seal, nonce64, Aes128CtrStream};
 use crate::timing::ntp_be;
 use crate::video_pipeline::FrameClock;
 use std::time::Duration;
+use crate::video_compat::VideoPolicy;
+use crate::video_capture::CaptureWriter;
 use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::OwnedWriteHalf;
 
@@ -104,6 +106,9 @@ pub struct ScreenSender {
     logged_first_frame: bool,
     /** HEVC 告警只打印一次。 */
     logged_hevc: bool,
+    policy: VideoPolicy,
+    requested_fps: u32,
+    capture: Option<CaptureWriter>,
 }
 
 impl ScreenSender {
@@ -137,6 +142,9 @@ impl ScreenSender {
             last_pps: None,
             logged_first_frame: false,
             logged_hevc: false,
+            policy: VideoPolicy::Original,
+            requested_fps: 30,
+            capture: None,
         }
     }
 
@@ -150,6 +158,21 @@ impl ScreenSender {
     }
 
     pub fn has_video_config(&self) -> bool { self.config_sent }
+
+    pub fn set_policy(&mut self, policy: VideoPolicy, fps: u32) {
+        if self.policy != policy { self.reset_video_config(); }
+        self.policy = policy; self.requested_fps = fps;
+    }
+
+    pub fn enable_capture(&mut self, directory: &std::path::Path) {
+        if self.capture.is_some() { return; }
+        match CaptureWriter::create(directory, "outgoing") {
+            Ok(capture) => self.capture = Some(capture),
+            Err(error) => crate::emit_state("diagnostic_capture_failed", &error),
+        }
+    }
+
+    pub fn finish_capture(&mut self) {if let Some(capture)=self.capture.as_mut(){capture.finish();}}
 
     pub fn set_size(&mut self, width: u32, height: u32) {
         let w = (width / 2) * 2;
@@ -261,6 +284,12 @@ impl ScreenSender {
             }
         }
         if let (Some(s), Some(p)) = (sps, pps) {
+            let normalized = self.policy.normalize_sps(s, self.requested_fps).map_err(|error| {
+                crate::emit_state("diagnostic_blocked", &error);
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+            })?;
+            if normalized != s { crate::emit_log(&format!("VIDEO: policy={:?} sourceLevel={} outputLevel={} knownConstraintsChecked=true bitrateCompliance=unverified", self.policy, s[3], normalized[3])); }
+            let s = normalized.as_slice();
             let changed = self.last_sps.as_deref() != Some(s) || self.last_pps.as_deref() != Some(p);
             if changed {
                 let avcc = build_avcc(s, p);
@@ -277,6 +306,13 @@ impl ScreenSender {
 
         // 打包「4 字节 BE 长度前缀 NAL 序列」（SPS/PPS 已经走 VideoConfig，不进帧体）
         let mut plain = Vec::with_capacity(annexb.len());
+        let idr = nals.iter().any(|n| nal_type(n) == 5);
+        if idr && self.policy.inline_headers() {
+            for nal in [self.last_sps.as_deref(), self.last_pps.as_deref()].into_iter().flatten() {
+                plain.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+                plain.extend_from_slice(nal);
+            }
+        }
         for &nal in &nals {
             let kind = nal_type(nal);
             if kind == 7 || kind == 8 {
@@ -313,6 +349,18 @@ impl ScreenSender {
         wire.extend_from_slice(&header);
         wire.extend_from_slice(&body);
         self.write_wire(&wire).await?;
+        if let Some(capture) = self.capture.as_mut().filter(|c| c.is_recording()) {
+            let mut packet = Vec::with_capacity(annexb.len() + 128);
+            if idr {
+                for nal in [self.last_sps.as_deref(), self.last_pps.as_deref()].into_iter().flatten() {
+                    packet.extend_from_slice(&[0,0,0,1]); packet.extend_from_slice(nal);
+                }
+            }
+            for nal in &nals {
+                if !matches!(nal_type(nal), 7 | 8) { packet.extend_from_slice(&[0,0,0,1]); packet.extend_from_slice(nal); }
+            }
+            capture.record(&packet, pts_us);
+        }
 
         self.frames = self.frames.wrapping_add(1);
         self.bytes = self.bytes.wrapping_add(plain.len() as u64);

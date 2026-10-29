@@ -86,6 +86,22 @@ pub struct EngineConfig {
     /// 语音助手于是报「麦克风有问题」（现场 2026-10-24 定位）。
     #[serde(default)]
     pub voice: u32,
+    #[serde(default)]
+    pub video_policy: crate::video_compat::VideoPolicy,
+    #[serde(default)]
+    pub diagnostic_dir: Option<String>,
+    #[serde(default)]
+    pub diagnostic_probe: bool,
+    #[serde(default)]
+    pub diagnostic_replay: Option<String>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct VideoPumpOptions {
+    pub policy: crate::video_compat::VideoPolicy,
+    pub fps: u32,
+    pub capture_dir: Option<String>,
+    pub capture_source: bool,
 }
 
 fn default_true() -> bool {
@@ -189,15 +205,42 @@ pub async fn run_engine(
             }
         });
     }
+    let transcode = cfg.video_policy == crate::video_compat::VideoPolicy::HardwareTranscode;
+    let _recovery=crate::video_recovery::register(stop.clone(),transcode);
+    let transform_target=Arc::new(Mutex::new(None::<(u32,u32)>));
     // ---- 分发器：CarLife 事件 → 视频泵 / 音频泵 ----
     let (video_tx, video_rx) = mpsc::unbounded_channel::<CarLifeEvent>();
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<CarLifeEvent>();
+    if transcode {
+        let (lease,mut output)=crate::video_transform::register(stop.clone());
+        let tx=video_tx.clone();
+        spawn_scoped(stop.clone(),async move {
+            let _lease=lease;
+            let mut actual_size=None;
+            while let Some(frame)=output.recv().await {
+                crate::video_recovery::observe(crate::session::current_id(),&frame.data,true);
+                let actual=crate::screen::annexb_nals(&frame.data).into_iter().find(|n|crate::screen::nal_type(n)==7)
+                    .and_then(|s|crate::video_compat::SpsInfo::parse(s).ok());
+                if let Some(s)=actual {actual_size=Some((s.width,s.height));}
+                let (width,height)=actual_size.unwrap_or((frame.width,frame.height));
+                if (width,height)!=(frame.width,frame.height) {emit_log(&format!("TRANSCODE: 使用实际SPS尺寸 {width}x{height}，编码请求为 {}x{}",frame.width,frame.height));}
+                let _=tx.send(CarLifeEvent::EncoderResolution{width,height});
+                if tx.send(CarLifeEvent::VideoFrame{source_timestamp:(frame.pts/1000) as u32,data:frame.data}).is_err(){return;}
+            }
+        });
+    }
     {
+        let target=transform_target.clone();
+        let mut raw_capture=if transcode {cfg.diagnostic_dir.as_ref().and_then(|p|crate::video_capture::CaptureWriter::create(std::path::Path::new(p),"source").ok())} else {None};
+        let clock=std::time::Instant::now();let mut dimensions=(cfg.width,cfg.height);
+        let mut source=SourceVideoBuffer::new(cfg.width,cfg.height);
+        let mut codec_pts=0u64;
         let stop_d = stop.clone();
         spawn_scoped(stop.clone(), async move {
             loop {
                 tokio::select! {
                     _ = stop_d.notified() => return,
+                    _ = tokio::time::sleep(Duration::from_millis(16)), if transcode => {},
                     ev = life_events.recv() => match ev {
                         Some(ev) => {
                             let to_audio = matches!(
@@ -215,7 +258,21 @@ pub async fn run_engine(
                             if to_audio {
                                 if audio_tx.send(ev).is_err() { return; }
                             } else if to_video {
-                                if video_tx.send(ev).is_err() { return; }
+                                if transcode {
+                                    match ev {
+                                        CarLifeEvent::EncoderResolution{width,height}=>{dimensions=(width,height);source.set_size(width,height);},
+                                        CarLifeEvent::VideoFrame{data,..}=>{
+                                            if let Some(info)=crate::screen::annexb_nals(&data).into_iter().find(|n|crate::screen::nal_type(n)==7).and_then(|s|crate::video_compat::SpsInfo::parse(s).ok()) {
+                                                dimensions=(info.width,info.height);
+                                            }
+                                            let pts=clock.elapsed().as_micros() as u64;
+                                            if let Some(c)=raw_capture.as_mut(){c.record(&data,pts);}
+                                            source.push(data);
+                                        },
+                                        CarLifeEvent::ClientLeft{video:true}=>{emit_state("ended","转码来源断开，需要新会话重新配置解码器");stop_d.cancel();return;},
+                                        _=>{}
+                                    }
+                                } else if video_tx.send(ev).is_err() { return; }
                             } else {
                                 match ev {
                                     CarLifeEvent::Handshake => emit_log("CARLIFE: 握手完成"),
@@ -226,6 +283,17 @@ pub async fn run_engine(
                         None => return,
                     },
                 }
+                let negotiated=*target.lock();
+                if transcode {
+                    if let Some((tw,th))=negotiated {
+                        while let Some(data)=source.pop() {
+                            codec_pts=codec_pts.saturating_add(1_000_000/cfg.fps.max(1) as u64);
+                            if !crate::emit_transcode(dimensions.0,dimensions.1,tw,th,codec_pts,&data) {
+                                emit_state("ended","硬件转码输入失败；保留原厂组件，停止本轮");stop_d.cancel();return;
+                            }
+                        }
+                    }
+                }
             }
         });
     }
@@ -235,12 +303,13 @@ pub async fn run_engine(
     let video_stats = Arc::new(Mutex::new(PumpStat::default()));
     let initial_size = (cfg.width, cfg.height);
     let media_readiness = MediaReadiness::new();
+    let video_options = VideoPumpOptions { policy: cfg.video_policy, fps: cfg.fps, capture_dir: cfg.diagnostic_dir.clone(), capture_source: !transcode };
     {
         let stop_v = stop.clone();
         let stats = video_stats.clone();
         let readiness = media_readiness.clone();
         spawn_scoped(stop.clone(), async move {
-            run_video_pump(initial_size, screen_ready_rx, video_rx, stats, stop_v, readiness).await;
+            run_video_pump(initial_size, screen_ready_rx, video_rx, stats, stop_v, readiness, video_options).await;
         });
     }
     // ---- 音频泵：重采样 + 闪避混音 + RTP ----
@@ -444,6 +513,7 @@ pub async fn run_engine(
     let _timing = outcome.timing;
 
     // 屏幕/音频发送器交给泵
+    *transform_target.lock()=Some(outcome.screen.size());
     let _ = screen_ready_tx.send(outcome.screen);
     hub.allow_video_init();
     if let Some(audio) = outcome.audio {
@@ -565,6 +635,7 @@ pub(crate) async fn run_video_pump(
     stats: Arc<Mutex<PumpStat>>,
     stop_v: Arc<SessionStop>,
     media_readiness: Arc<MediaReadiness>,
+    options: VideoPumpOptions,
 ) {
     let mut sender: Option<ScreenSender> = None;
     let mut source = SourceVideoBuffer::new(initial_size.0, initial_size.1);
@@ -580,6 +651,9 @@ pub(crate) async fn run_video_pump(
     let mut standby_started = std::time::Instant::now();
     let mut standby_tick = 0u32;
     let mut standby_last_idr = std::time::Instant::now();
+    let mut source_capture = options.capture_dir.as_ref().filter(|_| options.capture_source).and_then(|path|
+        crate::video_capture::CaptureWriter::create(std::path::Path::new(path), "source")
+            .map_err(|error| emit_state("diagnostic_capture_failed", &error)).ok());
     loop {
         tokio::select! {
             _ = stop_v.notified() => return,
@@ -612,6 +686,9 @@ pub(crate) async fn run_video_pump(
                     source.set_size(width, height);
                 }
                 Some(CarLifeEvent::VideoFrame { source_timestamp, data }) => {
+                    if let Some(capture) = source_capture.as_mut() {
+                        capture.record(&data, crate::timing::monotonic_nanos() / 1_000);
+                    }
                     if !source_timestamp_logged {
                         source_timestamp_logged = true;
                         emit_log(&format!(
@@ -622,6 +699,8 @@ pub(crate) async fn run_video_pump(
                     source.push(data);
                 }
                 Some(CarLifeEvent::ClientLeft { video: true }) => {
+                    if let Some(capture)=source_capture.as_mut(){capture.finish();}
+                    if let Some(sender)=sender.as_mut(){sender.finish_capture();}
                     source.require_keyframe();
                     showing_standby = true;
                     standby_size_sent = None;
@@ -643,6 +722,7 @@ pub(crate) async fn run_video_pump(
                         if let Some(set) = crate::airplay::standby_for_aspect(standby_canvas.0, standby_canvas.1) {
                             if !set.frames.is_empty() {
                                 if standby_size_sent != Some((set.width, set.height)) {
+                                    s.set_policy(crate::video_compat::VideoPolicy::Original, options.fps.max(1));
                                     s.set_size(set.width, set.height);
                                     s.reset_video_config();
                                     standby_size_sent = Some((set.width, set.height));
@@ -681,6 +761,8 @@ pub(crate) async fn run_video_pump(
         if source.has_pending() {
             if let Some(s) = sender.as_mut() {
                 if showing_standby || s.size() != source.size {
+                    s.set_policy(options.policy, options.fps.max(1));
+                    if let Some(path) = options.capture_dir.as_ref() { s.enable_capture(std::path::Path::new(path)); }
                     s.set_size(source.size.0, source.size.1);
                     s.reset_video_config();
                     showing_standby = false;

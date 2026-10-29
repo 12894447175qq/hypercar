@@ -12,10 +12,10 @@ val appVersionName = "0.1.1"
 
 // CI 构建号：`-Phypercar.buildNumber=<github.run_number>`（CI 每次 push 传入）。
 //   versionName = 0.1.1.<N>、versionCode = base*10000 + N —— 每次推送 +1，可覆盖安装。
-// 本地车测版本 0.1.1.7 / 50007；CI 仍按 run_number 累计。
+// 本地车测版本 0.1.1.8 / 50008；CI 仍按 run_number 累计。
 val buildNumber: Int? = providers.gradleProperty("hypercar.buildNumber").orNull?.toIntOrNull()
 val baseVersionCode = 5
-val localBuildNumber = 7
+val localBuildNumber = 8
 
 // Local test APKs must not need signing questions or machine-specific setup.
 // A configured key always wins. CI/formal builds still require that configuration.

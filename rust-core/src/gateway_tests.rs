@@ -9,6 +9,29 @@ async fn command(socket: &mut TcpStream) -> (u32, Vec<u8>) {
 }
 
 #[tokio::test]
+async fn keyframe_recovery_writes_pause_start_once_and_never_restarts_after_cancel() {
+    let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut md=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();let(hu,_)=listener.accept().await.unwrap();
+    let(events,_)=mpsc::unbounded_channel();let stop=SessionStop::new(9009);
+    let _lease=crate::video_recovery::register(stop.clone(),false);
+    let (_,ready)=tokio::sync::watch::channel(true);
+    let first=Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handler=tokio::spawn(handle_cmd_client(hu,events,Arc::new(Mutex::new((1280,720))),30,0,"test".into(),"test".into(),stop.clone(),first.clone(),ready));
+    assert_eq!(command(&mut md).await.0,0x18001);
+    // Enter the encoder-start boundary with the phone's real protocol message ID.
+    md.write_all(&[0,0,0,0,0,1,0,8]).await.unwrap();
+    assert_eq!(command(&mut md).await.0,0x18009);assert_eq!(command(&mut md).await.0,0x1801d);
+    first.store(true,std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(crate::video_recovery::request(stop.id),Some(false));
+    assert_eq!(crate::video_recovery::request(stop.id),None);
+    let restart=tokio::time::timeout(Duration::from_secs(2),async {let a=command(&mut md).await;let b=command(&mut md).await;(a.0,b.0)}).await.unwrap();
+    assert_eq!(restart,(0x1800a,0x18009));
+    stop.cancel();assert_eq!(crate::video_recovery::request(stop.id),None);
+    assert_eq!(command(&mut md).await.0,0x1800a);handler.await.unwrap();
+    assert_eq!(md.read(&mut [0u8;1]).await.unwrap(),0);
+}
+
+#[tokio::test]
 async fn encoder_init_waits_for_airplay_geometry_and_cancellation_closes_waiters() {
     for cancelled in [false, true] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

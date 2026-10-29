@@ -789,6 +789,11 @@ async fn handle_cmd_client(
                 return;
             }
             _ = tick.tick() => {
+                if hs.encoder_start_sent && crate::video_recovery::take(stop.id) {
+                    let paused=send_cmd(&mut wr,CMD_VIDEO_ENCODER_PAUSE,&[]).await;
+                    let started=send_cmd(&mut wr,CMD_VIDEO_ENCODER_START,&[]).await;
+                    emit_log(&format!("CARLIFE: bounded_keyframe_restart pauseWritten={paused} startWritten={started}；等待新IDR，不代表已恢复画面"));
+                }
                 if !hs.encoder_start_sent {
                     emit_log(&format!("CARLIFE: 握手进行中（{}）", hs.phase_name()));
                 } else if !first_frame.load(std::sync::atomic::Ordering::Relaxed)
@@ -1403,6 +1408,7 @@ async fn handle_media_client(
                                 matches!(crate::screen::nal_type(nal), 1 | 5)) {
                                 first_frame.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
+                            crate::video_recovery::observe(crate::session::current_id(), &payload, false);
                             let _ = events.send(CarLifeEvent::VideoFrame {
                                 source_timestamp: ts_ms,
                                 data: payload,

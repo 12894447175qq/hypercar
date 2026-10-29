@@ -57,6 +57,7 @@ object RustCoreBridge {
 
         fun onLog(generation: Long, line: String)
         fun onIap(generation: Long, bytes: ByteArray)
+        fun onTranscodeInput(generation:Long, sourceWidth:Int, sourceHeight:Int, targetWidth:Int, targetHeight:Int, ptsUs:Long, data:ByteArray):Boolean = false
 
         /** 统计心跳（约 1s 一次）：fps/frames/kbps/音频闪避。 */
         fun onStats(generation: Long, fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean)
@@ -87,6 +88,8 @@ object RustCoreBridge {
      */
     external fun nativeStart(configJson: String, controlFd: Int, socketProvider: SocketProvider, generation: Long): Boolean
 
+    external fun nativeIsIdle():Boolean
+    external fun nativeSubmitTranscodedVideo(generation:Long,width:Int,height:Int,ptsUs:Long,data:ByteArray):Boolean
     external fun nativeStop()
     external fun nativeSendIap(generation: Long, bytes: ByteArray): Boolean
     external fun nativeControlReady(generation: Long): Boolean
