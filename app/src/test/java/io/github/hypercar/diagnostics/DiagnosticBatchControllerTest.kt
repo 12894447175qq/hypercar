@@ -11,6 +11,25 @@ import org.junit.Assert.*
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class DiagnosticBatchControllerTest {
+    @Test fun ordinaryConnectionsBeforePreflightAndCarTrialsNeedNoManualDisconnect()=runTest {
+        val root=Files.createTempDirectory("hc-auto-takeover").toFile()
+        try {
+            val ports=Ports().apply{takeover=io.github.hypercar.session.DiagnosticTakeover(Any(),java.util.concurrent.atomic.AtomicBoolean());ordinaryConnected=true}
+            val c=DiagnosticBatchController(root,"test",ports,this)
+            c.startPreflight();advanceUntilIdle();assertFalse(ports.ordinaryConnected)
+            assertTrue(c.state.value.trials.all{it.localPassed})
+            assertTrue(ports.takeover!!.automatic{ports.ordinaryConnected=true})
+            c.confirmSource(true);c.startVehicleTrials();runCurrent()
+            for(policy in VideoStrategy.entries) {
+                assertFalse(ports.ordinaryConnected)
+                assertEquals(policy,c.state.value.current)
+                assertFalse(ports.takeover!!.automatic{c.cancel()})
+                c.observe(c.state.value.caseId,"黑屏");advanceTimeBy(3_100);runCurrent()
+            }
+            assertEquals(VideoStrategy.entries,ports.cars.map{it.first})
+            assertFalse(c.state.value.busy);assertEquals(2,ports.retirements)
+        }finally{root.deleteRecursively()}
+    }
     @Test fun failedPreflightsPreserveAndCanExportEarlierSuccessfulSource()=runTest {
         val root=Files.createTempDirectory("hc-keep-source").toFile()
         try {
@@ -88,13 +107,15 @@ class DiagnosticBatchControllerTest {
         }finally{root.deleteRecursively()}
     }
     private class Ports:DiagnosticPorts {
+        var takeover:io.github.hypercar.session.DiagnosticTakeover?=null
+        var ordinaryConnected=false;var retirements=0
         var blockReplay:VideoStrategy?=null
         var failProbe=false
         var failClaim=false
         var failRelease=false
         var claims=0;var releases=0;var stops=0;var blockProbe=false;var saved:VideoStrategy?=null
         val cars=mutableListOf<Pair<VideoStrategy,Boolean>>()
-        override suspend fun claim(){claims++;if(failClaim)error("another connection owns resources")}
+        override suspend fun claim(){claims++;if(failClaim)error("another connection owns resources");takeover?.acquire({ordinaryConnected=false;retirements++},{},{})}
         override suspend fun probe(directory:File){directory.mkdirs();if(failProbe)throw IllegalStateException("source failed password=secret-value",IllegalArgumentException("underlying failure"));if(blockProbe)awaitCancellation();File(directory,"source.packets").writeText("test fixture")}
         override suspend fun replay(input:File,directory:File,policy:VideoStrategy){assertTrue(input.isFile);directory.mkdirs();if(policy==blockReplay)awaitCancellation()}
         override suspend fun decode(sample:File,metadata:File,directory:File):JSONObject {
@@ -104,7 +125,7 @@ class DiagnosticBatchControllerTest {
         override suspend fun transcode(input:File,metadata:File,directory:File)=input
         override suspend fun connect(policy:VideoStrategy,directory:File,audio:Boolean){cars.add(policy to audio)}
         override suspend fun stop(){stops++}
-        override fun release(){releases++;if(failRelease)error("resource release failed")}
+        override fun release(){releases++;takeover?.release{};if(failRelease)error("resource release failed")}
         override fun logs()=if(failProbe)emptyList()else listOf("test log")
         override fun save(policy:VideoStrategy){saved=policy}
         override suspend fun export(directory:File)="test.zip"

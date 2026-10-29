@@ -31,21 +31,21 @@ import io.github.hypercar.session.HyperCarRepo
         Surface(modifier=Modifier.fillMaxSize().padding(12.dp),shape=MaterialTheme.shapes.large) {
             Column(Modifier.padding(16.dp).verticalScroll(rememberScrollState()),verticalArrangement=Arrangement.spacedBy(8.dp)) {
                 Text("视频综合诊断",style=MaterialTheme.typography.titleLarge)
-                Text("先在手机确认来源画面，再到车旁轮测。请停车操作；画面、声音、触控分别确认。关闭此窗口不会停止正在运行的测试。")
+                Text("已连接也可以开始：程序会自动接管、结束旧会话并切换视频方案，无需去首页反复断开。请停车操作；关闭此窗口不会停止测试。")
                 Text("本批次的步骤和每轮协议日志独立保存，不受普通日志暂停或清空影响；达到容量会明确标记裁剪。")
                 Text(state.stage,style=MaterialTheme.typography.titleMedium)
                 Text(state.message)
                 Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
-                    Button(onClick={controller.startPreflight()},enabled=!state.busy){Text("新建并开始手机预检")}
+                    Button(onClick={controller.startPreflight()},enabled=!state.busy,modifier=Modifier.weight(1f)){Text("开始视频诊断（自动接管）")}
                     OutlinedButton(onClick={controller.cancel()},enabled=state.busy){Text("停止")}
                 }
                 state.sourcePreview?.let {path ->
                     val bitmap=remember(path){BitmapFactory.decodeFile(path)}
                     bitmap?.let {Image(it.asImageBitmap(),"真实来源视频解码首帧",Modifier.fillMaxWidth().heightIn(max=240.dp))}
                     Text("请按图片实际内容选择；若为原厂协议页，请在原厂界面处理。")
-                    Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(onClick={controller.confirmSource(true)},enabled=!state.busy && !state.restored){Text("是正常 Jovi 桌面")}
-                        OutlinedButton(onClick={controller.confirmSource(false)},enabled=!state.busy && !state.restored){Text("提示页 / 黑屏")}
+                    Column(verticalArrangement=Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick={controller.confirmSource(true);controller.startVehicleTrials()},enabled=!state.busy && !state.restored,modifier=Modifier.fillMaxWidth()){Text("预览正常，开始 A → E 车测")}
+                        OutlinedButton(onClick={controller.confirmSource(false)},enabled=!state.busy && !state.restored,modifier=Modifier.fillMaxWidth()){Text("预览是提示页 / 黑屏")}
                     }
                 }
                 HorizontalDivider()
@@ -57,7 +57,7 @@ import io.github.hypercar.session.HyperCarRepo
                         OutlinedButton(onClick={controller.validate(trial.policy,true)},enabled=!state.busy){Text("再连接验证")}
                     }
                 }
-                Button(onClick={controller.startVehicleTrials()},enabled=!state.busy && state.sourceConfirmed && state.trials.any{it.localPassed}){Text("开始 A → E 车机轮测")}
+                Button(onClick={controller.startVehicleTrials()},enabled=!state.busy && state.sourceConfirmed && state.trials.any{it.localPassed}){Text("重新运行 A → E 车测（自动连接）")}
                 if(state.stage.startsWith("观察车机")) {
                     Text("当前车机画面是什么？选择后自动结束本轮并进入下一方案。")
                     val observationToken=state.caseId
@@ -79,7 +79,7 @@ import io.github.hypercar.session.HyperCarRepo
                 state.exportPath?.let {Text(it)}
                 val history=remember(state.id,state.busy,state.exportPath){controller.history()}
                 history.forEach {id->OutlinedButton(onClick={controller.exportHistory(id)},enabled=!state.busy){Text("导出历史：$id")}}
-                Text("普通 vivo 连接也会保存短视频样本，可从下方历史批次导出。未导出的样本会保留；空间不足时停止新增采样。")
+                Text("普通 vivo 连接也会保存短视频样本，可从历史批次导出。未导出的样本会保留；空间不足时停止新增采样。")
                 TextButton(onClick={controller.resetPolicy()},enabled=!state.busy){Text("恢复默认视频策略")}
                 TextButton(onClick={open=false}){Text("关闭窗口")}
             }

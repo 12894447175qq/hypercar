@@ -112,7 +112,12 @@ internal class DiagnosticBatchController(private val root:File,private val versi
         catch(e:CancellationException){journal?.record("$name.cancelled",mapOf("elapsedMs" to (System.nanoTime()-started)/1_000_000),e);throw e}
         catch(e:Exception){journal?.record("$name.failed",mapOf("elapsedMs" to (System.nanoTime()-started)/1_000_000),e);throw e}
     }
-    private suspend fun own() {step("resource.claim"){ports.claim()};claimed=true;ports.attachJournal(journal)}
+    private suspend fun own() {
+        val nextStage=state.value.stage
+        update{it.copy(stage="正在接管连接",message="正在自动结束旧会话并准备诊断，请保持蓝牙和车机 Wi-Fi 开启，无需手动断开")}
+        step("resource.claim"){ports.claim()};claimed=true;ports.attachJournal(journal)
+        update{it.copy(stage=nextStage,message="诊断已接管连接，后续方案由程序自动切换")}
+    }
     fun startPreflight()=execute("preflight") {
         val id="batch-${System.currentTimeMillis()}-${UUID.randomUUID().toString().take(8)}"
         journal?.close();journal=null
@@ -159,7 +164,7 @@ internal class DiagnosticBatchController(private val root:File,private val versi
     fun confirmSource(normal:Boolean) {
         if(!state.value.restored && !state.value.busy && state.value.sourcePreview!=null) {
             journal?.record("user.source_confirmed",mapOf("normalJoviDesktop" to normal,"sourcePreview" to state.value.sourcePreview?.let{File(it).name}))
-            update{it.copy(sourceConfirmed=normal,stage=if(normal)"可开始车测" else "来源画面阻塞",message=if(normal)"到车旁后启动轮测；仅测试已通过本地解码的方案，每轮可能需要重新选择 Apple CarPlay" else "请导出证据，来源提示/黑屏不能当正常桌面")}
+            update{it.copy(sourceConfirmed=normal,stage=if(normal)"可开始车测" else "来源画面阻塞",message=if(normal)"保持车机蓝牙和 Wi-Fi 就绪，程序自动连接并切换方案；车机若弹出确认，选择 Apple CarPlay" else "请导出证据，来源提示/黑屏不能当正常桌面")}
         }
     }
     fun startVehicleTrials() {
@@ -172,7 +177,7 @@ internal class DiagnosticBatchController(private val root:File,private val versi
                 VideoEvidence.reserve(directory)
                 val answer=CompletableDeferred<String>();verdict=answer
                 val token=UUID.randomUUID().toString()
-                update{it.copy(stage="连接车机：${policy.title}",current=policy,caseId=token,message="蓝牙及车机热点就绪后，在车机选择 Apple CarPlay；请停车操作")}
+                update{it.copy(stage="连接车机：${policy.title}",current=policy,caseId=token,message="正在自动连接本轮方案；车机若弹出确认，选择 Apple CarPlay。请停车操作")}
                 val case=File(directory,"car-${policy.wire}-${System.currentTimeMillis()}")
                 journal?.target(case,token,policy.wire)
                 try {

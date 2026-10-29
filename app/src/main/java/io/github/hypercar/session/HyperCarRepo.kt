@@ -70,6 +70,7 @@ object HyperCarRepo {
 
     @Volatile private var activeDiagnosticJournal: io.github.hypercar.diagnostics.DiagnosticJournal? = null
     private val diagnosticOwned = AtomicBoolean(false)
+    private val diagnosticTakeover = DiagnosticTakeover(this,diagnosticOwned)
     @Volatile private var diagnosticRetiringJob: Job? = null
     @Volatile private var diagnosticWait: kotlinx.coroutines.CompletableDeferred<Unit>? = null
     @Volatile private var diagnosticOptions: org.json.JSONObject? = null
@@ -92,18 +93,20 @@ object HyperCarRepo {
                     }.onFailure {journal.record("environment.failed",error=it)}
                 }
                 override suspend fun claim() {
-                    synchronized(HyperCarRepo) {
-                        check(!connecting && !streaming && !sessionLive.get() && !cleanupInProgress && diagnosticRetiringJob?.isCompleted!=false) {"请先停止普通连接，并等待旧任务退出，再开始综合诊断"}
-                        check(diagnosticOwned.compareAndSet(false,true)) {"已有诊断正在运行"}
-                    }
-                    try {
-                        stopVivoSourceCheck();sourceRecovery.cancel();reconnectJob?.cancel();stopNative();awaitCodecExit()
-                        check(withTimeoutOrNull(16_000){while(!RustCoreBridge.nativeIsIdle())delay(50);true}==true) {"旧会话未退出"}
-                        val ticket=HyperCarService.request(context,keepAliveTicket);keepAliveTicket=ticket
-                        check(withTimeoutOrNull(8_000){ticket.ready.await();true}==true) {"综合诊断前台保活未就绪"}
-                    }catch(e:Exception){releaseKeepAlive();diagnosticOwned.set(false);throw e}
+                    diagnosticTakeover.acquire(
+                        retire={
+                            log("DIAGNOSTIC: 已接管连接，自动停止旧会话；蓝牙/Wi-Fi 无需手动断开")
+                            stopVivoSourceCheck();sourceRecovery.cancel();reconnectJob?.cancel();reconnectJob=null
+                            stop()
+                        },
+                        prepare={
+                            val ticket=HyperCarService.request(context,keepAliveTicket);keepAliveTicket=ticket
+                            check(withTimeoutOrNull(8_000){ticket.ready.await();true}==true) {"综合诊断前台保活未就绪"}
+                        },
+                        rollback={releaseKeepAlive()},
+                    )
                 }
-                override fun release() {diagnosticWait=null;diagnosticOptions=null;releaseKeepAlive();diagnosticOwned.set(false)}
+                override fun release() = diagnosticTakeover.release {diagnosticWait=null;diagnosticOptions=null;releaseKeepAlive()}
                 override suspend fun stop() {
                     val options=diagnosticOptions
                     activeDiagnosticJournal?.record("cleanup.begin",mapOf("nativeIdle" to RustCoreBridge.nativeIsIdle(),"sourceBound" to carLifeSession?.hasRenderer,"connecting" to connecting))
@@ -572,6 +575,7 @@ object HyperCarRepo {
             // All entrypoints call connect(), which awaits the same foreground-service lease.
             AutoStart.handler = { ctx, device, connected ->
                 val app = ctx.applicationContext
+                val dispatched=diagnosticTakeover.automatic {
                 if (connected) {
                     // 记住刚连上 ACL 的车机：本轮 iAP2 只拨/只收这台，别再去碰
                     // HI-BOX 之类已配对的旧 dongle（每次 RFCOMM 失败都白占栈、添噪音，
@@ -589,6 +593,14 @@ object HyperCarRepo {
                         if (address == aclCarMac) { aclCarMac = null; aclCarName = null }
                     }
                     disconnect()
+                }
+                }
+                if(!dispatched) {
+                    // Retain a stable car identity throughout diagnostic teardown/reconnect.
+                    if(connected && aclCarMac==null) {
+                        aclCarMac=runCatching{device.address}.getOrNull();aclCarName=bluetoothName(device)
+                    }
+                    log("DIAGNOSTIC: 蓝牙状态 connected=$connected，仅记录；诊断负责本轮连接，不触发普通连接或取消批次")
                 }
                 logAclEvent(device, connected)
             }
