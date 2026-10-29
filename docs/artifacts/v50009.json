@@ -1,0 +1,87 @@
+{
+  "sourceCommit": "8660972c3c70775d59c114584711973927abb1de",
+  "sourceWorktreeCleanAtPackaging": true,
+  "apk": "HyperCar-0.1.1.9-v50009-vivo-MIB3-mac-test.apk",
+  "versionCode": 50009,
+  "versionName": "0.1.1.9",
+  "apkBytes": 4891142,
+  "apkSha256": "4254aed85f5a1482cd0bf2549e60123fad388d1b89d75b1d1832cf7946f4c9f2",
+  "certificateSha256": "01020c4ff672bdef9550f9c740285fdaf1f4ae0d70e9296050c0815d1570d5af",
+  "sameSignerAs50008": true,
+  "nativeLibrarySha256": "73f5dda2b62229d659071204e09b0764ea90a7e4658f6c93d86cd7e615722402",
+  "abi": "arm64-v8a",
+  "minSdk": 31,
+  "targetSdk": 34,
+  "checks": {
+    "zipCrc": true,
+    "apkSignatureVerified": true,
+    "zipAlignment16KiB": true,
+    "elfLoadAlignment16KiB": true,
+    "packagedNativeMatchesRebuild": true,
+    "embeddedVcsMatchesSource": true,
+    "jniEntrypointsAndDexCallbacksPresent": true,
+    "jniEntrypoints": [
+      "nativeBuildIap2NavPacket",
+      "nativeControlReady",
+      "nativeInitLogger",
+      "nativeIsIdle",
+      "nativeIsRunning",
+      "nativeSendHardKey",
+      "nativeSendIap",
+      "nativeSendMic",
+      "nativeSendTouch",
+      "nativeSetListener",
+      "nativeStart",
+      "nativeStop",
+      "nativeSubmitTranscodedVideo"
+    ],
+    "syntheticTestFixtureNotBundled": true
+  },
+  "deviceAcceptance": "not run; physical vivo decoder, MediaStore, and MIB3 display/audio/touch/reconnect remain pending",
+  "applicationId": "io.github.hypercar",
+  "builtAtUtc": "2026-10-29T09:05:27.117173+00:00",
+  "validation": {
+    "android": {
+      "tests": 99,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "suites": 21,
+    "lint": {
+      "Warning": 30,
+      "Information": 2
+    },
+    "rust": {
+      "executedThisTurn": false,
+      "previousPassingTests": 55,
+      "evidenceReusedFrom": "v50008",
+      "sourceTreeUnchanged": true,
+      "tree": "68236b48a77a5a7457b09a66e022000da6754b8c"
+    },
+    "releaseMinificationBuild": true,
+    "newLogSchemaPresentInDex": true,
+    "deviceTest": "not run; user will install and return diagnostic ZIP",
+    "independentAgentReview": "not performed; self-review"
+  },
+  "releasePublished": false,
+  "preserved": {
+    "vivoJovi": true,
+    "sixPortUidCheck": true,
+    "vendorComponentsDisabled": false
+  },
+  "files": {
+    "mapping.txt.gz": {
+      "bytes": 2062166,
+      "sha256": "13fcb079ce175725a98644542eef0e591f5ad39b79dcc5a52d306f6f786e3c79"
+    },
+    "INSTALL.md": {
+      "bytes": 1116,
+      "sha256": "bfbc994a1ed7a71fa10f735c7e0e4f53397c8969921026142e8deba88fff5f96"
+    },
+    "HyperCar-0.1.1.9-v50009-vivo-MIB3-mac-test.apk": {
+      "bytes": 4891142,
+      "sha256": "4254aed85f5a1482cd0bf2549e60123fad388d1b89d75b1d1832cf7946f4c9f2"
+    }
+  }
+}
