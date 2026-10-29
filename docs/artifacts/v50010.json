@@ -1,0 +1,95 @@
+{
+  "sourceCommit": "8a4945e4a23900674bebf9bd4c3a687395e52139",
+  "sourceWorktreeCleanAtPackaging": true,
+  "apk": "HyperCar-0.1.1.10-v50010-vivo-MIB3-mac-test.apk",
+  "versionCode": 50010,
+  "versionName": "0.1.1.10",
+  "apkBytes": 4910682,
+  "apkSha256": "5984acf4e5dc06107af8d92bc4ac4e758bc1f65979a80672dde889dcb84ab13c",
+  "certificateSha256": "01020c4ff672bdef9550f9c740285fdaf1f4ae0d70e9296050c0815d1570d5af",
+  "sameSignerAs50009": true,
+  "nativeLibrarySha256": "a054c06a85632f03863ee5f345dae99a12197e474e3c6116d86fd0d4bcdb736c",
+  "abi": "arm64-v8a",
+  "minSdk": 31,
+  "targetSdk": 34,
+  "checks": {
+    "zipCrc": true,
+    "apkSignatureVerified": true,
+    "zipAlignment16KiB": true,
+    "elfLoadAlignment16KiB": true,
+    "packagedNativeMatchesRebuild": true,
+    "embeddedVcsMatchesSource": true,
+    "jniEntrypointsAndDexCallbacksPresent": true,
+    "jniEntrypoints": [
+      "nativeBuildIap2NavPacket",
+      "nativeControlReady",
+      "nativeInitLogger",
+      "nativeIsIdle",
+      "nativeIsRunning",
+      "nativeSendHardKey",
+      "nativeSendIap",
+      "nativeSendMic",
+      "nativeSendTouch",
+      "nativeSetListener",
+      "nativeStart",
+      "nativeStop",
+      "nativeSubmitTranscodedVideo"
+    ],
+    "syntheticTestFixtureNotBundled": true
+  },
+  "deviceAcceptance": "not run; physical vivo decoder, MediaStore, and MIB3 display/audio/touch/reconnect remain pending",
+  "validation": {
+    "sourceCommit": "8a4945e4a23900674bebf9bd4c3a687395e52139",
+    "baseline": "d1f395579d052e5f687933bf6596acb17a3de77e",
+    "android": {
+      "android": {
+        "tests": 112,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "suites": 26,
+      "lint": {
+        "Warning": 30,
+        "Information": 2
+      }
+    },
+    "rustTests": 62,
+    "cargoCheck": true,
+    "nativeBuiltThisTurn": true,
+    "selfReviewed": true,
+    "independentAgentReview": false,
+    "phoneConnected": false,
+    "vehicleAccepted": false,
+    "runtimeBlockers": [
+      "OriginOS exact abort policy remains unknown",
+      "Jovi source image content needs raw video evidence",
+      "MIB3 display and audible continuity await vehicle acceptance"
+    ],
+    "changes": [
+      "foreground source launch",
+      "finite full-session source recovery",
+      "PCM jitter buffer and RTP pacing",
+      "nonzero audio state",
+      "Audi vivo default compatibility unless explicit preference",
+      "near-black decoded-frame metrics",
+      "automatic short samples and protected exportable history"
+    ]
+  },
+  "builtAtUtc": "2026-10-29T14:37:42.488652+00:00",
+  "releasePublished": false,
+  "files": {
+    "mapping.txt.gz": {
+      "bytes": 2068887,
+      "sha256": "fd13eae00494d8cd019f1bd4dbf1656fb42f2302aa48270844c0ba68b2c9e513"
+    },
+    "INSTALL.md": {
+      "bytes": 1045,
+      "sha256": "12ad1eff88ac2c0cd4f740c95433e29ce393c26877cc1a23267e6d513a5ec7a3"
+    },
+    "HyperCar-0.1.1.10-v50010-vivo-MIB3-mac-test.apk": {
+      "bytes": 4910682,
+      "sha256": "5984acf4e5dc06107af8d92bc4ac4e758bc1f65979a80672dde889dcb84ab13c"
+    }
+  }
+}
