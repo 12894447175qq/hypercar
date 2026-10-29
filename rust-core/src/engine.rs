@@ -25,6 +25,7 @@ use crate::audio_out::AudioOut;
 use crate::carlife::{CarLifeConfig, CarLifeHub};
 use crate::screen::ScreenSender;
 use crate::video_pipeline::SourceVideoBuffer;
+use crate::media_start::{IapCommand, MediaReadiness};
 
 #[cfg(test)]
 #[path = "video_flow_tests.rs"]
@@ -55,6 +56,9 @@ pub struct EngineConfig {
     pub fps: u32,
     #[serde(default = "default_true")]
     pub enable_audio: bool,
+    /// Opt-in for MIB3. Other receivers retain their previous startup behavior.
+    #[serde(default)]
+    pub wait_for_control: bool,
     #[serde(default)]
     pub keep_alive_stats: bool,
     pub identity_path: String,
@@ -105,7 +109,7 @@ pub async fn run_engine(
     mut key_rx: mpsc::UnboundedReceiver<u32>,
     // 麦克风 PCM 来源（PC 侧联调注入；Android 上为 None）
     mut mic_rx: Option<mpsc::UnboundedReceiver<Vec<i16>>>,
-    iap_rx: mpsc::Receiver<Vec<u8>>,
+    iap_rx: mpsc::Receiver<IapCommand>,
     stop: Arc<SessionStop>,
 ) -> Result<(), String> {
     if stop.is_cancelled() { return Ok(()); }
@@ -230,11 +234,13 @@ pub async fn run_engine(
     let (screen_ready_tx, screen_ready_rx) = tokio::sync::oneshot::channel::<ScreenSender>();
     let video_stats = Arc::new(Mutex::new(PumpStat::default()));
     let initial_size = (cfg.width, cfg.height);
+    let media_readiness = MediaReadiness::new();
     {
         let stop_v = stop.clone();
         let stats = video_stats.clone();
+        let readiness = media_readiness.clone();
         spawn_scoped(stop.clone(), async move {
-            run_video_pump(initial_size, screen_ready_rx, video_rx, stats, stop_v).await;
+            run_video_pump(initial_size, screen_ready_rx, video_rx, stats, stop_v, readiness).await;
         });
     }
     // ---- 音频泵：重采样 + 闪避混音 + RTP ----
@@ -409,6 +415,8 @@ pub async fn run_engine(
         device_id: cfg.device_id.clone(),
         identity_path: cfg.identity_path.clone(),
         enable_audio: cfg.enable_audio && cfg.carlife_enabled,
+        wait_for_control: cfg.wait_for_control,
+        media_readiness,
         keep_alive_stats: cfg.keep_alive_stats,
         width: cfg.width,
         height: cfg.height,
@@ -556,6 +564,7 @@ pub(crate) async fn run_video_pump(
     video_rx: mpsc::UnboundedReceiver<CarLifeEvent>,
     stats: Arc<Mutex<PumpStat>>,
     stop_v: Arc<SessionStop>,
+    media_readiness: Arc<MediaReadiness>,
 ) {
     let mut sender: Option<ScreenSender> = None;
     let mut source = SourceVideoBuffer::new(initial_size.0, initial_size.1);
@@ -567,6 +576,7 @@ pub(crate) async fn run_video_pump(
     let mut source_timestamp_logged = false;
     let mut standby_idx = 0usize;
     let mut standby_size_sent = None;
+    let mut standby_canvas = initial_size;
     let mut standby_started = std::time::Instant::now();
     let mut standby_tick = 0u32;
     let mut standby_last_idr = std::time::Instant::now();
@@ -584,6 +594,15 @@ pub(crate) async fn run_video_pump(
                 if sender.is_none() {
                     emit_log("VIDEO: sender_unavailable，协商未完成或视频交接已关闭");
                     return;
+                }
+                // The negotiated sender already contains the initial standby frame.
+                // Keep that decoder configuration until an actual source keyframe;
+                // neither old UI settings nor encoder requests are video frames.
+                let screen = sender.as_ref().unwrap();
+                standby_canvas = screen.size();
+                if screen.has_video_config() {
+                    standby_size_sent = Some(standby_canvas);
+                    standby_idx = 1;
                 }
                 emit_log("VIDEO: pump_ready，已接收屏幕发送器；等待来源完整 SPS/PPS/IDR，等待页不算来源首帧");
             }
@@ -606,6 +625,7 @@ pub(crate) async fn run_video_pump(
                     source.require_keyframe();
                     showing_standby = true;
                     standby_size_sent = None;
+                    standby_canvas = source.size;
                     emit_log("CARLIFE: 视频来源断开；重连后等待新的来源 IDR，禁止沿用旧参考帧");
                 }
                 Some(_) => {}
@@ -620,7 +640,7 @@ pub(crate) async fn run_video_pump(
                     // An unchanged source can be silent. Keep its last frame until
                     // the source channel actually closes, instead of flashing standby.
                     if showing_standby && !source.has_pending() {
-                        if let Some(set) = crate::airplay::standby_for_aspect(source.size.0, source.size.1) {
+                        if let Some(set) = crate::airplay::standby_for_aspect(standby_canvas.0, standby_canvas.1) {
                             if !set.frames.is_empty() {
                                 if standby_size_sent != Some((set.width, set.height)) {
                                     s.set_size(set.width, set.height);
@@ -678,6 +698,7 @@ pub(crate) async fn run_video_pump(
                             };
                             if frames == 1 {
                                 emit_log(&format!("VIDEO: first_source_frame_written bytes={} size={}x{}；非等待页；接收端是否解码显示仍需实车核对", data.len(), source.size.0, source.size.1));
+                                media_readiness.source_written();
                             }
                         }
                         Ok(false) => {

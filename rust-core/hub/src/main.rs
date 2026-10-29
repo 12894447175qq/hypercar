@@ -59,6 +59,8 @@ mod rtsp;
 mod screen;
 #[path = "../../src/session.rs"]
 mod session;
+#[path = "../../src/media_start.rs"]
+mod media_start;
 #[path = "../../src/srp6a.rs"]
 mod srp6a;
 #[path = "../../src/timing.rs"]

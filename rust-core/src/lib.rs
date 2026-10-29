@@ -28,6 +28,7 @@ mod pairing;
 mod rtsp;
 mod screen;
 mod session;
+mod media_start;
 mod srp6a;
 mod tlv8;
 mod timing;
@@ -66,7 +67,29 @@ struct EngineHandle {
     key_tx: mpsc::UnboundedSender<u32>,
     /// 手机麦克风 PCM → CarLife VR 通道（语音助手用）
     mic_tx: mpsc::UnboundedSender<Vec<i16>>,
-    iap_tx: mpsc::Sender<Vec<u8>>,
+    iap_tx: mpsc::Sender<media_start::IapCommand>,
+}
+
+fn enqueue_iap(stop: &SessionStop, tx: &mpsc::Sender<media_start::IapCommand>, generation: i64, command: media_start::IapCommand) -> bool {
+    stop.id == generation && !stop.is_cancelled() && tx.try_send(command).is_ok()
+}
+
+#[cfg(test)]
+mod control_generation_tests {
+    use super::*;
+    #[test]
+    fn old_or_cancelled_native_callbacks_cannot_release_new_session_audio() {
+        let stop = SessionStop::new(7);
+        let (tx, mut rx) = mpsc::channel(2);
+        assert!(!enqueue_iap(&stop, &tx, 6, media_start::IapCommand::ControlReady));
+        assert!(rx.try_recv().is_err());
+        assert!(enqueue_iap(&stop, &tx, 7, media_start::IapCommand::ControlReady));
+        assert!(matches!(rx.try_recv(), Ok(media_start::IapCommand::ControlReady)));
+        stop.cancel();
+        assert!(!enqueue_iap(&stop, &tx, 7, media_start::IapCommand::ControlReady));
+        assert!(!enqueue_iap(&stop, &tx, 7, media_start::IapCommand::Packet(vec![1])));
+        assert!(rx.try_recv().is_err());
+    }
 }
 
 static ENGINE: Lazy<parking_lot::Mutex<Option<EngineHandle>>> =
@@ -403,7 +426,7 @@ fn native_start_impl(
     let (key_tx, key_rx) = mpsc::unbounded_channel::<u32>();
     // 手机麦克风 → CarLife VR（语音助手要靠车机喂麦克风）
     let (mic_tx, mic_rx) = mpsc::unbounded_channel::<Vec<i16>>();
-    let (iap_tx, iap_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (iap_tx, iap_rx) = mpsc::channel::<media_start::IapCommand>(64);
     let stop = SessionStop::new(generation);
 
     let stop_run = stop.clone();
@@ -499,8 +522,16 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSendIap
     let Ok(bytes) = env.convert_byte_array(packet) else { return JNI_FALSE; };
     let engine = ENGINE.lock();
     let Some(handle) = engine.as_ref() else { return JNI_FALSE; };
-    if handle.stop.id != generation || handle.stop.is_cancelled() { return JNI_FALSE; }
-    if handle.iap_tx.try_send(bytes).is_ok() { JNI_TRUE } else { JNI_FALSE }
+    if enqueue_iap(&handle.stop, &handle.iap_tx, generation, media_start::IapCommand::Packet(bytes)) { JNI_TRUE } else { JNI_FALSE }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeControlReady(
+    _env: JNIEnv, _class: JClass, generation: jlong,
+) -> jboolean {
+    let engine = ENGINE.lock();
+    let Some(handle) = engine.as_ref() else { return JNI_FALSE; };
+    if enqueue_iap(&handle.stop, &handle.iap_tx, generation, media_start::IapCommand::ControlReady) { JNI_TRUE } else { JNI_FALSE }
 }
 
 /// 手机麦克风 PCM（16kHz 单声道 16-bit）→ CarLife VR 通道。

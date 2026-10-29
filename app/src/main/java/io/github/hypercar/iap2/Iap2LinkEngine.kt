@@ -158,6 +158,9 @@ class Iap2LinkEngine(
     /** 诊断：每个出向链路帧的摘要（仅链路层帧，用于对照真车协商时序）。 */
     var onFrameSent: ((control: Int, sequence: Int, ack: Int, sessionId: Int, size: Int) -> Unit)? = null
 
+    /** Complete DETECT markers outside framed payloads, including fragmented input. */
+    var onDetectionMarker: ((Long) -> Unit)? = null
+
     private var unknownSessionDropped = 0
 
     private val unacknowledged = ArrayList<Packet>()
@@ -303,10 +306,18 @@ class Iap2LinkEngine(
     // ---- 接收解析 ----
 
     private fun parseAvailable(nowMillis: Long): Boolean {
-        // 丢弃帧头前的杂字节（含对端 marker FF55…）
+        // Preserve a partial marker; do not search inside validated frame payloads.
         while (receive.size >= 2 &&
             !(receive[0] == 0xFF.toByte() && receive[1] == 0x5A.toByte())
         ) {
+            if (receive[0] == MARKER[0] && receive[1] == MARKER[1]) {
+                if (receive.size < MARKER.size) return false
+                if (receive.peek(MARKER.size).contentEquals(MARKER)) {
+                    receive.discard(MARKER.size)
+                    onDetectionMarker?.invoke(nowMillis)
+                    return true
+                }
+            }
             receive.discard(1)
         }
         if (receive.size < HEADER_BYTES) return false

@@ -280,6 +280,7 @@ object SettingsStore {
             append("\"height\":").append(carlifeHeight.coerceAtLeast(2) / 2 * 2).append(",")
             append("\"fps\":").append(carlifeFps).append(",")
             append("\"enable_audio\":").append(enableAudio).append(",")
+            append("\"wait_for_control\":").append(headUnitProfileId == "audi_mib3").append(",")
             // voice=0：由原厂 CarLife 使用手机麦克风，Hypercar 不重复采集。
             append("\"voice\":0,")
             append("\"keep_alive_stats\":").append(keepAliveStats).append(",")

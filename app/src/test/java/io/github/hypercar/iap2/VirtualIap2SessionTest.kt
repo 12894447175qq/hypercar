@@ -9,14 +9,19 @@ class VirtualIap2SessionTest {
         val output = ArrayDeque<ByteArray>()
         val logs = mutableListOf<String>()
         var clock = 0L
-        val session = VirtualIap2Session({ output.add(it); true }, logs::add, now = { clock }, epoch = { 1_793_106_514_000 })
+        var controlReady = 0
+        val session = VirtualIap2Session({ output.add(it); true }, logs::add, now = { clock }, epoch = { 1_793_106_514_000 }, onControlReady = { controlReady++ })
         var peerSequence = 20
         var phoneSequence = 0
         val seen = mutableListOf<Iap2Csm.Frame>()
 
-        fun connect() {
-            session.arm()
-            assertArrayEquals(Iap2LinkEngine.MARKER, output.removeFirst())
+        fun connect(arm: Boolean = true) {
+            if (arm) {
+                session.arm()
+                assertArrayEquals(Iap2LinkEngine.MARKER, output.removeFirst())
+            } else {
+                output.clear() // The receiver has consumed the fallback SYN.
+            }
             val sync = Iap2LinkEngine.SynchronizationPayload(127, 4096, 1000, 500, 4, 3,
                 listOf(Iap2LinkEngine.SessionDescriptor(1, 0, 1), Iap2LinkEngine.SessionDescriptor(2, 2, 1)))
             session.feed(packet(0x80, peerSequence, 0, 0, sync.encode()))
@@ -64,9 +69,13 @@ class VirtualIap2SessionTest {
         f.receive(0xaa06)
         f.receive(0xaa01, Iap2Csm.param(0, byteArrayOf(1, 2, 3)))
         assertEquals(20, Iap2Csm.parseParams(f.seen.last { it.messageId == 0xaa02 }.body).single().value.size)
+        assertEquals(0, f.controlReady)
         f.receive(0xaa04)
         assertEquals(32, Iap2Csm.parseParams(f.seen.last { it.messageId == 0xaa02 }.body).single().value.size)
         f.receive(0xaa03, Iap2Csm.param(0, byteArrayOf(7)))
+        assertEquals(1, f.controlReady)
+        f.receive(0xaa03, Iap2Csm.param(0, byteArrayOf(7)))
+        assertEquals(1, f.controlReady)
         assertEquals(1, f.seen.count { it.messageId == 0xaa05 })
         assertTrue(f.seen.any { it.messageId == 0x4e0c })
         for ((request, response) in listOf(0x5000 to 0x5001, 0x4157 to 0x4158, 0x4154 to 0x4155, 0x4170 to 0x4171)) {
@@ -91,6 +100,7 @@ class VirtualIap2SessionTest {
         f.receive(0xaa03) // 空应答不能推进成功。
         for (i in 1..3) { f.clock += 3001; f.session.tick(); f.drain() }
         assertFalse(f.seen.any { it.messageId == 0xaa05 })
+        assertEquals(0, f.controlReady)
         assertTrue(f.logs.any { "所有挑战长度" in it })
         val lonely = Fixture()
         lonely.session.arm()
@@ -134,6 +144,38 @@ class VirtualIap2SessionTest {
         f.session.tick()
         assertFalse(f.session.isOpen())
         assertTrue(f.logs.any { "cause=timeout" in it && "peerSync=true" in it })
+    }
+
+    @Test fun repeatedMib3DetectMarkersStartSynchronizationBeforeFirstHeartbeatDeadline() {
+        val f = Fixture()
+        f.session.arm()
+        f.output.clear()
+        f.clock = 100
+        f.session.feed(Iap2LinkEngine.MARKER)
+        f.clock = 1100
+        // Event RTSP boundaries need not coincide with the six-byte marker.
+        Iap2LinkEngine.MARKER.forEach { f.session.feed(byteArrayOf(it)) }
+        val wire = f.output.flatMap { it.toList() }.toByteArray()
+        val sync = (0 until wire.size - 8).firstOrNull {
+            wire[it] == 0xff.toByte() && wire[it + 1] == 0x5a.toByte() &&
+                (wire[it + 4].toInt() and 0x80) != 0
+        }
+        assertNotNull("MIB3 requested our table twice; waiting 6s loses the live session", sync)
+        f.connect(arm = false)
+        f.receive(0x1d01, Iap2Csm.string(0, "Audi-fixture"))
+        assertTrue(f.seen.any { it.messageId == 0x1d02 })
+        f.session.close()
+        f.output.clear()
+        f.session.feed(Iap2LinkEngine.MARKER + Iap2LinkEngine.MARKER)
+        assertTrue(f.output.isEmpty())
+    }
+
+    @Test fun lateMarkersDoNotRestartAnEstablishedControlLink() {
+        val f = Fixture()
+        f.connect()
+        f.output.clear()
+        f.session.feed(Iap2LinkEngine.MARKER + Iap2LinkEngine.MARKER)
+        assertTrue("late markers must not reset a live control session", f.output.isEmpty())
     }
 
     companion object {

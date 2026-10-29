@@ -26,11 +26,12 @@ struct Capture {
     source: Vec<u8>,
     source_frames: usize,
     source_configs: usize,
+    config_sizes: Vec<(u32, u32)>,
 }
 
 async fn receive(mut socket: TcpStream, key: [u8; 32]) -> Capture {
     let expected_sps = annexb_nals(SOURCE).into_iter().find(|n| nal_type(n) == 7).unwrap();
-    let mut output = Capture { all: vec![], source: vec![], source_frames: 0, source_configs: 0 };
+    let mut output = Capture { all: vec![], source: vec![], source_frames: 0, source_configs: 0, config_sizes: vec![] };
     let mut counter = 0;
     let mut source = false;
     let mut last_timestamp = None;
@@ -44,6 +45,10 @@ async fn receive(mut socket: TcpStream, key: [u8; 32]) -> Capture {
         match header[4] {
             1 => {
                 assert_eq!(header[6], 4);
+                output.config_sizes.push((
+                    f32::from_le_bytes(header[16..20].try_into().unwrap()) as u32,
+                    f32::from_le_bytes(header[20..24].try_into().unwrap()) as u32,
+                ));
                 let sps_size = u16::from_be_bytes([body[6], body[7]]) as usize;
                 let sps = &body[8..8 + sps_size];
                 let p = 8 + sps_size;
@@ -102,10 +107,12 @@ async fn switch_and_resume(initial: (u32, u32), label: &str) {
     let (events, event_rx) = mpsc::unbounded_channel();
     let stats = Arc::new(Mutex::new(PumpStat::default()));
     let stop = SessionStop::new(8006);
-    let pump = tokio::spawn(run_video_pump(initial, ready_rx, event_rx, stats.clone(), stop.clone()));
+    let readiness = MediaReadiness::new();
+    let pump = tokio::spawn(run_video_pump(initial, ready_rx, event_rx, stats.clone(), stop.clone(), readiness.clone()));
     ready.send(ScreenSender::new(writer, ScreenCipher::ChaCha(key), initial.0, initial.1, false)).ok().unwrap();
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert_eq!(stats.lock().frames, 0, "standby is not source video");
+    assert!(!readiness.snapshot().source, "standby must not release audio startup");
     let frames = access_units();
     assert_eq!(frames.len(), 9);
     events.send(CarLifeEvent::EncoderResolution { width: 1280, height: 720 }).unwrap();
@@ -114,6 +121,7 @@ async fn switch_and_resume(initial: (u32, u32), label: &str) {
         tokio::time::sleep(Duration::from_millis(15)).await;
     }
     wait_frames(&stats, 8).await;
+    assert!(readiness.snapshot().source);
     // A static screen is allowed to send no changed frames. Do not replace it after 900ms.
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     // A reference frame after that pause must remain decodable, rather than wait for another IDR.
@@ -151,3 +159,29 @@ async fn same_size_source_switch_and_static_frame_recovery() { switch_and_resume
 
 #[tokio::test]
 async fn changed_size_source_switch_and_static_frame_recovery() { switch_and_resume((2560, 744), "changed-size").await; }
+
+#[tokio::test]
+async fn negotiated_standby_is_not_replaced_by_stale_settings_or_encoder_requests() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    let (_, writer) = client.into_split();
+    let key = [13; 32];
+    let capture = tokio::spawn(receive(server, key));
+    let mut screen = ScreenSender::new(writer, ScreenCipher::ChaCha(key), 1280, 720, false);
+    let standby = crate::airplay::standby_for_aspect(1412, 654).unwrap();
+    screen.send_video_annexb(standby.frames[0]).await.unwrap();
+    let (ready, ready_rx) = tokio::sync::oneshot::channel();
+    let (events, event_rx) = mpsc::unbounded_channel();
+    let stats = Arc::new(Mutex::new(PumpStat::default()));
+    let stop = SessionStop::new(8007);
+    let pump = tokio::spawn(run_video_pump((2560, 744), ready_rx, event_rx, stats, stop.clone(), MediaReadiness::new()));
+    ready.send(screen).ok().unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    events.send(CarLifeEvent::EncoderResolution { width: 1408, height: 656 }).unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    stop.cancel();
+    pump.await.unwrap();
+    let output = capture.await.unwrap();
+    assert_eq!(output.config_sizes, vec![(1280, 720)], "do not reconfigure the waiting decoder before a real source IDR");
+}

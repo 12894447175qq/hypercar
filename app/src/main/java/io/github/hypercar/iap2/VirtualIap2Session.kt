@@ -11,6 +11,7 @@ class VirtualIap2Session(
     preferredChallengeBytes: Int = 20,
     private val now: () -> Long = { System.nanoTime() / 1_000_000L },
     private val epoch: () -> Long = { System.currentTimeMillis() },
+    private val onControlReady: () -> Unit = {},
 ) : AutoCloseable {
     private val engine = Iap2LinkEngine()
     private val parser = Iap2Csm.Parser()
@@ -36,6 +37,23 @@ class VirtualIap2Session(
     private var lastReportAt = 0L
     private var reportedState: Iap2LinkEngine.State? = null
     private var earlyBytes = 0
+    private var detectMarkers = 0
+    private var readyNotified = false
+
+    init {
+        engine.onDetectionMarker = { clock ->
+            if (open && armed && engine.state == Iap2LinkEngine.State.NEGOTIATING &&
+                engine.peerSynchronization == null && !initiated) {
+                detectMarkers++
+                log("IAPLINK: peer_detect count=$detectMarkers elapsedMs=${clock - armedAt}")
+                if (detectMarkers >= 2) {
+                    initiated = true
+                    engine.initiate(clock)
+                    log("IAPLINK: 连续两次 DETECT，立即补发本方同步表（CarDeck 协商顺序）")
+                }
+            }
+        }
+    }
     @Synchronized fun isOpen(): Boolean = open
 
     @Synchronized fun arm() {
@@ -108,6 +126,12 @@ class VirtualIap2Session(
             }
         }
         flush()
+        if (open && authenticated && !readyNotified) {
+            readyNotified = true
+            // Queue after all authentication/device-state messages. Native code
+            // acknowledges those transactions before releasing optional audio.
+            onControlReady()
+        }
     }
 
     private fun flush() {

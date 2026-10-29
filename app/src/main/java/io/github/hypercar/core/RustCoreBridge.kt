@@ -89,6 +89,7 @@ object RustCoreBridge {
 
     external fun nativeStop()
     external fun nativeSendIap(generation: Long, bytes: ByteArray): Boolean
+    external fun nativeControlReady(generation: Long): Boolean
 
     /** AirPlay 事件通道解出的车机触摸 → CarLife 0x68001（坐标已在 Rust 侧换算）。 */
     external fun nativeSendTouch(action: Int, x: Int, y: Int)

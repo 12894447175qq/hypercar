@@ -149,6 +149,8 @@ impl ScreenSender {
         (self.width as u32, self.height as u32)
     }
 
+    pub fn has_video_config(&self) -> bool { self.config_sent }
+
     pub fn set_size(&mut self, width: u32, height: u32) {
         let w = (width / 2) * 2;
         let h = (height / 2) * 2;
@@ -202,6 +204,12 @@ impl ScreenSender {
             self.config_counter, self.width, self.height, avcc.get(1).copied().unwrap_or(0),
             avcc.get(3).copied().unwrap_or(0), avcc.len(), fingerprint, self.frame_counter,
         ));
+        let hex: String = avcc.iter().take(256).map(|b| format!("{b:02x}")).collect();
+        crate::emit_log(&format!("VIDEO: codec_parameters configId={} avccHex={hex} truncated={}；仅解码参数，不含画面", self.config_counter, avcc.len() > 256));
+        let macroblocks = (self.width as u32).div_ceil(16) * (self.height as u32).div_ceil(16);
+        if avcc.get(3) == Some(&30) && macroblocks > 1620 {
+            crate::emit_log(&format!("VIDEO: codec_metadata_warning declaredLevel=3.0 canvasMacroblocks={macroblocks} levelMaxFs=1620 fullSpsCheckRequired=true；保持原始码流，未篡改等级"));
+        }
         Ok(())
     }
 

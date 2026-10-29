@@ -265,6 +265,8 @@ async fn fixture(
         device_id: "00:11:22:33:44:55".into(),
         identity_path: String::new(),
         enable_audio,
+        wait_for_control: false,
+        media_readiness: crate::media_start::MediaReadiness::new(),
         keep_alive_stats: false,
         width: 800,
         height: 480,
@@ -309,6 +311,112 @@ async fn drain(stop: &SessionStop) {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn one_late_feedback_reply_does_not_stop_sending_heartbeats_or_end_video() {
+    let (task, receiver, stop) = fixture(false, None).await;
+    let server = tokio::spawn(async move {
+        let mut active = receiver.bootstrap(true).await.unwrap();
+        let first = active.control.next().await;
+        assert_eq!(first.first_line, "POST /feedback RTSP/1.0");
+        // A slow/lost first response must not stop the one-second outbound cadence.
+        for _ in 0..4 {
+            let next = tokio::time::timeout(Duration::from_millis(1800), active.control.next()).await;
+            let Ok(next) = next else { return false; };
+            assert_eq!(next.first_line, "POST /feedback RTSP/1.0");
+            active.control.reply(&next, "200 OK", Value::dict(vec![])).await;
+        }
+        // A now-late CSeq must not satisfy a different pending transaction.
+        active.control.reply(&first, "200 OK", Value::dict(vec![])).await;
+        true
+    });
+    let _outcome = task.await.unwrap().unwrap();
+    let cadence_ok = server.await.unwrap();
+    let alive = !stop.is_cancelled();
+    drain(&stop).await;
+    assert!(cadence_ok && alive, "one lost response killed a live media session or stopped heartbeat transmission");
+}
+
+#[tokio::test]
+async fn silent_receiver_still_has_a_bounded_heartbeat_failure() {
+    let (task, receiver, stop) = fixture(false, None).await;
+    let server_stop = stop.clone();
+    let server = tokio::spawn(async move {
+        let active = receiver.bootstrap(true).await.unwrap();
+        server_stop.notified().await;
+        active
+    });
+    let _outcome = task.await.unwrap().unwrap();
+    let started = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(12), stop.notified()).await.unwrap();
+    assert!(started.elapsed() >= Duration::from_secs(9), "a single request deadline ended the whole session");
+    drain(&stop).await;
+    server.await.unwrap();
+}
+
+async fn gated_audio(source_first: bool, cancel: bool, expire: bool) {
+    let (task, receiver, stop) = fixture(true, Some([9; 32])).await;
+    let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<Arc<crate::media_start::MediaReadiness>>();
+    let server_stop = stop.clone();
+    let server = tokio::spawn(async move {
+        let mut active = receiver.bootstrap(true).await.unwrap();
+        let gate = gate_rx.await.unwrap();
+        let mut audio_setups = 0;
+        loop {
+            let request = tokio::select! {
+                biased;
+                _ = server_stop.notified() => break,
+                message = active.control.next() => message,
+            };
+            if request.first_line.starts_with("SETUP rtsp://") {
+                let state = gate.snapshot();
+                assert!(state.control && state.source, "audio started before control+source readiness");
+                assert!(!cancel && !expire, "cancelled/expired gate sent audio SETUP");
+                audio_setups += 1;
+                active.control.reply(&request, "200 OK", Value::dict(vec![("streams", Value::array(vec![Value::dict(vec![
+                    ("type", Value::int(100)), ("dataPort", Value::int(active.audio.local_addr().unwrap().port() as i64)),
+                ])]))])).await;
+            } else {
+                assert!(matches!(request.first_line.as_str(), "POST /feedback RTSP/1.0" | "RECORD / RTSP/1.0"));
+                active.control.reply(&request, "200 OK", Value::dict(vec![])).await;
+            }
+        }
+        assert_eq!(audio_setups, if cancel || expire { 0 } else { 1 });
+    });
+    let mut outcome = task.await.unwrap().unwrap();
+    let mut audio = outcome.audio.take().unwrap();
+    audio.params.wait_for_control = true;
+    let gate = audio.params.media_readiness.clone();
+    gate_tx.send(gate.clone()).unwrap();
+    let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+    audio.start(ready_tx);
+    if source_first { gate.source_written(); } else { gate.control_ready(); }
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(matches!(ready_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+    assert!(!stop.is_cancelled(), "waiting for milestones must not stop video");
+    if cancel {
+        stop.cancel();
+        gate.source_written(); gate.control_ready(); // Late callbacks cannot resurrect audio.
+        assert!(ready_rx.await.is_err());
+    } else if expire {
+        assert!(tokio::time::timeout(Duration::from_secs(21), ready_rx).await.unwrap().is_err());
+        assert!(!stop.is_cancelled(), "optional audio timeout must preserve video");
+    } else {
+        if source_first { gate.control_ready(); } else { gate.source_written(); }
+        assert!(tokio::time::timeout(Duration::from_secs(2), ready_rx).await.unwrap().is_ok());
+    }
+    drain(&stop).await;
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn audio_waits_for_control_after_source() { gated_audio(true, false, false).await; }
+#[tokio::test]
+async fn audio_waits_for_source_after_control() { gated_audio(false, false, false).await; }
+#[tokio::test]
+async fn cancel_while_waiting_for_control_cannot_start_late_audio() { gated_audio(true, true, false).await; }
+#[tokio::test]
+async fn audio_readiness_timeout_preserves_video() { gated_audio(true, false, true).await; }
 
 #[tokio::test]
 async fn event_connection_precedes_modes_and_screen_setup() {
@@ -563,14 +671,19 @@ async fn cancel_audio(during_record: bool, before_start: bool) {
         }
         stage_tx.send(()).unwrap();
         let mut bytes = [0; 2048];
-        let read = tokio::time::timeout(
-            Duration::from_secs(2),
-            active.control.socket.read(&mut bytes),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(read, 0, "cancelled session wrote another request");
+        // An immediate heartbeat may already be on the wire before cancellation.
+        // It is not a late audio mutation. Drain through EOF and reject any SETUP/RECORD.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut buffered = Vec::new();
+            loop {
+                let read = active.control.socket.read(&mut bytes).await.unwrap();
+                if read == 0 { break; }
+                buffered.extend_from_slice(&bytes[..read]);
+                for message in parse_rtsp_messages(&mut buffered) {
+                    assert_eq!(message.first_line, "POST /feedback RTSP/1.0", "cancelled session wrote a media mutation");
+                }
+            }
+        }).await.unwrap();
         let mut packet = [0; 2048];
         assert!(
             tokio::time::timeout(Duration::from_millis(80), active.audio.recv(&mut packet))

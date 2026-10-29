@@ -476,6 +476,8 @@ object HyperCarRepo {
         reconnectJob?.cancel()
         reconnectJob = null
         if (resetRecoveryBudget) sessionHadLink = false
+        lastVideoFrames = 0L
+        lastFrameProgressAt = 0L
         connecting = true
         sessionLive.set(true)
         connectionTrace = ConnectionTrace("connect", ::log, SystemClock::elapsedRealtime).also {
@@ -1556,11 +1558,17 @@ object HyperCarRepo {
             connectionTrace?.event("native.$state", "generation=$generation $detail") ?: log("CORE: [$state] $detail")
             when (state) {
                 "starting" -> {
+                    lastVideoFrames = 0L
+                    lastFrameProgressAt = 0L
                     if (headUnitProfile.id == io.github.hypercar.headunit.HeadUnitProfiles.AUDI_MIB3.id) {
                         virtualIap = VirtualIap2Session(
                             send = { bytes -> RustCoreBridge.nativeSendIap(generation, bytes) },
                             log = { line -> log("IAP[$generation] $line") },
                             preferredChallengeBytes = headUnitProfile.mfiPreferredChallengeBytes,
+                            onControlReady = {
+                                val accepted = RustCoreBridge.nativeControlReady(generation)
+                                connectionTrace?.event("control.ready_queued", "generation=$generation accepted=$accepted certificateChainValidated=false")
+                            },
                         )
                     }
                 }

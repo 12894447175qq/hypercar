@@ -183,6 +183,7 @@ pub struct RtspChannel {
     write: Arc<tokio::sync::Mutex<OwnedWriteHalf>>,
     cipher: Arc<Mutex<Option<ControlCipher>>>,
     cseq: Arc<Mutex<i32>>,
+    request_order: tokio::sync::Mutex<()>,
     pending: Arc<Mutex<HashMap<i32, oneshot::Sender<RtspMessage>>>>,
     reader: tokio::task::JoinHandle<()>,
 }
@@ -229,6 +230,7 @@ impl RtspChannel {
             write,
             cipher,
             cseq,
+            request_order: tokio::sync::Mutex::new(()),
             pending,
             reader,
         });
@@ -261,8 +263,9 @@ impl RtspChannel {
         timeout: Duration,
     ) -> Result<RtspMessage, String> {
         let started = std::time::Instant::now();
+        let order = self.request_order.lock().await;
         let cseq = self.next_cseq();
-        let traced = method == "SETUP" || method == "RECORD";
+        let traced = method == "SETUP" || method == "RECORD" || cseq <= 16;
         if traced {
             crate::emit_log(&format!("RTSP[{}]: begin CSeq={cseq} {method} {path} bodyBytes={} encrypted={} timeoutMs={}", self.label, body.len(), self.is_encrypted(), timeout.as_millis()));
         }
@@ -292,6 +295,7 @@ impl RtspChannel {
             crate::emit_log(&detail);
             return Err(detail);
         }
+        drop(order); // Never hold request ordering while waiting for a reply.
 
         let result = match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(msg)) => Ok(msg),
@@ -321,6 +325,7 @@ impl RtspChannel {
         body: &[u8],
         content_type: &str,
     ) -> Result<(), String> {
+        let _order = self.request_order.lock().await;
         let cseq = self.next_cseq();
         let head = format!(
             "POST {path} RTSP/1.0\r\n\
@@ -500,6 +505,8 @@ mod tests {
         }).await.unwrap();
         for task in tasks { task.await.unwrap(); }
         assert_eq!(received.iter().filter(|m| !m.is_response()).count(), 128);
+        let request_sequences: Vec<_> = received.iter().filter(|m| !m.is_response()).map(|m| m.cseq().unwrap()).collect();
+        assert_eq!(request_sequences, (1..=128).collect::<Vec<_>>(), "CSeq allocation and wire ordering must agree");
         assert!(received.iter().any(|m| m.status() == 200 && m.cseq() == Some(701)));
         assert_eq!(inbound.recv().await.unwrap().cseq(), Some(701));
         stop.cancel();

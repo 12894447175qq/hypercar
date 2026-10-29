@@ -100,7 +100,10 @@ fn older_configs_keep_source_enabled_and_transport_only_is_explicit() {
     let json = r#"{"device_id":"test","car_ip":"127.0.0.1","airplay_port":7000,"width":640,"height":480,"fps":30,"identity_path":"test"}"#;
     let previous: crate::engine::EngineConfig = serde_json::from_str(json).unwrap();
     assert!(previous.carlife_enabled);
+    assert!(!previous.wait_for_control, "older/non-MIB3 configurations must retain audio startup");
     let explicit = json.replace("\"fps\":30", "\"fps\":30,\"carlife_enabled\":false");
     let only_transport: crate::engine::EngineConfig = serde_json::from_str(&explicit).unwrap();
     assert!(!only_transport.carlife_enabled);
+    let mib3: crate::engine::EngineConfig = serde_json::from_str(&json.replace("\"fps\":30", "\"fps\":30,\"wait_for_control\":true")).unwrap();
+    assert!(mib3.wait_for_control && mib3.carlife_enabled);
 }

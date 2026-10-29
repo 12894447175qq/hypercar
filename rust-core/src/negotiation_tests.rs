@@ -62,7 +62,9 @@ async fn mib3_requires_session_setup_before_resource_command() {
     let params = AirplayParams {
         car_ip: "127.0.0.1".into(), airplay_port: 7000,
         device_id: "00:11:22:33:44:55".into(), identity_path: String::new(),
-        enable_audio: false, keep_alive_stats: false, width: 2560, height: 744,
+        enable_audio: false,
+        wait_for_control: false,
+        media_readiness: crate::media_start::MediaReadiness::new(), keep_alive_stats: false, width: 2560, height: 744,
         touch_display: None, encoder_size: Arc::new(Mutex::new((2560, 744))),
     };
     let outcome = setup_media_session(&channel, &params, Value::dict(vec![]), Some(&[9; 32]), &LoopbackSockets, stop.clone()).await;
@@ -121,6 +123,7 @@ async fn unavailable_info_does_not_probe_authentication_or_erase_known_geometry(
     let params = AirplayParams {
         car_ip: "127.0.0.1".into(), airplay_port: 7000, device_id: "00:11:22:33:44:55".into(),
         identity_path: String::new(), enable_audio: false, keep_alive_stats: false, width: 640, height: 480,
+        wait_for_control: false, media_readiness: crate::media_start::MediaReadiness::new(),
         touch_display: None, encoder_size: Arc::new(Mutex::new((640, 480))),
     };
     let known = Value::dict(vec![("displays", Value::array(vec![Value::dict(vec![

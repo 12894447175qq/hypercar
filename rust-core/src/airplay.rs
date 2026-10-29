@@ -54,6 +54,8 @@ pub struct AirplayParams {
     pub device_id: String,
     pub identity_path: String,
     pub enable_audio: bool,
+    pub wait_for_control: bool,
+    pub media_readiness: Arc<crate::media_start::MediaReadiness>,
     pub keep_alive_stats: bool,
     /// 设置里的 CarLife 编码分辨率（仅作 `/info` 无显示器信息时的兜底）。
     pub width: u32,
@@ -96,6 +98,14 @@ pub struct PendingAudioSetup {
 impl PendingAudioSetup {
     pub fn start(self, ready: tokio::sync::oneshot::Sender<AudioOut>) {
         spawn_scoped(self.stop.clone(), async move {
+            if self.params.wait_for_control {
+                emit_log("MEDIA: audio_deferred wait=control_acknowledged+source_frame timeoutMs=20000；视频与心跳继续");
+                if tokio::time::timeout(Duration::from_secs(20), self.params.media_readiness.ready()).await.is_err() {
+                    emit_log(&format!("MEDIA: audio_skipped readiness_timeout state={:?}；保留视频", self.params.media_readiness.snapshot()));
+                    return;
+                }
+                emit_log("MEDIA: audio_gate_open control_acknowledged=true source_frame_written=true");
+            }
             emit_log("AIRPLAY: 后台协商音频；持续视频与心跳不等待音频应答");
             let Some(audio) = negotiate_audio(
                 &self.channel, &self.factory, self.shared_secret.as_ref(), &self.params,
@@ -124,7 +134,7 @@ pub async fn negotiate(
     factory: Arc<dyn SocketProvider>,
     touch_tx: mpsc::UnboundedSender<TouchInput>,
     key_tx: mpsc::UnboundedSender<u32>,
-    iap_rx: mpsc::Receiver<Vec<u8>>,
+    iap_rx: mpsc::Receiver<crate::media_start::IapCommand>,
     stop: Arc<SessionStop>,
 ) -> Result<AirplayOutcome, String> {
     let (mut channel, _control_inbound) = RtspChannel::spawn(read, write, None, stop.clone());
@@ -286,7 +296,7 @@ async fn negotiate_media(
     factory: Arc<dyn SocketProvider>,
     touch_tx: mpsc::UnboundedSender<TouchInput>,
     key_tx: mpsc::UnboundedSender<u32>,
-    iap_rx: mpsc::Receiver<Vec<u8>>,
+    iap_rx: mpsc::Receiver<crate::media_start::IapCommand>,
     stop: Arc<SessionStop>,
 ) -> Result<AirplayOutcome, String> {
     let MediaSession { info, timing, event_channel, event_rx, keep_alive_port } =
@@ -417,9 +427,8 @@ async fn negotiate_media(
                 let nals = crate::screen::annexb_nals(first);
                 let sps = nals.iter().find(|n| crate::screen::nal_type(n) == 7).copied();
                 let pps = nals.iter().find(|n| crate::screen::nal_type(n) == 8).copied();
-                if let (Some(sps), Some(pps)) = (sps, pps) {
-                    let avcc = crate::screen::build_avcc(sps, pps);
-                    screen.send_config(&avcc).await.map_err(|e| format!("等待页配置写失败 kind={:?} os={:?}: {e}", e.kind(), e.raw_os_error()))?;
+                if sps.is_some() && pps.is_some() {
+                    // send_video_annexb emits the config once, before its IDR.
                     let frame_ok = screen.send_video_annexb(first).await
                         .map_err(|e| format!("等待页首帧写失败 kind={:?} os={:?}: {e}", e.kind(), e.raw_os_error()))?;
                     let cfg_ok = true;
@@ -437,7 +446,7 @@ async fn negotiate_media(
 
 
     // MIB3 虚拟 iAP2：控制通道出站、事件通道入站；与当前引擎一起取消。
-    spawn_iap_sender(channel.clone(), iap_rx, stop.clone());
+    spawn_iap_sender(channel.clone(), iap_rx, stop.clone(), p.media_readiness.clone());
     emit_state("iap_ready", "主屏 SETUP 已完成，可启动虚拟 iAP2 控制链路");
 
     // Activate the video session first. The caller can start its pump as soon as
@@ -758,9 +767,10 @@ mod event_tests {
         let stop = SessionStop::new(82);
         let (control, _) = RtspChannel::spawn(r, w, None, stop.clone());
         let (tx, rx) = mpsc::channel(2);
-        spawn_iap_sender(control, rx, stop.clone());
+        let readiness = crate::media_start::MediaReadiness::new();
+        spawn_iap_sender(control, rx, stop.clone(), readiness.clone());
         let packet = vec![0xff, 0x55, 2, 0, 0xee, 0x10];
-        tx.send(packet.clone()).await.unwrap();
+        tx.send(crate::media_start::IapCommand::Packet(packet.clone())).await.unwrap();
         let mut buffer = Vec::new();
         let request = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -775,9 +785,16 @@ mod event_tests {
         assert_eq!(request.first_line, "POST /command RTSP/1.0");
         assert_eq!(body.get("type").and_then(Value::as_str), Some("iAPSendMessage"));
         assert_eq!(body.get("params").unwrap().get("data").and_then(Value::as_bytes), Some(packet.as_slice()));
+        tx.send(crate::media_start::IapCommand::ControlReady).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!readiness.snapshot().control, "queued is not acknowledged");
+        server.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n", request.cseq().unwrap()).as_bytes()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !readiness.snapshot().control { tokio::task::yield_now().await; }
+        }).await.unwrap();
         stop.cancel();
         tokio::time::timeout(Duration::from_secs(1), stop.wait_idle()).await.unwrap();
-        assert!(tx.send(vec![1]).await.is_err());
+        assert!(tx.send(crate::media_start::IapCommand::Packet(vec![1])).await.is_err());
     }
 }
 
@@ -919,52 +936,121 @@ fn spawn_keepalive_loops(
     }
 
     spawn_scoped(stop.clone(), async move {
-        emit_log("HEARTBEAT: feedback ready intervalMs=1000 timeoutMs=3000");
+        // Keep the 1Hz cadence while individual replies are delayed. At most
+        // three transactions are pending; no reply for 10s ends this session.
+        emit_log("HEARTBEAT: feedback ready intervalMs=1000 requestTimeoutMs=3000 silenceLimitMs=10000 maxPending=3");
+        let (results, mut replies) = mpsc::channel::<Result<crate::rtsp::RtspMessage, String>>(3);
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_ok = tokio::time::Instant::now();
+        let mut last_tick = last_ok;
+        let mut pending = 0usize;
         let mut sent = 0u64;
+        let mut received = 0u64;
         loop {
             tokio::select! {
+                biased;
                 _ = stop.notified() => return,
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-            }
-            let response = channel
-                .request(
-                    "POST",
-                    "/feedback",
-                    &[],
-                    "application/octet-stream",
-                    &[],
-                    Duration::from_secs(3),
-                )
-                .await;
-            if let Ok(ref reply) = response {
-                sent += 1;
-                if sent == 1 || sent % 30 == 0 || reply.status() != 200 {
-                    emit_log(&format!("HEARTBEAT: feedback replies={sent} status={}", reply.status()));
+                response = replies.recv(), if pending > 0 => {
+                    pending -= 1;
+                    match response {
+                        Some(Ok(reply)) if reply.status() == 200 => {
+                            last_ok = tokio::time::Instant::now();
+                            received += 1;
+                            if received <= 8 || received % 30 == 0 {
+                                emit_log(&format!("HEARTBEAT: feedback replies={received} sent={sent} pending={pending} status=200"));
+                                log_feedback_streams(&reply.body);
+                            }
+                        }
+                        other => {
+                            let error = match other {
+                                Some(Ok(reply)) => reply.first_line,
+                                Some(Err(error)) => error,
+                                None => "reply worker closed".into(),
+                            };
+                            emit_log(&format!("HEARTBEAT: feedback_missed pending={pending} lastSuccessAgeMs={} error={error}；继续有限重试", last_ok.elapsed().as_millis()));
+                        }
+                    }
                 }
-            }
-            if let Err(error) = response {
-                let detail = format!("AirPlay feedback 失败：{error}");
-                emit_log(&detail);
-                emit_state("ended", &detail);
-                stop.cancel();
-                return;
+                _ = tick.tick() => {
+                    let gap = last_tick.elapsed();
+                    last_tick = tokio::time::Instant::now();
+                    if gap > Duration::from_millis(2500) {
+                        emit_log(&format!("HEARTBEAT: scheduler_gap_ms={}；需结合网络与系统后台状态", gap.as_millis()));
+                    }
+                    if last_ok.elapsed() >= Duration::from_secs(10) {
+                        let detail = format!("AirPlay feedback 连续10秒无有效应答 sent={sent} replies={received} pending={pending}");
+                        emit_log(&detail);
+                        emit_state("ended", &detail);
+                        stop.cancel();
+                        return;
+                    }
+                    if pending >= 3 { continue; }
+                    pending += 1;
+                    sent += 1;
+                    let channel = channel.clone();
+                    let results = results.clone();
+                    spawn_scoped(stop.clone(), async move {
+                        let reply = channel.request("POST", "/feedback", &[], "application/octet-stream",
+                            &[], Duration::from_secs(3)).await;
+                        let _ = results.send(reply).await;
+                    });
+                }
             }
         }
     });
 }
 
-fn spawn_iap_sender(channel: Arc<RtspChannel>, mut packets: mpsc::Receiver<Vec<u8>>, stop: Arc<SessionStop>) {
+fn log_feedback_streams(body: &[u8]) {
+    if body.is_empty() { return; }
+    let Ok(root) = bplist::parse(body) else {
+        emit_log(&format!("HEARTBEAT: feedback_body_unparsed bytes={}", body.len()));
+        return;
+    };
+    if let Some(streams) = root.get("streams").and_then(Value::as_array) {
+        for stream in streams.iter().take(8) {
+            // Only stream timing/type metadata; never dump arbitrary receiver data.
+            emit_log(&format!("HEARTBEAT: stream type={:?} sampleTime={:?} timestamp={:?}",
+                stream.get("type"), stream.get("sampleTime"), stream.get("timestamp")));
+        }
+    }
+}
+
+fn spawn_iap_sender(
+    channel: Arc<RtspChannel>, mut packets: mpsc::Receiver<crate::media_start::IapCommand>,
+    stop: Arc<SessionStop>, readiness: Arc<crate::media_start::MediaReadiness>,
+) {
     spawn_scoped(stop.clone(), async move {
-        while let Some(packet) = packets.recv().await {
+        let mut sent = 0u64;
+        while let Some(command) = packets.recv().await {
+            let packet = match command {
+                crate::media_start::IapCommand::Packet(bytes) => bytes,
+                crate::media_start::IapCommand::ControlReady => {
+                    readiness.control_ready();
+                    emit_log("IAP: control_ready prior_commands_acknowledged=true certificateChainValidated=false");
+                    continue;
+                }
+            };
             let body = bplist::encode(&Value::dict(vec![
                 ("type", Value::str("iAPSendMessage")),
                 ("params", Value::dict(vec![("data", Value::Data(packet))])),
             ]));
-            if let Err(error) = channel.post_fire_and_forget("/command", &body, "application/x-apple-binary-plist").await {
-                let detail = format!("虚拟 iAP2 控制写失败: {error}");
-                emit_state("ended", &detail);
-                stop.cancel();
-                return;
+            // CarDeck uses the control channel for outbound iAP and observes its
+            // RTSP acknowledgement. This worker never owns the feedback reader.
+            let response = channel.request("POST", "/command", &body,
+                "application/x-apple-binary-plist", &[], Duration::from_secs(10)).await;
+            match response {
+                Ok(reply) if reply.status() == 200 => {
+                    sent += 1;
+                    if sent <= 8 || sent % 30 == 0 { emit_log(&format!("IAP: control_command_ack count={sent} status=200")); }
+                }
+                other => {
+                    let reason = match other { Ok(reply) => reply.first_line, Err(error) => error };
+                    let detail = format!("虚拟 iAP2 控制事务失败: {reason}");
+                    emit_state("ended", &detail);
+                    stop.cancel();
+                    return;
+                }
             }
         }
     });
