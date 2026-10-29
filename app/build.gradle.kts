@@ -15,7 +15,7 @@ val appVersionName = "0.1.1"
 // 本地车测版本 0.1.1.9 / 50009；CI 仍按 run_number 累计。
 val buildNumber: Int? = providers.gradleProperty("hypercar.buildNumber").orNull?.toIntOrNull()
 val baseVersionCode = 5
-val localBuildNumber = 9
+val localBuildNumber = 10
 
 // Local test APKs must not need signing questions or machine-specific setup.
 // A configured key always wins. CI/formal builds still require that configuration.

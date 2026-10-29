@@ -327,24 +327,17 @@ pub async fn run_engine(
             let mut tts_remain: Vec<i16> = Vec::new();
             let mut media_fmt: (u32, u8) = (44_100, 2);
             let mut tts_fmt: (u32, u8) = (16_000, 1);
-            // 48k 立体声混音缓冲
-            let mut media_mix: VecDeque<i16> = VecDeque::with_capacity(48_000 * 2);
-            let mut tts_mix: VecDeque<i16> = VecDeque::with_capacity(48_000 * 2);
+            let mut media_mix = crate::audio_pipeline::AudioBuffer::new(60);
+            let mut tts_mix = crate::audio_pipeline::AudioBuffer::new(20);
+            let mut media_packet = vec![0i16; SPF * 2];
+            let mut tts_packet = vec![0i16; SPF * 2];
+            let mut activity = crate::audio_pipeline::AudioActivity::default();
+            let mut clock: Option<crate::audio_pipeline::AudioClock> = None;
+            let mut skipped_frames = 0u64;
             let mut duck_hold: u32 = 0;
             let mut gain: f32 = 1.0;
-            // 音频发包节拍：**绝不漂移**。
-            //
-            // cardeck 的节奏天然正确——它由 AudioRecord.read() 的阻塞读取驱动，
-            // 硬件按 48k 实时吐 352 帧，一包一发，永不累计误差。
-            // 我们这里是「收 CarLife PCM → 自己重排节奏」，所以必须用绝对时刻对齐：
-            //  - Burst：漏掉的拍**立刻补发**（Delay 会永久丢拍 → RTP 时钟持续落后于
-            //    墙钟，接收端表现为 late/discontinuity 一直涨、听感断续）。
-            //  - 补发仍受混音队列上限（~0.5s）约束，不会无限喷包。
-            // 现场 2026-10-23 23:45：WinPlay 侧统计 packets 只有 ~68/s（应为 48000/352≈136/s），
-            // 正好少一半，印证漏拍。
-            let mut tick =
-                tokio::time::interval(Duration::from_nanos((SPF as u64) * 1_000_000_000 / TARGET_RATE as u64));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+            let mut tick = tokio::time::interval(Duration::from_nanos(crate::audio_pipeline::PERIOD_NS));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut sync_tick = tokio::time::interval(Duration::from_secs(1));
             sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // 发包速率自测：每秒记一行，联调时能直接看出节拍对不对。
@@ -367,6 +360,9 @@ pub async fn run_engine(
                     } => {
                         if let Some(a) = r.flatten() {
                             emit_log("AUDIO: pump_ready，音频 RECORD 已成功；开始 PCM48k/SPF352 推流，车机是否有声仍需确认");
+                            emit_log(&format!("AUDIO: sync_available={} mediaPrebufferMs=60 ttsPrebufferMs=20 missedTicks=skip_with_rtp_advance",a.sync_available()));
+                            clock=Some(crate::audio_pipeline::AudioClock::new(crate::timing::monotonic_nanos()));
+                            tick.reset_immediately();
                             out = Some(a);
                         } else {
                             emit_log("AUDIO: sender_unavailable，音频关闭或协商未完成，见前置音频日志");
@@ -377,10 +373,13 @@ pub async fn run_engine(
                         Some(CarLifeEvent::AudioInit { tts, rate, channels }) => {
                             if tts { tts_fmt = (rate.max(1), channels.max(1)); }
                             else { media_fmt = (rate.max(1), channels.max(1)); }
-                            stats.lock().playing = true;
+                            if tts {tts_mix.stop();tts_remain.clear();} else {media_mix.stop();media_remain.clear();}
+                            activity.clear();stats.lock().playing=false;
                         }
                         Some(CarLifeEvent::AudioStop { tts }) => {
-                            if tts { tts_mix.clear(); } else { media_mix.clear(); }
+                            if tts { tts_mix.stop();tts_remain.clear(); } else { media_mix.stop();media_remain.clear(); }
+                            activity.clear();stats.lock().playing=false;
+                            emit_log(&format!("AUDIO: source_stop tts={tts} stalePcmCleared=true"));
                         }
                         Some(CarLifeEvent::AudioData { tts, rate, channels, data }) => {
                             let (fmt, remain, mix) = if tts {
@@ -390,10 +389,9 @@ pub async fn run_engine(
                             };
                             if rate > 0 && rate != fmt.0 { fmt.0 = rate; }
                             if channels >= 1 && channels <= 2 && channels != fmt.1 { fmt.1 = channels; }
-                            push_resampled(&data, fmt.0, fmt.1, remain, mix);
-                            // 缓冲上限 ~0.5s：过载丢旧（导航长语音不至于拖垮媒体）
-                            let cap = (TARGET_RATE as usize) * 2 / 2;
-                            while mix.len() > cap { mix.pop_front(); }
+                            let before=mix.queue.len();
+                            push_resampled(&data, fmt.0, fmt.1, remain, &mut mix.queue);
+                            mix.appended((mix.queue.len()-before)/2,crate::timing::monotonic_nanos());
                         }
                         Some(_) => {}
                         None => return,
@@ -402,7 +400,9 @@ pub async fn run_engine(
                         // RTP↔NTP 同步包（每秒；缺它车机照收 UDP 但喇叭无声）。
                         // 时间基与 TimingServer 的 timesync 应答同源（进程级单调钟）。
                         if let Some(a) = out.as_mut() {
-                            if let Err(error) = a.send_sync_now(crate::timing::monotonic_nanos()).await {
+                            let now=crate::timing::monotonic_nanos();
+                            let timestamp=clock.as_ref().map(|c|c.rtp_at(now)).unwrap_or(0);
+                            if let Err(error) = a.send_sync(timestamp,now).await {
                                 sync_errors += 1;
                                 if last_sync_error.map_or(true, |last| last.elapsed() >= Duration::from_secs(5)) {
                                     emit_log(&format!("AUDIO: sync_write_failed errors={sync_errors} kind={:?} os={:?}: {error}", error.kind(), error.raw_os_error()));
@@ -412,24 +412,21 @@ pub async fn run_engine(
                         }
                     }
                     _ = tick.tick() => {
+                        let now=crate::timing::monotonic_nanos();
+                        let Some(timeline)=clock.as_mut() else {continue};
+                        let Some(skipped)=timeline.due(now) else {continue};
+                        if skipped>0 {
+                            skipped_frames+=skipped;
+                            media_mix.discard(skipped);tts_mix.discard(skipped);
+                            if let Some(a)=out.as_mut(){a.skip_frames(skipped);}
+                        }
+                        media_mix.render(&mut media_packet);tts_mix.render(&mut tts_packet);
                         if duck_hold > 0 { duck_hold -= 1; }
-                        let tts_active = !tts_mix.is_empty();
-                        if tts_active { duck_hold = 40; } // ~410ms 尾音保持
-                        let target = if duck_hold > 0 { 0.25f32 } else { 1.0f32 };
-                        gain += (target - gain) * 0.15;
-
-                        for i in 0..SPF {
-                            // 混音队列里是**交错立体声**（push_resampled 每帧压 L、R 两个样本）。
-                            // 之前每帧只取一个样本再左右都填它——只消费了一半数据、还把立体声
-                            // 压成单声道，听感就是沙沙声 + 断续（现场 2026-10-23 23:10 定位）。
-                            let ml = take_or_zero(&mut media_mix);
-                            let mr = take_or_zero(&mut media_mix);
-                            let tl = take_or_zero(&mut tts_mix);
-                            let tr = take_or_zero(&mut tts_mix);
-                            let l = (ml as f32 * gain) as i32 + tl as i32;
-                            let r = (mr as f32 * gain) as i32 + tr as i32;
-                            mixed[i * 2] = l.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                            mixed[i * 2 + 1] = r.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                        if tts_packet.iter().any(|v|*v!=0) {duck_hold=40;}
+                        let target=if duck_hold>0 {0.25f32}else{1.0f32};
+                        gain+=(target-gain)*0.15;
+                        for i in 0..SPF*2 {
+                            mixed[i]=((media_packet[i] as f32*gain) as i32+tts_packet[i] as i32).clamp(i16::MIN as i32,i16::MAX as i32) as i16;
                         }
                         stats.lock().ducking = duck_hold > 0;
                         if let Some(a) = out.as_mut() {
@@ -437,6 +434,7 @@ pub async fn run_engine(
                             let before = a.packets_sent();
                             match a.send_pcm(&mixed).await {
                                 Ok(()) => {
+                                    activity.wrote(now,&mixed);
                                     if before == 0 && a.packets_sent() > 0 {
                                         emit_log("AUDIO: first_rtp_packet_written；UDP 写出不等于车机扬声器播放");
                                     }
@@ -446,6 +444,7 @@ pub async fn run_engine(
                                     }
                                 }
                                 Err(error) => {
+                                    a.skip_frames(SPF as u64);
                                     pcm_errors += 1;
                                     if last_pcm_error.map_or(true, |last| last.elapsed() >= Duration::from_secs(5)) {
                                         emit_log(&format!("AUDIO: pcm_write_failed errors={pcm_errors} packets={} kind={:?} os={:?}: {error}", a.packets_sent(), error.kind(), error.raw_os_error()));
@@ -455,16 +454,20 @@ pub async fn run_engine(
                             }
                             sent_packets += a.packets_sent().saturating_sub(before);
                         }
-                        // 每秒报一次实际发包速率：48000/352 ≈ 136/s。低于它就是漏拍，
-                        // 接收端会表现为 late/discontinuity 增长、听感断续。
+                        stats.lock().playing=activity.playing(now);
+                        // Report transport, input starvation and skipped presentation slots separately.
+                        // A successful UDP send or a full packet rate is not proof of audible output.
                         if rate_mark.elapsed() >= Duration::from_secs(1) {
                             let secs = rate_mark.elapsed().as_secs_f64().max(0.001);
                             emit_log(&format!(
-                                "AUDIO: 发包 {:.0}/s（应 {:.0}/s） 队列 media={}ms tts={}ms pcmErrors={pcm_errors} syncErrors={sync_errors}",
+                                "AUDIO: 发包 {:.0}/s（应 {:.0}/s） 队列 media={}ms tts={}ms pcmErrors={pcm_errors} syncErrors={sync_errors} syncAvailable={} skippedFrames={skipped_frames} inputFrames={}/{} paddedFrames={}/{} underruns={}/{} droppedFrames={}/{} inputGapMaxMs={}/{}",
                                 sent_packets as f64 / secs,
                                 TARGET_RATE as f64 / SPF as f64,
-                                media_mix.len() * 1000 / (TARGET_RATE as usize).max(1) / 2,
-                                tts_mix.len() * 1000 / (TARGET_RATE as usize).max(1) / 2
+                                media_mix.queued_ms(), tts_mix.queued_ms(),
+                                out.as_ref().is_some_and(|a|a.sync_available()),
+                                media_mix.input_frames,tts_mix.input_frames,media_mix.padded_frames,tts_mix.padded_frames,
+                                media_mix.underruns,tts_mix.underruns,media_mix.dropped_frames,tts_mix.dropped_frames,
+                                media_mix.max_input_gap_ms,tts_mix.max_input_gap_ms
                             ));
                             sent_packets = 0;
                             rate_mark = std::time::Instant::now();

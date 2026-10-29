@@ -248,10 +248,20 @@ object HyperCarRepo {
                 closeVirtualIap()
                 mediaEvidence.begin(generation)
                 activeDiagnosticJournal?.nativeStarted(generation)
-                activeDiagnosticJournal?.record("native.start",mapOf("trace" to ownerTrace?.id,"generation" to generation,"videoPolicy" to (diagnosticOptions?.optString("video_policy")?:SettingsStore.videoPolicy)))
-                ownerTrace?.event("native.start", "generation=$generation")
-                val selected=org.json.JSONObject(config).put("video_policy",SettingsStore.videoPolicy)
+                val policy=VideoPolicySelection.resolve(SettingsStore.explicitVideoPolicy,headUnitProfile.id,carLifeSession?.source?.enginePackage?:SettingsStore.carlifePackage)
+                val selected=org.json.JSONObject(config).put("video_policy",policy)
                 diagnosticOptions?.let {overrides->overrides.keys().forEach {key->selected.put(key,overrides.get(key))}}
+                if(diagnosticOptions==null && carLifeSession?.source?.usesBoundRenderer==true) {
+                    val context=appContext()
+                    if(context!=null)runCatching {
+                        val root=java.io.File(context.filesDir,"video-diagnostics")
+                        val path=io.github.hypercar.diagnostics.AutomaticVideoEvidence.prepare(root,"batch-auto-${System.currentTimeMillis()}-$generation",io.github.hypercar.BuildConfig.VERSION_NAME)
+                        selected.put("diagnostic_dir",path.path)
+                        ownerTrace?.event("video.auto_capture","batch=${path.parentFile?.name} maxPackets=90 maxBytesPerSample=8388608 upload=false")
+                    }.onFailure {ownerTrace?.event("video.auto_capture_skipped","reason=${it.message} connectionNotBlocked=true")}
+                }
+                activeDiagnosticJournal?.record("native.start",mapOf("trace" to ownerTrace?.id,"generation" to generation,"videoPolicy" to selected.optString("video_policy")))
+                ownerTrace?.event("native.start", "generation=$generation videoPolicy=${selected.optString("video_policy")} explicitSaved=${SettingsStore.explicitVideoPolicy!=null} diagnostic=${diagnosticOptions!=null}")
                 selected.optString("diagnostic_dir").takeIf{it.isNotBlank()}?.let {path ->
                     val info=org.json.JSONObject(selected.toString()).apply {remove("identity_path");remove("device_id");remove("car_ip");remove("diagnostic_replay");remove("diagnostic_dir")}
                     val battery=appContext()?.registerReceiver(null,android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
@@ -2060,24 +2070,26 @@ object HyperCarRepo {
         } catch (error: Exception) {
             if (carLifeSession === owner && owner.isOpen && sessionLive.get()) {
                 connectionTrace?.failure("source.initialize", error)
-                fail("vivo CarLife 初始化失败：${error.message}；请打开来源应用权限检查，原厂服务未就绪时不会继续假装取源成功")
+                dumpCarLifeDiag("source_initialize:${error.javaClass.simpleName}")
+                fail("vivo CarLife 初始化失败：${error.message}；本轮已停止，请按上面的具体启动或绑定原因处理")
             }
         }
     }
 
     /** Retire all old sockets before re-binding; the next session rechecks all six UIDs. */
-    private fun onSourceBindingLost(owner: CarLifeWakeSession, reason: String) {
+    private fun onSourceBindingLost(owner: CarLifeWakeSession, reason: String, recovered: () -> Boolean = { owner.hasRenderer }) {
         val trace = connectionTrace
         if (carLifeSession !== owner || !owner.isOpen) return
         val context = appContext() ?: return
+        dumpCarLifeDiag("source_lost:$reason")
         if(diagnosticOwned.get()) {diagnosticWait?.completeExceptionally(IllegalStateException(reason));fail(reason,allowReconnect=false);return}
         sourceRecovery.lost(
             isCurrent = { connectionTrace === trace && carLifeSession === owner && owner.isOpen &&
                 sessionLive.get() && !userDisconnectRequested },
-            sourceActive = { owner.hasRenderer },
+            sourceActive = recovered,
             stillWanted = { connectionTrace === trace && !sessionLive.get() && !userDisconnectRequested &&
                 !connecting && !streaming && !cleanupInProgress },
-            stop = { retain -> fail("vivo 来源绑定失效：$reason", allowReconnect = false, keepAliveUntilRetry = retain) },
+            stop = { retain -> fail("vivo 来源需要恢复：$reason", allowReconnect = false, keepAliveUntilRetry = retain) },
             restart = { connectInternal(context, resetRecoveryBudget = false) },
             log = { stage, detail -> trace?.event("source.recovery.$stage", "$detail reason=$reason") },
         )
@@ -2262,7 +2274,8 @@ object HyperCarRepo {
             }
             if (!sessionLive.get() || carLifeSession !== owner || !owner.isOpen || carLifeActiveAt >= startedAt) return@launch
             log("CARLIFE: 12s 内没走完握手（Phase 1 无回应）——重建本轮来源连接一次")
-            restartLocalCarLife()
+            if(owner.source.usesBoundRenderer) onSourceBindingLost(owner,"来源握手超时",{carLifeActiveAt>=startedAt})
+            else restartLocalCarLife()
         }
     }
 
@@ -2294,7 +2307,10 @@ object HyperCarRepo {
             } else {
                 log("DIAG: 请核对所选来源的渲染与投屏授权；仅有协议握手不能证明编码器收到画面")
             }
-            dumpCarLifeDiag()
+            dumpCarLifeDiag("no_source_frames")
+            if (owner.source.usesBoundRenderer && lastVideoFrames==0L && carLifeSession===owner && owner.isOpen && sessionLive.get()) {
+                onSourceBindingLost(owner,"来源握手后12秒没有真实视频帧",{lastVideoFrames>0L})
+            }
         }
     }
 
@@ -2307,9 +2323,7 @@ object HyperCarRepo {
             currentCoroutineContext().ensureActive()
             if (carLifeSession !== owner || !owner.isOpen) return@launch
             if (owner.source.usesBoundRenderer) {
-                owner.releaseRenderer()
-                withContext(Dispatchers.Main) { }
-                if (owner.isOpen && sessionLive.get()) bindVivoRenderer(owner)
+                onSourceBindingLost(owner,"来源请求重新初始化",{false})
                 return@launch
             }
             ShizukuTools.exec("am force-stop ${owner.source.enginePackage}", 4_000)
@@ -2862,12 +2876,22 @@ object HyperCarRepo {
      *
      * 只在有 Shizuku 时可用；输出截断到 40 行、每行 200 字符，避免把环形日志刷满。
      */
-    fun dumpCarLifeDiag() {
+    private var lastAutomaticSourceDiag=0L
+    private var sourceDiagnosticJob:Job?=null
+    @Synchronized fun dumpCarLifeDiag(automaticReason:String?=null) {
+        if(sourceDiagnosticJob?.isActive==true){log("DIAG: 上一份来源现场正在采集，合并本次请求");return}
+        if(automaticReason!=null) {
+            val now=SystemClock.elapsedRealtime()
+            if(lastAutomaticSourceDiag!=0L && now-lastAutomaticSourceDiag<30_000L){log("DIAG: 自动来源取证限频 reason=$automaticReason");return}
+            lastAutomaticSourceDiag=now
+        }
         if (!ShizukuTools.isReady) {
             log("DIAG: 需要 Shizuku 才能抓 CarLife 现场（dumpsys/logcat）——先授权再点一次")
             return
         }
-        scope.launch(Dispatchers.IO) {
+        val pkg = selectedEnginePackage() ?: SettingsStore.carlifePackage
+        val traceId = connectionTrace?.id
+        sourceDiagnosticJob=scope.launch(Dispatchers.IO) {
             suspend fun run(prefix: String, cmd: String, maxLines: Int) {
                 val r = runCatching { ShizukuTools.exec(cmd, 12_000) }.getOrNull()
                 if (r == null) {
@@ -2879,10 +2903,12 @@ object HyperCarRepo {
                 if (r.err.isNotBlank()) log("$prefix: stderr=${r.err.take(500)}")
                 lines.take(maxLines).forEach { log("$prefix ${it.take(200)}") }
             }
-            log("DIAG: ==== CarLife 现场开始 ====")
-            val pkg = selectedEnginePackage() ?: SettingsStore.carlifePackage
+            log("DIAG: ==== CarLife 现场开始 ==== reason=${automaticReason?:"manual_or_no_frame"} owner=$traceId source=$pkg")
             if (Regex("[a-zA-Z][a-zA-Z0-9_]*(\\.[a-zA-Z0-9_]+)+").matches(pkg)) {
                 run("DIAG-PKG", "dumpsys package ${io.github.hypercar.shizuku.shellQuote(pkg)} | grep -E 'versionCode=|versionName=|User 0:|ACCESS_FINE_LOCATION:|ACCESS_COARSE_LOCATION:|ACCESS_BACKGROUND_LOCATION:' | head -10", 10)
+                run("DIAG-EXIT", "dumpsys activity exit-info ${io.github.hypercar.shizuku.shellQuote(pkg)} | head -36", 36)
+                run("DIAG-ACT-SOURCE", "dumpsys activity activities ${io.github.hypercar.shizuku.shellQuote(pkg)} | grep -iE 'ActivityRecord|Hist #|visible=|state=|finishing=|displayId=' | head -16", 16)
+                run("DIAG-START-REASON", "logcat -d -b system -t 800 | grep -iE 'carlife|hypercar|too many activities|Background activity start' | tail -16", 16)
                 run("DIAG-SVC", "dumpsys activity services ${io.github.hypercar.shizuku.shellQuote(pkg)} | grep -E 'ServiceRecord|intent=|ConnectionRecord|startRequested|recentCalling' | head -14", 14)
                 if (pkg == CarLifeSource.VIVO) {
                     run("DIAG-JOVI", "dumpsys activity services com.vivo.car.networking | grep -E 'ServiceRecord|intent=|ConnectionRecord|startRequested|recentCalling' | head -12", 12)

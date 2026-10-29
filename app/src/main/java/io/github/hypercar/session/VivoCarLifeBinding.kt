@@ -119,29 +119,24 @@ internal class VivoCarLifeBinding private constructor(
                 bootstrap = {
                     currentCoroutineContext().ensureActive()
                     if (!stillValid()) throw CancellationException("CarLife session already closed")
-                    trace.event("wake.begin", "reason=cold_bind_rejected component=${source.activity} backend=${if (ShizukuTools.isReady) "shizuku" else "context"}")
-                    if (ShizukuTools.isReady) {
-                        // Preserve the existing background wake capability. Do not
-                        // perform shell work on Main or start a detached SDK FGS.
-                        val result = withContext(Dispatchers.IO) {
-                            currentCoroutineContext().ensureActive()
+                    trace.event("wake.begin", "reason=cold_bind_rejected component=${source.activity} selection=foreground_first shizukuAvailable=${ShizukuTools.isReady}")
+                    val backend=launchSourceActivity(
+                        foreground={withContext(Dispatchers.Main.immediate) {
                             if (!stillValid()) throw CancellationException("CarLife session already closed")
-                            ShizukuTools.exec("am start -W --user 0 -n ${shellQuote(requireNotNull(source.activity))}", 8_000)
-                        }
-                        trace.event("wake.shizuku.result", "exit=${result.code} stdout=${result.out.replace('\n', '|')} stderr=${result.err.replace('\n', '|')}")
-                        val output = result.out + "\n" + result.err
-                        check(result.code == 0 && !Regex("(?im)^Error(?: type \\d+)?[: ]|unknown error code").containsMatchIn(output)) {
-                            "原厂入口启动失败：${output.trim().take(240)}"
-                        }
-                    } else {
-                        withContext(Dispatchers.Main.immediate) {
-                            if (!stillValid()) throw CancellationException("CarLife session already closed")
-                            context.startActivity(Intent().setComponent(
-                                requireNotNull(ComponentName.unflattenFromString(source.activity!!)))
-                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                            trace.event("wake.context.requested", "activityStartNotConfirmed=true")
-                        }
-                    }
+                            ForegroundSourceActivity.launch(Intent().setComponent(requireNotNull(ComponentName.unflattenFromString(source.activity!!))))
+                        }},
+                        shell={
+                            check(ShizukuTools.isReady) { "请在手机前台打开 Hypercar 再启动来源，或手动打开原厂 CarLife" }
+                            val result=withContext(Dispatchers.IO) {
+                                currentCoroutineContext().ensureActive()
+                                if (!stillValid()) throw CancellationException("CarLife session already closed")
+                                ShizukuTools.exec("am start -W --user current -f 0x20000000 -n ${shellQuote(requireNotNull(source.activity))}",8_000)
+                            }
+                            trace.event("wake.shizuku.result","exit=${result.code} stdout=${result.out.replace('\n','|')} stderr=${result.err.replace('\n','|')}")
+                            SourceLaunchResult(result.code,result.out,result.err)
+                        },
+                    )
+                    trace.event("wake.requested","backend=$backend bindingStillRequired=true")
                     trace.event("wake.retry_wait", "delayMs=3100 reason=original_sdk_throttle")
                 },
               ).also { trace.event("initialize.bound", "active=${it.isActive} videoAndDesktopNotVerified=true") }
@@ -150,6 +145,7 @@ internal class VivoCarLifeBinding private constructor(
                 throw cancelled
             } catch (error: Exception) {
                 trace.failure("initialize", error)
+                if(error is SourceActivityStartException) trace.event("wake.blocked","code=${error.startCode} permissionFailureNotAssumed=true automaticRelaunch=false")
                 throw error
             }
         }

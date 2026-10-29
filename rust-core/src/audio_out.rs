@@ -67,6 +67,9 @@ pub struct AudioOut {
 }
 
 impl AudioOut {
+    /// Advance presentation time for missed real-time slots without sending a burst or reusing nonces.
+    pub fn skip_frames(&mut self, frames: u64) { self.ts = self.ts.wrapping_add(frames as u32); }
+    pub fn sync_available(&self) -> bool { self.sync.is_some() }
     /// 构造。data/sync 两个套接字都由调用方 connect 好（本类型只用 `send`）。
     pub fn new(
         data: UdpSocket,
@@ -178,4 +181,31 @@ pub fn build_sync_packet(seq: u16, rtp_ts: u32, ntp_nanos: u64) -> Vec<u8> {
     let next = rtp_ts.wrapping_add(SAMPLES_PER_PACKET as u32);
     packet[16..20].copy_from_slice(&next.to_be_bytes());
     packet
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::chacha_open;
+    #[tokio::test]
+    async fn missed_slots_advance_rtp_but_keep_unique_nonce_and_wire_sample_order() {
+        let receiver=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.connect(receiver.local_addr().unwrap()).await.unwrap();
+        let key=[9u8;32];let mut out=AudioOut::new(sender,None,key,100);
+        assert!(!out.sync_available());
+        let samples:Vec<i16>=(0..704).map(|i|if i%2==0{1234}else{-1234}).collect();
+        let mut packet=[0u8;2048];
+        out.send_pcm(&samples).await.unwrap();
+        receiver.recv(&mut packet).await.unwrap();
+        out.skip_frames(352*49);
+        out.send_pcm(&samples).await.unwrap();
+        let len=receiver.recv(&mut packet).await.unwrap();
+        assert_eq!(u16::from_be_bytes(packet[2..4].try_into().unwrap()),1);
+        assert_eq!(u32::from_be_bytes(packet[4..8].try_into().unwrap()),352*50);
+        assert_eq!(u64::from_le_bytes(packet[len-8..len].try_into().unwrap()),1);
+        let pcm=chacha_open(&key,&nonce64(1),&packet[12..len-8],&packet[4..12]).unwrap();
+        assert_eq!(&pcm[..4],&[0x04,0xd2,0xfb,0x2e]);
+        assert_eq!(out.packets_sent(),2);
+    }
 }

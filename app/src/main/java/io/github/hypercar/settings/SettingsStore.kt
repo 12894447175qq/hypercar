@@ -28,6 +28,8 @@ object SettingsStore {
         get()=p().getString("video_policy","original") ?: "original"
         set(value) {require(value in setOf("original","level40","inline_headers","level40_inline","hardware_transcode"));p().edit().putString("video_policy",value).apply()}
 
+    val explicitVideoPolicy:String? get()=p().getString("video_policy",null)
+
     private const val KEY_TARGET_MAC = "target_car_mac"
     private const val KEY_TARGET_NAME = "target_car_name"
     private const val KEY_AUTO_CONNECT = "auto_connect_on_bt"

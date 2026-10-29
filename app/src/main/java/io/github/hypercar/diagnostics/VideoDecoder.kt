@@ -51,7 +51,7 @@ internal object VideoDecoder {
         val decoder=MediaCodec.createDecoderByType("video/avc")
         report.put("decoder",decoder.name)
         trace("configure decoder=${decoder.name} width=$w height=$h inputFrames=${packets.size}")
-        val hashes=JSONArray();var fed=0;var ended=false;var frames=0;var firstPts=0L
+        val hashes=JSONArray();var fed=0;var ended=false;var frames=0;var firstPts=0L;var blackFrames=0
         output.mkdirs();val info=MediaCodec.BufferInfo();val deadline=System.nanoTime()+30_000_000_000L
         try {
             report.put("phase","configure_decoder");decoder.configure(format,null,null,0)
@@ -92,7 +92,11 @@ internal object VideoDecoder {
                                         digest.update(bytes)
                                     }
                                 }
-                                hashes.put(JSONObject().put("ptsUs",info.presentationTimeUs).put("sha256",digest.digest().joinToString(""){"%02x".format(it)}).put("width",width).put("height",height))
+                                val fullRange=decoder.outputFormat.run {containsKey(MediaFormat.KEY_COLOR_RANGE) && getInteger(MediaFormat.KEY_COLOR_RANGE)==MediaFormat.COLOR_RANGE_FULL}
+                                val content=FrameContent.inspect(channels[0],channels[1],channels[2],fullRange)
+                                if(content.nearBlack)blackFrames++
+                                if(frames==0)trace("content_first minLuma=${content.minLuma} maxLuma=${content.maxLuma} meanLuma=${content.meanLuma} darkFraction=${content.darkFraction} nearBlack=${content.nearBlack} fullRange=$fullRange desktopVerified=false")
+                                hashes.put(JSONObject().put("nearBlack",content.nearBlack).put("meanLuma",content.meanLuma).put("ptsUs",info.presentationTimeUs).put("sha256",digest.digest().joinToString(""){"%02x".format(it)}).put("width",width).put("height",height))
                                 if(frames==0 || frames==packets.size-1) {
                                     val pw=minOf(640,width);val ph=(height.toLong()*pw/width).toInt().coerceAtLeast(1)
                                     val pixels=IntArray(pw*ph)
@@ -119,7 +123,8 @@ internal object VideoDecoder {
             }
             report.put("phase","end_of_stream")
             check(frames>0) { "解码结果没有图像" }
-            return JSONObject().put("decoder",decoder.name).put("frames",frames).put("inputFrames",packets.size).put("firstPtsUs",firstPts).put("pixels",hashes).put("vehicleDisplayVerified",false)
+            trace("content_summary frames=$frames nearBlackFrames=$blackFrames desktopVerified=false")
+            return JSONObject().put("nearBlackFrames",blackFrames).put("decoder",decoder.name).put("frames",frames).put("inputFrames",packets.size).put("firstPtsUs",firstPts).put("pixels",hashes).put("vehicleDisplayVerified",false)
                 .also {File(output,"decode.json").writeText(it.toString(2))}
         } catch(e:Exception) {report.put("primaryError",CodecFailure.describe(e));throw e}
         finally {

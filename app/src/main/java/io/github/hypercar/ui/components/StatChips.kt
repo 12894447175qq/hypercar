@@ -200,7 +200,7 @@ private fun CarLifeChip(carLife: CarLifeState, external: Boolean = false, modifi
 private fun AudioChip(audio: AudioStats, external: Boolean = false, modifier: Modifier = Modifier) {
     val (accent, value) = when {
         audio.ducking -> AmberWarning to "导航闪避中"
-        audio.playing -> MintGreen to "播放中"
+        audio.playing -> MintGreen to "音频发送中"
             else -> TextSecondary to if (external) "PC 侧播放" else "待机"
     }
     StatChip(

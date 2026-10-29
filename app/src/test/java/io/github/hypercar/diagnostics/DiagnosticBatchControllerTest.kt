@@ -11,6 +11,20 @@ import org.junit.Assert.*
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class DiagnosticBatchControllerTest {
+    @Test fun failedPreflightsPreserveAndCanExportEarlierSuccessfulSource()=runTest {
+        val root=Files.createTempDirectory("hc-keep-source").toFile()
+        try {
+            val ports=Ports();val c=DiagnosticBatchController(root,"test",ports,this)
+            c.startPreflight();advanceUntilIdle();val good=c.state.value.id
+            ports.failProbe=true
+            repeat(5){c.startPreflight();advanceUntilIdle()}
+            assertTrue(File(root,"$good/source/source.packets").isFile)
+            assertTrue(c.history().contains(good));val current=c.state.value.id
+            c.exportHistory(good);advanceUntilIdle()
+            assertEquals(current,c.state.value.id);assertEquals("test.zip",c.state.value.exportPath)
+            assertTrue(File(root,"$good/exported.json").isFile)
+        }finally{root.deleteRecursively()}
+    }
     @Test fun failedClaimHasEvidenceWithoutStoppingAnUnownedConnection()=runTest {
         val root=Files.createTempDirectory("hc-claim-log").toFile()
         try {

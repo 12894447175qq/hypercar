@@ -86,6 +86,9 @@ import io.github.hypercar.ui.theme.TextSecondary
 
 /** 单 Activity：底部三 Tab（主页 / 设置 / 诊断），state-based 切换，无需 navigation-compose。 */
 class MainActivity : ComponentActivity() {
+    override fun onResume() { super.onResume(); io.github.hypercar.session.ForegroundSourceActivity.resumed(this) }
+    override fun onPause() { io.github.hypercar.session.ForegroundSourceActivity.paused(this); super.onPause() }
+
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)

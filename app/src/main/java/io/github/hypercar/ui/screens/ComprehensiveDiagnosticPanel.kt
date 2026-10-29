@@ -77,6 +77,9 @@ import io.github.hypercar.session.HyperCarRepo
                 }
                 OutlinedButton(onClick={controller.export()},enabled=!state.busy && state.id.isNotEmpty()){Text("导出本批次 ZIP")}
                 state.exportPath?.let {Text(it)}
+                val history=remember(state.id,state.busy,state.exportPath){controller.history()}
+                history.forEach {id->OutlinedButton(onClick={controller.exportHistory(id)},enabled=!state.busy){Text("导出历史：$id")}}
+                Text("普通 vivo 连接也会保存短视频样本，可从下方历史批次导出。未导出的样本会保留；空间不足时停止新增采样。")
                 TextButton(onClick={controller.resetPolicy()},enabled=!state.busy){Text("恢复默认视频策略")}
                 TextButton(onClick={open=false}){Text("关闭窗口")}
             }

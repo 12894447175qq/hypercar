@@ -19,6 +19,7 @@
 
 mod airplay;
 mod audio_out;
+mod audio_pipeline;
 mod bplist;
 mod carlife;
 mod crypto;

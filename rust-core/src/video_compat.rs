@@ -214,6 +214,16 @@ impl Bits {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn actual_vivo_50009_sps_is_720p_and_passes_bounded_level4_conversion() {
+        // codec_parameters from the user's 2026-10-29 21:26:13.402 log, no image content.
+        let original=[0x67,0x42,0x80,0x1e,0xda,0x01,0x40,0x16,0xe9,0xa8,0x28,0x30,0x28,0x36,0x85,0x09,0xa8];
+        let info=SpsInfo::parse(&original).unwrap();
+        assert_eq!((info.width,info.height,info.frame_mbs),(1280,720,3600));
+        let mut expected=original;expected[3]=40;
+        assert_eq!(VideoPolicy::Level40Inline.normalize_sps(&original,60).unwrap(),expected);
+        assert_eq!(VideoPolicy::Original.normalize_sps(&original,60).unwrap(),original);
+    }
     fn source_sps() -> Vec<u8> {
         crate::screen::annexb_nals(include_bytes!("../testdata/source-1280x720.h264"))
             .into_iter()

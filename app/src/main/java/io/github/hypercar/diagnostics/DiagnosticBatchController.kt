@@ -80,6 +80,7 @@ internal class DiagnosticBatchController(private val root:File,private val versi
     }
     @Synchronized private fun execute(action:String,block:suspend ()->Unit) {
         if(operation?.isActive==true){journal?.record("operation.ignored",mapOf("action" to action,"reason" to "busy"));return}
+        if(action !in setOf("preflight","export","history_export") && state.value.id.isNotEmpty())File(directory,"exported.json").delete()
         if(action=="preflight")mutable.value=state.value.copy(busy=true,exportPath=null) else {
             journal?.target();journal?.record("operation.started",mapOf("action" to action))
             update{it.copy(busy=true,exportPath=null)}
@@ -119,13 +120,14 @@ internal class DiagnosticBatchController(private val root:File,private val versi
         journal=DiagnosticJournal(directory,version)
         journal?.record("operation.started",mapOf("action" to "preflight","source" to "com.baidu.carlife.vivo"))
         own()
-        root.listFiles()?.filter{it.isDirectory && it!=directory && it.name.matches(Regex("batch-[a-zA-Z0-9-]+"))}?.sortedByDescending{it.lastModified()}?.drop(2)?.forEach{VideoEvidence.files(it);it.deleteRecursively()}
+        DiagnosticRetention.prune(root,directory)
         val source=File(directory,"source");VideoEvidence.reserve(directory)
         journal?.target(source,"source","original")
         step("source.probe"){ports.probe(source)};step("source.stop"){ports.stop()}
         val sourceDecoded=step("source.decode"){ports.decode(File(source,"source.packets"),File(source,"source.json"),File(source,"preview"))}
         journal?.record("source.decoded",mapOf("frames" to sourceDecoded.optInt("frames"),"decoder" to sourceDecoded.optString("decoder")))
         check(sourceDecoded.getInt("frames")>0)
+        journal?.record("source.content",mapOf("nearBlackFrames" to sourceDecoded.optInt("nearBlackFrames"),"frames" to sourceDecoded.getInt("frames"),"desktopVerified" to false))
         update{it.copy(sourcePreview=File(source,"preview/first.png").path)}
         for(policy in VideoStrategy.entries) {
             currentCoroutineContext().ensureActive();VideoEvidence.reserve(directory)
@@ -223,5 +225,16 @@ internal class DiagnosticBatchController(private val root:File,private val versi
     fun saveSelected() {val s=state.value;val p=s.selected?:return;if(s.trials.any{it.policy==p && it.display=="正常 Jovi"}){ports.save(p);journal?.record("settings.video_policy_save_requested",mapOf("policy" to p.wire));update{it.copy(message="已保存 ${p.title}，其他设置未修改")}}}
     fun resetPolicy() {if(!state.value.busy){ports.save(VideoStrategy.A);journal?.record("settings.video_policy_reset");update{it.copy(message="已恢复普通连接的原始视频策略")}}}
     fun cancel() {journal?.record("user.cancel_requested");operation?.cancel()}
-    fun export()=execute("export") {check(state.value.id.isNotEmpty());File(directory,"session.txt").writeText(ports.logs().joinToString("\n").takeLast(4*1024*1024));update{it.copy(stage="正在导出")};journal?.record("export.snapshot",mapOf("sourceConfirmed" to state.value.sourceConfirmed,"localPassed" to state.value.trials.filter{it.localPassed}.map{it.policy.wire},"storageError" to journal?.storageError()));journal?.close();val path=step("export.write"){ports.export(directory)};update{it.copy(exportPath=path,stage="已导出")}}
+    fun export()=execute("export") {check(state.value.id.isNotEmpty());File(directory,"session.txt").writeText(ports.logs().joinToString("\n").takeLast(4*1024*1024));update{it.copy(stage="正在导出")};journal?.record("export.snapshot",mapOf("sourceConfirmed" to state.value.sourceConfirmed,"localPassed" to state.value.trials.filter{it.localPassed}.map{it.policy.wire},"storageError" to journal?.storageError()));journal?.close();val path=step("export.write"){ports.export(directory)};File(directory,"exported.json").writeText(JSONObject().put("at",System.currentTimeMillis()).toString());update{it.copy(exportPath=path,stage="已导出")}}
+    fun history():List<String> = root.listFiles().orEmpty().filter {it.isDirectory && it!=directory && !java.nio.file.Files.isSymbolicLink(it.toPath()) && it.name.matches(Regex("batch-[a-zA-Z0-9-]+")) && File(it,"batch.json").isFile}.sortedByDescending{it.lastModified()}.map{it.name}
+    fun exportHistory(id:String) {
+        if(id !in history())return
+        execute("history_export") {
+            val old=File(root,id);VideoEvidence.files(old)
+            val path=ports.export(old)
+            File(old,"exported.json").writeText(JSONObject().put("at",System.currentTimeMillis()).toString())
+            update{it.copy(exportPath=path,stage="历史批次已导出",message="已导出 $id；当前批次未切换")}
+        }
+    }
+
 }
