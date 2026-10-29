@@ -12,13 +12,13 @@ internal enum class VideoStrategy(val wire:String,val title:String) {
     A("original","A 原始转发"), B("level40","B Level 4.0 兼容"), C("inline_headers","C 关键帧携带参数"),
     D("level40_inline","D 两项组合"), E("hardware_transcode","E 硬件重编码")
 }
-internal data class DiagnosticTrial(val policy:VideoStrategy,val status:String="未执行",val detail:String="",val display:String="未确认")
+internal data class DiagnosticTrial(val policy:VideoStrategy,val status:String="未执行",val detail:String="",val display:String="未确认",val localPassed:Boolean=false)
 internal data class DiagnosticBatchState(
     val id:String="", val busy:Boolean=false,val stage:String="尚未开始",val sourceConfirmed:Boolean=false,
     val sourcePreview:String?=null,val message:String="",val current:VideoStrategy?=null,
     val trials:List<DiagnosticTrial> = VideoStrategy.entries.map(::DiagnosticTrial),
     val audio:String="未确认",val touch:String="未确认",val reconnect:String="未确认",val selected:VideoStrategy?=null,
-    val exportPath:String?=null,val caseId:String?=null,
+    val exportPath:String?=null,val caseId:String?=null,val restored:Boolean=false,
 )
 internal interface DiagnosticPorts {
     suspend fun claim()
@@ -50,11 +50,11 @@ internal class DiagnosticBatchController(private val root:File,private val versi
                 val entries=data.optJSONArray("trials") ?: JSONArray()
                 val trials=VideoStrategy.entries.map {policy ->
                     val saved=(0 until entries.length()).map{entries.getJSONObject(it)}.firstOrNull{it.optString("policy")==policy.wire}
-                    DiagnosticTrial(policy,saved?.optString("status")?:"未执行",saved?.optString("detail").orEmpty(),saved?.optString("display")?:"未确认")
+                    DiagnosticTrial(policy,saved?.optString("status")?:"未执行",saved?.optString("detail").orEmpty(),saved?.optString("display")?:"未确认",saved?.optBoolean("localPassed",false)==true)
                 }
                 File(d,"interrupted-state.json").writeText(data.toString(2))
                 mutable.value=DiagnosticBatchState(id=d.name,stage="历史批次已中断；可导出或新建",message="不会自动重连；原始结果保存在诊断包中",sourcePreview=File(d,"source/preview/first.png").takeIf{it.isFile}?.path,
-                    trials=trials,audio=data.optString("audio","未确认"),touch=data.optString("touch","未确认"),reconnect=data.optString("reconnect","未确认"))
+                    trials=trials,audio=data.optString("audio","未确认"),touch=data.optString("touch","未确认"),reconnect=data.optString("reconnect","未确认"),restored=true)
                 data.put("restoredAfterProcessExit",true).put("activeOutcome","中断/未确认")
                 File(d,"batch.json").writeText(data.toString(2))
             }
@@ -69,7 +69,7 @@ internal class DiagnosticBatchController(private val root:File,private val versi
         val json=JSONObject().put("id",s.id).put("version",version).put("stage",s.stage).put("busy",s.busy)
             .put("source","com.baidu.carlife.vivo").put("sourceConfirmed",s.sourceConfirmed).put("message",s.message)
             .put("audio",s.audio).put("touch",s.touch).put("reconnect",s.reconnect).put("selected",s.selected?.wire)
-            .put("trials",JSONArray(s.trials.map {JSONObject().put("policy",it.policy.wire).put("status",it.status).put("detail",it.detail).put("display",it.display)}))
+            .put("trials",JSONArray(s.trials.map {JSONObject().put("policy",it.policy.wire).put("status",it.status).put("detail",it.detail).put("display",it.display).put("localPassed",it.localPassed)}))
         val temp=File(directory,"batch.json.tmp");temp.writeText(json.toString(2))
         java.nio.file.Files.move(temp.toPath(),File(directory,"batch.json").toPath(),java.nio.file.StandardCopyOption.REPLACE_EXISTING)
     }
@@ -116,7 +116,7 @@ internal class DiagnosticBatchController(private val root:File,private val versi
                     fun hashes(j:JSONObject):List<String> = j.getJSONArray("pixels").let {a->(0 until a.length()).map{a.getJSONObject(it).getString("sha256")}}
                     check(hashes(received)==hashes(sourceDecoded)) {"接收端解码像素与原始来源不一致"}
                 }
-                trial(policy){it.copy(status="本地通过",detail="真实TCP解密与手机解码完成；实车未确认")}
+                trial(policy){it.copy(status="本地通过",localPassed=true,detail="真实TCP解密与手机解码完成；实车未确认")}
             } catch(e:CancellationException){throw e}
             catch(e:Exception){trial(policy){it.copy(status="本地阻塞",detail=e.message.orEmpty())}}
             finally {ports.stop()}
@@ -124,14 +124,14 @@ internal class DiagnosticBatchController(private val root:File,private val versi
         update{it.copy(stage="请确认预览内容",message="只有预览确为 Jovi 桌面才进入车测；原厂协议提示请在原厂页面处理")}
     }
     @Synchronized private fun trial(policy:VideoStrategy,block:(DiagnosticTrial)->DiagnosticTrial)=update{it.copy(trials=it.trials.map {t->if(t.policy==policy)block(t) else t})}
-    fun confirmSource(normal:Boolean) {if(!state.value.busy && state.value.sourcePreview!=null)update{it.copy(sourceConfirmed=normal,stage=if(normal)"可开始车测" else "来源画面阻塞",message=if(normal)"到车旁后启动轮测；每轮可能需要重新选择 Apple CarPlay" else "请导出证据，来源提示/黑屏不能当正常桌面")}}
+    fun confirmSource(normal:Boolean) {if(!state.value.restored && !state.value.busy && state.value.sourcePreview!=null)update{it.copy(sourceConfirmed=normal,stage=if(normal)"可开始车测" else "来源画面阻塞",message=if(normal)"到车旁后启动轮测；仅测试已通过本地解码的方案，每轮可能需要重新选择 Apple CarPlay" else "请导出证据，来源提示/黑屏不能当正常桌面")}}
     fun startVehicleTrials() {
-        if(!state.value.sourceConfirmed)return
+        if(!state.value.sourceConfirmed || state.value.trials.none{it.localPassed})return
         execute {
             own()
             for(policy in VideoStrategy.entries) {
                 currentCoroutineContext().ensureActive()
-                if(state.value.trials.first{it.policy==policy}.status=="本地阻塞")continue
+                if(!state.value.trials.first{it.policy==policy}.localPassed)continue
                 VideoEvidence.reserve(directory)
                 val answer=CompletableDeferred<String>();verdict=answer
                 val token=UUID.randomUUID().toString()
@@ -162,7 +162,7 @@ internal class DiagnosticBatchController(private val root:File,private val versi
         if(caseId!=null && caseId==state.value.caseId && state.value.stage.startsWith("观察车机") && value in listOf("正常 Jovi","Hypercar 等待页","黑屏","卡住/断开"))verdict?.complete(value)
     }
     fun validate(policy:VideoStrategy,reconnect:Boolean=false) {
-        if(state.value.trials.none{it.policy==policy && it.display=="正常 Jovi"})return
+        if(state.value.restored || !state.value.sourceConfirmed || state.value.trials.none{it.policy==policy && it.localPassed && it.display=="正常 Jovi"})return
         execute {
             own();VideoEvidence.reserve(directory)
             update{it.copy(selected=policy,current=policy,stage=if(reconnect)"重连验证" else "音视频与触控验证",message="观察3分钟，手动点击车机界面并播放声音；完成后记录结果并停止",

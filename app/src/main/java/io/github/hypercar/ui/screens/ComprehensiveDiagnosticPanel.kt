@@ -43,20 +43,20 @@ import io.github.hypercar.session.HyperCarRepo
                     bitmap?.let {Image(it.asImageBitmap(),"真实来源视频解码首帧",Modifier.fillMaxWidth().heightIn(max=240.dp))}
                     Text("请按图片实际内容选择；若为原厂协议页，请在原厂界面处理。")
                     Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(onClick={controller.confirmSource(true)},enabled=!state.busy){Text("是正常 Jovi 桌面")}
-                        OutlinedButton(onClick={controller.confirmSource(false)},enabled=!state.busy){Text("提示页 / 黑屏")}
+                        OutlinedButton(onClick={controller.confirmSource(true)},enabled=!state.busy && !state.restored){Text("是正常 Jovi 桌面")}
+                        OutlinedButton(onClick={controller.confirmSource(false)},enabled=!state.busy && !state.restored){Text("提示页 / 黑屏")}
                     }
                 }
                 HorizontalDivider()
                 state.trials.forEach {trial ->
                     Text("${trial.policy.title}：${trial.status}；车机画面：${trial.display}")
                     if(trial.detail.isNotBlank())Text(trial.detail,style=MaterialTheme.typography.bodySmall)
-                    if(trial.display=="正常 Jovi")Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
+                    if(trial.localPassed && trial.display=="正常 Jovi" && !state.restored)Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {
                         OutlinedButton(onClick={controller.validate(trial.policy)},enabled=!state.busy){Text("音视频 / 触控验证")}
                         OutlinedButton(onClick={controller.validate(trial.policy,true)},enabled=!state.busy){Text("再连接验证")}
                     }
                 }
-                Button(onClick={controller.startVehicleTrials()},enabled=!state.busy && state.sourceConfirmed){Text("开始 A → E 车机轮测")}
+                Button(onClick={controller.startVehicleTrials()},enabled=!state.busy && state.sourceConfirmed && state.trials.any{it.localPassed}){Text("开始 A → E 车机轮测")}
                 if(state.stage.startsWith("观察车机")) {
                     Text("当前车机画面是什么？选择后自动结束本轮并进入下一方案。")
                     val observationToken=state.caseId

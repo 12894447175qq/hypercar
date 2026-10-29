@@ -11,6 +11,22 @@ import org.junit.Assert.*
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class DiagnosticBatchControllerTest {
+    @Test fun interruptedPreflightNeverRunsUnverifiedPoliciesOnTheCar()=runTest {
+        val root=Files.createTempDirectory("hc-partial-preflight").toFile()
+        try {
+            val ports=Ports().apply{blockReplay=VideoStrategy.C}
+            val c=DiagnosticBatchController(root,"test",ports,this)
+            c.startPreflight();runCurrent();c.cancel();advanceUntilIdle()
+            assertEquals(listOf(VideoStrategy.A,VideoStrategy.B),c.state.value.trials.filter{it.localPassed}.map{it.policy})
+            c.confirmSource(true);c.startVehicleTrials();runCurrent()
+            for(policy in listOf(VideoStrategy.A,VideoStrategy.B)) {
+                assertEquals(policy,c.state.value.current)
+                c.observe(c.state.value.caseId,"Hypercar 等待页");advanceTimeBy(3_100);runCurrent()
+            }
+            assertFalse(c.state.value.busy)
+            assertEquals(listOf(VideoStrategy.A,VideoStrategy.B),ports.cars.map{it.first})
+        }finally{root.deleteRecursively()}
+    }
     @Test fun immediateCancelBeforeDispatcherStartsNeverLeavesBusyState()=runTest {
         val root=Files.createTempDirectory("hc-immediate-cancel").toFile()
         try {
@@ -20,11 +36,12 @@ class DiagnosticBatchControllerTest {
         }finally{root.deleteRecursively()}
     }
     private class Ports:DiagnosticPorts {
+        var blockReplay:VideoStrategy?=null
         var claims=0;var releases=0;var stops=0;var blockProbe=false;var saved:VideoStrategy?=null
         val cars=mutableListOf<Pair<VideoStrategy,Boolean>>()
         override suspend fun claim(){claims++}
         override suspend fun probe(directory:File){directory.mkdirs();if(blockProbe)awaitCancellation();File(directory,"source.packets").writeText("test fixture")}
-        override suspend fun replay(input:File,directory:File,policy:VideoStrategy){assertTrue(input.isFile);directory.mkdirs()}
+        override suspend fun replay(input:File,directory:File,policy:VideoStrategy){assertTrue(input.isFile);directory.mkdirs();if(policy==blockReplay)awaitCancellation()}
         override suspend fun decode(sample:File,metadata:File,directory:File):JSONObject {
             directory.mkdirs();File(directory,"first.png").writeText("test fixture")
             return JSONObject().put("frames",1).put("pixels",JSONArray().put(JSONObject().put("sha256","same-pixels")))
@@ -65,6 +82,7 @@ class DiagnosticBatchControllerTest {
             assertFalse(c.state.value.busy);assertTrue(c.state.value.trials.none{it.display=="正常 Jovi"});assertEquals(1,ports.releases);assertTrue(ports.stops>0)
             val restored=DiagnosticBatchController(root,"test",ports,this)
             assertTrue(restored.state.value.stage.contains("中断"));assertFalse(restored.state.value.sourceConfirmed)
+            restored.confirmSource(true);assertFalse(restored.state.value.sourceConfirmed)
             restored.startVehicleTrials();runCurrent();assertTrue(ports.cars.isEmpty())
         }finally{root.deleteRecursively()}
     }
