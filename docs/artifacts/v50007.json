@@ -1,0 +1,91 @@
+{
+  "versionName": "0.1.1.7",
+  "versionCode": 50007,
+  "applicationId": "io.github.hypercar",
+  "minSdk": 31,
+  "targetSdk": 34,
+  "abi": "arm64-v8a",
+  "builtAtUtc": "2026-10-29T02:40:40.329940+00:00",
+  "sourceCommit": "96bdf04aff07be52c4168ee7e08513794ce36871",
+  "sourceWorktreeCleanAtPackaging": true,
+  "apk": "HyperCar-0.1.1.7-v50007-vivo-MIB3-mac-test.apk",
+  "certificateSha256": "01020c4ff672bdef9550f9c740285fdaf1f4ae0d70e9296050c0815d1570d5af",
+  "sameSignerAs50006": true,
+  "nativeLibrarySha256": "d011a52bf4ea9cd42f2676c1687900b5800e802f8c6e008b37c1aa8528986094",
+  "validation": {
+    "android": {
+      "tests": 83,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "suites": 18,
+    "lint": {
+      "Warning": 30,
+      "Information": 2
+    },
+    "rust": {
+      "tests": 43,
+      "failures": 0
+    },
+    "cargoCheck": true,
+    "androidArm64Build": true,
+    "videoDecode": {
+      "checks": [
+        {
+          "case": "same-size",
+          "sourceFrames": 18,
+          "mixedFrames": 29,
+          "sourcePixelsMatch": true,
+          "mixedSha256": "e0cce1a7efbd98c42011563b6bf2575f98b934e39a71948f161c1c9151cf2021"
+        },
+        {
+          "case": "changed-size",
+          "sourceFrames": 18,
+          "mixedFrames": 31,
+          "sourcePixelsMatch": true,
+          "mixedSha256": "6034521c6444b52238df05612d2998f739c4975b3b55bb1b4b99858b33cfc514"
+        }
+      ],
+      "decoder": "ffmpeg version 7.1 Copyright (c) 2000-2024 the FFmpeg developers",
+      "realVehicleTest": false,
+      "input": "generated baseline H264 fixture, not current vivo capture"
+    },
+    "windowsHubCheck": "not validated on macOS: native-windows-gui platform dependency compilation fails before project check",
+    "phoneOrVehicleTest": "not run; user will install and test"
+  },
+  "checks": {
+    "apkSignatureVerified": true,
+    "zipCrc": true,
+    "zipAlignment16KiB": true,
+    "elfLoadAlignment16KiB": true,
+    "packagedNativeMatchesRebuild": true,
+    "embeddedVcsMatchesSource": true,
+    "jniEntrypointsAndDexCallbacksPresent": true,
+    "jniEntrypoints": 11,
+    "releaseMinificationBuild": true
+  },
+  "preserved": {
+    "source": "com.baidu.carlife.vivo",
+    "sixPortUidCheck": true,
+    "vivoJoviSourcePreserved": true,
+    "vendorComponentsDisabled": false,
+    "phoneConnected": false
+  },
+  "vehicleAcceptance": "pending user test; no actual Jovi display/audio/touch/reconnect confirmation",
+  "releasePublished": false,
+  "files": {
+    "HyperCar-0.1.1.7-v50007-vivo-MIB3-mac-test.apk": {
+      "bytes": 4600110,
+      "sha256": "35d9448f858cb69266fa378895a746da4008edf4958f3eb5f43ea7f7336ea77e"
+    },
+    "mapping.txt.gz": {
+      "bytes": 2002011,
+      "sha256": "bdc0ac1042804077af61d2b82c01d0ec07991d9cef950b55efcc98c42f049c7c"
+    },
+    "INSTALL.md": {
+      "bytes": 925,
+      "sha256": "e0ee5dbb30afd0bb87c4d5fda59d33b7c8481b6444ddda62878762b12f806ec9"
+    }
+  }
+}
