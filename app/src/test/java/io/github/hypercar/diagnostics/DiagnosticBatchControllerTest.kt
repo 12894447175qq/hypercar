@@ -11,6 +11,44 @@ import org.junit.Assert.*
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class DiagnosticBatchControllerTest {
+    @Test fun failedClaimHasEvidenceWithoutStoppingAnUnownedConnection()=runTest {
+        val root=Files.createTempDirectory("hc-claim-log").toFile()
+        try {
+            val ports=Ports().apply{failClaim=true};val controller=DiagnosticBatchController(root,"test",ports,this)
+            controller.startPreflight();advanceUntilIdle()
+            assertFalse(controller.state.value.busy);assertEquals(0,ports.stops);assertEquals(0,ports.releases)
+            val text=File(root,"${controller.state.value.id}/timeline.txt").readText()
+            assertTrue(text.contains("resource.claim.failed"));assertTrue(text.contains("another connection owns resources"))
+        }finally{root.deleteRecursively()}
+    }
+    @Test fun releaseFailureStillFinishesTheOperationAndIsNotSilentlyLost()=runTest {
+        val root=Files.createTempDirectory("hc-cleanup-log").toFile()
+        try {
+            val ports=Ports().apply{failRelease=true};val controller=DiagnosticBatchController(root,"test",ports,this)
+            controller.startPreflight();advanceUntilIdle()
+            assertFalse(controller.state.value.busy);assertEquals("收尾异常",controller.state.value.stage)
+            val events=File(root,"${controller.state.value.id}/timeline.txt").readLines().map(::JSONObject)
+            assertTrue(events.any{it.getString("event")=="resource.release.failed"})
+            assertTrue(events.any{it.getString("event")=="operation.finished"})
+        }finally{root.deleteRecursively()}
+    }
+    @Test fun failedSourceStepIsPersistedWithCauseEvenWhenOrdinaryLogIsEmpty()=runTest {
+        val root=Files.createTempDirectory("hc-stage-log").toFile()
+        try {
+            val ports=Ports().apply{failProbe=true}
+            val controller=DiagnosticBatchController(root,"test",ports,this)
+            controller.startPreflight();advanceUntilIdle()
+            val batch=File(root,controller.state.value.id)
+            assertTrue("critical steps must have their own durable log",File(batch,"timeline.txt").isFile)
+            val events=File(batch,"timeline.txt").readLines().map(::JSONObject)
+            val failed=events.first{it.getString("event")=="source.probe.failed"}
+            assertTrue(failed.getJSONObject("data").getLong("elapsedMs")>=0)
+            assertTrue(failed.toString().contains("IllegalArgumentException"))
+            assertFalse(failed.toString().contains("secret-value"))
+            assertTrue(events.any{it.getString("event")=="operation.finished"})
+            assertTrue(batch.walkTopDown().filter{it.isFile && it.extension in setOf("txt","json")}.none{it.readText().contains("secret-value")})
+        }finally{root.deleteRecursively()}
+    }
     @Test fun interruptedPreflightNeverRunsUnverifiedPoliciesOnTheCar()=runTest {
         val root=Files.createTempDirectory("hc-partial-preflight").toFile()
         try {
@@ -37,10 +75,13 @@ class DiagnosticBatchControllerTest {
     }
     private class Ports:DiagnosticPorts {
         var blockReplay:VideoStrategy?=null
+        var failProbe=false
+        var failClaim=false
+        var failRelease=false
         var claims=0;var releases=0;var stops=0;var blockProbe=false;var saved:VideoStrategy?=null
         val cars=mutableListOf<Pair<VideoStrategy,Boolean>>()
-        override suspend fun claim(){claims++}
-        override suspend fun probe(directory:File){directory.mkdirs();if(blockProbe)awaitCancellation();File(directory,"source.packets").writeText("test fixture")}
+        override suspend fun claim(){claims++;if(failClaim)error("another connection owns resources")}
+        override suspend fun probe(directory:File){directory.mkdirs();if(failProbe)throw IllegalStateException("source failed password=secret-value",IllegalArgumentException("underlying failure"));if(blockProbe)awaitCancellation();File(directory,"source.packets").writeText("test fixture")}
         override suspend fun replay(input:File,directory:File,policy:VideoStrategy){assertTrue(input.isFile);directory.mkdirs();if(policy==blockReplay)awaitCancellation()}
         override suspend fun decode(sample:File,metadata:File,directory:File):JSONObject {
             directory.mkdirs();File(directory,"first.png").writeText("test fixture")
@@ -49,8 +90,8 @@ class DiagnosticBatchControllerTest {
         override suspend fun transcode(input:File,metadata:File,directory:File)=input
         override suspend fun connect(policy:VideoStrategy,directory:File,audio:Boolean){cars.add(policy to audio)}
         override suspend fun stop(){stops++}
-        override fun release(){releases++}
-        override fun logs()=listOf("test log")
+        override fun release(){releases++;if(failRelease)error("resource release failed")}
+        override fun logs()=if(failProbe)emptyList()else listOf("test log")
         override fun save(policy:VideoStrategy){saved=policy}
         override suspend fun export(directory:File)="test.zip"
     }

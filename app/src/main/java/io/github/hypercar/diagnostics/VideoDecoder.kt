@@ -14,8 +14,27 @@ import org.json.JSONObject
 
 /** Real decoder output; PNGs never come from UI screenshots or standby fixtures. */
 internal object VideoDecoder {
-    suspend fun decode(sample:File, metadata:File, output:File):JSONObject {
+    suspend fun decode(sample:File, metadata:File, output:File,trace:(String)->Unit={}):JSONObject {
+        val started=System.nanoTime()
+        val report=JSONObject().put("sample",sample.name).put("sampleBytes",sample.length()).put("startedAt",System.currentTimeMillis()).put("phase","read_sample")
+        output.mkdirs()
+        trace("begin sample=${sample.name} bytes=${sample.length()}")
+        try {
+            return decodeFrames(sample,metadata,output,trace,report).also {report.put("status","decoded").put("result",it)}
+        } catch(e:Exception) {
+            report.put("status",if(e is kotlinx.coroutines.CancellationException)"cancelled" else "failed")
+                .put("error",DiagnosticJournal.errorDetails(e)).put("codecError",CodecFailure.describe(e))
+            CodecFailure.trace(e,trace);throw e
+        } finally {
+            report.put("endedAt",System.currentTimeMillis()).put("elapsedMs",(System.nanoTime()-started)/1_000_000)
+            trace("end phase=${report.optString("phase")} status=${report.optString("status")} fed=${report.optInt("fed")} decoded=${report.optInt("frames")} elapsedMs=${report.optLong("elapsedMs")}")
+            runCatching {File(output,"decode-attempt.json").writeText(report.toString(2))}
+                .onFailure {trace("attempt_report_write_failed ${CodecFailure.describe(it)}")}
+        }
+    }
+    private suspend fun decodeFrames(sample:File,metadata:File,output:File,trace:(String)->Unit,report:JSONObject):JSONObject {
         val packets=VideoEvidence.read(sample)
+        report.put("inputFrames",packets.size).put("phase","read_codec_metadata")
         val summary=JSONObject(metadata.readText())
         require(summary.optBoolean("closed") && summary.isNull("error")) { "来源样本未完整关闭或写入失败" }
         val codecInfo=summary.getJSONObject("codec")
@@ -28,26 +47,38 @@ internal object VideoDecoder {
             setInteger(MediaFormat.KEY_COLOR_FORMAT,MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
             setInteger(MediaFormat.KEY_MAX_INPUT_SIZE,4*1024*1024)
         }
+        report.put("phase","create_decoder").put("width",w).put("height",h)
         val decoder=MediaCodec.createDecoderByType("video/avc")
+        report.put("decoder",decoder.name)
+        trace("configure decoder=${decoder.name} width=$w height=$h inputFrames=${packets.size}")
         val hashes=JSONArray();var fed=0;var ended=false;var frames=0;var firstPts=0L
         output.mkdirs();val info=MediaCodec.BufferInfo();val deadline=System.nanoTime()+30_000_000_000L
         try {
-            decoder.configure(format,null,null,0);decoder.start()
+            report.put("phase","configure_decoder");decoder.configure(format,null,null,0)
+            report.put("phase","start_decoder");decoder.start()
+            trace("started decoder=${decoder.name}")
             while(!ended) {
                 currentCoroutineContext().ensureActive()
                 check(System.nanoTime()<deadline) { "解码超过30秒" }
                 if(fed<=packets.size) {
+                    report.put("phase","dequeue_input")
                     val index=decoder.dequeueInputBuffer(2_000)
                     if(index>=0) {
                         if(fed==packets.size) decoder.queueInputBuffer(index,0,0,packets.last().ptsUs+1,MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                         else { val p=packets[fed];val buffer=requireNotNull(decoder.getInputBuffer(index));check(buffer.capacity()>=p.data.size);buffer.clear();buffer.put(p.data);decoder.queueInputBuffer(index,0,p.data.size,p.ptsUs,0) }
-                        fed++
+                        fed++;report.put("fed",fed.coerceAtMost(packets.size))
+                        if(fed==1)trace("first_input ptsUs=${packets.first().ptsUs} bytes=${packets.first().data.size}")
                     }
                 }
+                report.put("phase","dequeue_output")
                 val index=decoder.dequeueOutputBuffer(info,2_000)
+                if(index==MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    report.put("outputFormat",decoder.outputFormat.toString());trace("output_format=${decoder.outputFormat}")
+                }
                 if(index>=0) {
                     try {
                         if(info.size>0) {
+                            report.put("phase","read_output_image")
                             val image=decoder.getOutputImage(index)?:error("解码器不支持读取真实输出图像")
                             image.use { img ->
                                 val crop=img.cropRect;val width=crop.width();val height=crop.height()
@@ -79,15 +110,24 @@ internal object VideoDecoder {
                                     File(output,if(frames==0)"first.png" else "last.png").outputStream().use {check(bitmap.compress(Bitmap.CompressFormat.PNG,100,it))};bitmap.recycle()
                                 }
                             }
-                            if(frames==0)firstPts=info.presentationTimeUs;frames++
+                            if(frames==0){firstPts=info.presentationTimeUs;trace("first_decoded_image ptsUs=$firstPts")};frames++
+                            report.put("frames",frames).put("lastPtsUs",info.presentationTimeUs)
                         }
                         ended=info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM!=0
                     } finally {decoder.releaseOutputBuffer(index,false)}
                 }
             }
+            report.put("phase","end_of_stream")
             check(frames>0) { "解码结果没有图像" }
             return JSONObject().put("decoder",decoder.name).put("frames",frames).put("inputFrames",packets.size).put("firstPtsUs",firstPts).put("pixels",hashes).put("vehicleDisplayVerified",false)
                 .also {File(output,"decode.json").writeText(it.toString(2))}
-        } finally {runCatching{decoder.stop()};decoder.release()}
+        } catch(e:Exception) {report.put("primaryError",CodecFailure.describe(e));throw e}
+        finally {
+            runCatching{decoder.stop()}.onFailure{trace("decoder_stop_failed ${CodecFailure.describe(it)}")}
+            try{decoder.release()}catch(e:Exception){
+                report.put("releaseError",CodecFailure.describe(e));trace("decoder_release_failed ${CodecFailure.describe(e)}")
+                if(!report.has("primaryError"))throw e
+            }
+        }
     }
 }

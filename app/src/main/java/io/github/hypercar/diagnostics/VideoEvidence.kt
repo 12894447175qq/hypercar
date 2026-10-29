@@ -50,6 +50,7 @@ internal object VideoEvidence {
         file.inputStream().use { input-> val b=ByteArray(16384);while(true){val n=input.read(b);if(n<0)break;digest.update(b,0,n)} };digest.digest().joinToString(""){"%02x".format(it)}
     }
     private val allowed=setOf("json","txt","png","packets")
+    private val interruptedMetadata=setOf("source.json.tmp","outgoing.json.tmp","transport.json.tmp","transcoded.json.tmp","batch.json.tmp","journal-summary.json.tmp")
     fun files(root:File):List<File> {
         require(!Files.isSymbolicLink(root.toPath()))
         val canonical=root.canonicalFile
@@ -57,7 +58,7 @@ internal object VideoEvidence {
         root.walkTopDown().onEnter { dir-> require(!Files.isSymbolicLink(dir.toPath()));true }.forEach { f ->
             require(!Files.isSymbolicLink(f.toPath())) { "诊断包不允许符号链接" }
             require(f.canonicalFile.toPath().startsWith(canonical.toPath())) { "诊断文件越界" }
-            if(f.isFile) {require(f.extension in allowed && !f.name.contains("identity",true) && !f.name.contains("key",true)) { "诊断目录含非证据文件" };result.add(f)}
+            if(f.isFile) {require((f.extension in allowed || f.name=="protocol.txt.1" || f.name in interruptedMetadata) && !f.name.contains("identity",true) && !f.name.contains("key",true)) { "诊断目录含非证据文件" };result.add(f)}
         }
         require(result.sumOf { it.length() }<=MAX_BATCH) { "诊断批次超过128MiB" }
         return result.sortedBy { it.relativeTo(root).path }
@@ -72,7 +73,7 @@ internal object VideoEvidence {
                 val digest=sha(f)
                 zip.putNextEntry(ZipEntry(name));f.inputStream().use{it.copyTo(zip)};zip.closeEntry()
                 require(digest==sha(f)) { "导出期间证据发生变化" }
-                manifest.put(JSONObject().put("path",name).put("bytes",f.length()).put("sha256",digest))
+                manifest.put(JSONObject().put("path",name).put("bytes",f.length()).put("sha256",digest).put("incompleteWrite",f.name in interruptedMetadata))
             }
             zip.putNextEntry(ZipEntry("manifest.json"));zip.write(JSONObject().put("files",manifest).toString(2).toByteArray());zip.closeEntry()
         }

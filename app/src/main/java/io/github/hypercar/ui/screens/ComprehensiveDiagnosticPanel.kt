@@ -32,6 +32,7 @@ import io.github.hypercar.session.HyperCarRepo
             Column(Modifier.padding(16.dp).verticalScroll(rememberScrollState()),verticalArrangement=Arrangement.spacedBy(8.dp)) {
                 Text("视频综合诊断",style=MaterialTheme.typography.titleLarge)
                 Text("先在手机确认来源画面，再到车旁轮测。请停车操作；画面、声音、触控分别确认。关闭此窗口不会停止正在运行的测试。")
+                Text("本批次的步骤和每轮协议日志独立保存，不受普通日志暂停或清空影响；达到容量会明确标记裁剪。")
                 Text(state.stage,style=MaterialTheme.typography.titleMedium)
                 Text(state.message)
                 Row(horizontalArrangement=Arrangement.spacedBy(8.dp)) {

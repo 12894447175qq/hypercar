@@ -68,6 +68,7 @@ import kotlinx.coroutines.withTimeoutOrNull
  */
 object HyperCarRepo {
 
+    @Volatile private var activeDiagnosticJournal: io.github.hypercar.diagnostics.DiagnosticJournal? = null
     private val diagnosticOwned = AtomicBoolean(false)
     @Volatile private var diagnosticRetiringJob: Job? = null
     @Volatile private var diagnosticWait: kotlinx.coroutines.CompletableDeferred<Unit>? = null
@@ -80,6 +81,16 @@ object HyperCarRepo {
         return batchController ?: io.github.hypercar.diagnostics.DiagnosticBatchController(
             java.io.File(context.filesDir,"video-diagnostics"),io.github.hypercar.BuildConfig.VERSION_NAME+"/"+io.github.hypercar.BuildConfig.VERSION_CODE,
             object : io.github.hypercar.diagnostics.DiagnosticPorts {
+                override fun attachJournal(journal:io.github.hypercar.diagnostics.DiagnosticJournal?) {
+                    activeDiagnosticJournal=journal
+                    if(journal!=null)runCatching {
+                        val source=resolveCarLifeSource()
+                        journal.record("environment",mapOf("device" to DeviceInfo.fullSummary(context),"sourcePackage" to SettingsStore.carlifePackage,
+                            "sourceInstalled" to (source!=null),"sourcePermissionIssue" to source?.let{rendererPermissionError(context,it)},
+                            "headUnitProfile" to headUnitProfile.id,"shizukuReady" to ShizukuTools.isReady,"carLifeEnabled" to SettingsStore.carlifeEnabled,
+                            "ordinaryLogRecording" to logRecording,"independentBatchRecording" to true))
+                    }.onFailure {journal.record("environment.failed",error=it)}
+                }
                 override suspend fun claim() {
                     synchronized(HyperCarRepo) {
                         check(!connecting && !streaming && !sessionLive.get() && !cleanupInProgress && diagnosticRetiringJob?.isCompleted!=false) {"请先停止普通连接，并等待旧任务退出，再开始综合诊断"}
@@ -94,16 +105,29 @@ object HyperCarRepo {
                 }
                 override fun release() {diagnosticWait=null;diagnosticOptions=null;releaseKeepAlive();diagnosticOwned.set(false)}
                 override suspend fun stop() {
+                    val options=diagnosticOptions
+                    activeDiagnosticJournal?.record("cleanup.begin",mapOf("nativeIdle" to RustCoreBridge.nativeIsIdle(),"sourceBound" to carLifeSession?.hasRenderer,"connecting" to connecting))
                     diagnosticWait=null;userDisconnectRequested=true
                     val job=connectJob ?: diagnosticRetiringJob;connectJob=null;diagnosticRetiringJob=job
                     carLifeSession?.close();wakeJob?.cancel();stopNative();job?.cancel()
+                    activeDiagnosticJournal?.record("cleanup.wait_connect")
                     val joined=try {withTimeoutOrNull(16_000){job?.join();true}==true} finally {runDisconnect("综合诊断案例结束")}
                     if(joined)diagnosticRetiringJob=null
                     check(joined) {"连接任务尚未退出，已停止本轮，禁止重叠启动"}
                     stopNative();codecWorker?.second?.close()
+                    activeDiagnosticJournal?.record("cleanup.wait_codecs")
                     awaitCodecExit()
+                    activeDiagnosticJournal?.record("cleanup.wait_native")
                     check(withTimeoutOrNull(16_000){while(!RustCoreBridge.nativeIsIdle())delay(50);true}==true) {"原生任务尚未释放，禁止开始下一轮"}
-                    carLifeCleanupJob?.join();diagnosticOptions=null
+                    carLifeCleanupJob?.join()
+                    options?.optString("diagnostic_dir")?.takeIf{it.isNotBlank()}?.let {path ->
+                        val names=mutableListOf("outgoing")
+                        if(options.optBoolean("carlife_enabled",true))names.add("source")
+                        if(options.optBoolean("diagnostic_probe") || options.has("diagnostic_replay"))names.add("transport")
+                        activeDiagnosticJournal?.auditSamples(java.io.File(path),names)
+                    }
+                    activeDiagnosticJournal?.record("cleanup.complete",mapOf("nativeIdle" to RustCoreBridge.nativeIsIdle(),"codecWorkerPresent" to (codecWorker!=null)))
+                    diagnosticOptions=null
                 }
                 private suspend fun local(directory:java.io.File,input:java.io.File?,policy:io.github.hypercar.diagnostics.VideoStrategy) {
                     directory.mkdirs()
@@ -132,7 +156,7 @@ object HyperCarRepo {
                 }
                 override suspend fun probe(directory:java.io.File)=local(directory,null,io.github.hypercar.diagnostics.VideoStrategy.A)
                 override suspend fun replay(input:java.io.File,directory:java.io.File,policy:io.github.hypercar.diagnostics.VideoStrategy)=local(directory,input,policy)
-                override suspend fun decode(sample:java.io.File,metadata:java.io.File,directory:java.io.File)=io.github.hypercar.diagnostics.VideoDecoder.decode(sample,metadata,directory)
+                override suspend fun decode(sample:java.io.File,metadata:java.io.File,directory:java.io.File)=io.github.hypercar.diagnostics.VideoDecoder.decode(sample,metadata,directory,trace={log("DECODE: $it")})
                 override suspend fun transcode(input:java.io.File,metadata:java.io.File,directory:java.io.File):java.io.File {
                     val codec=org.json.JSONObject(metadata.readText()).getJSONObject("codec")
                     val packets=io.github.hypercar.diagnostics.VideoEvidence.read(input)
@@ -223,6 +247,8 @@ object HyperCarRepo {
             nativeGate.startIf({ sessionLive.get() && connectionTrace === ownerTrace }) { generation ->
                 closeVirtualIap()
                 mediaEvidence.begin(generation)
+                activeDiagnosticJournal?.nativeStarted(generation)
+                activeDiagnosticJournal?.record("native.start",mapOf("trace" to ownerTrace?.id,"generation" to generation,"videoPolicy" to (diagnosticOptions?.optString("video_policy")?:SettingsStore.videoPolicy)))
                 ownerTrace?.event("native.start", "generation=$generation")
                 val selected=org.json.JSONObject(config).put("video_policy",SettingsStore.videoPolicy)
                 diagnosticOptions?.let {overrides->overrides.keys().forEach {key->selected.put(key,overrides.get(key))}}
@@ -1096,6 +1122,7 @@ object HyperCarRepo {
             }
             return
         }
+        activeDiagnosticJournal?.record("connection.disconnect",mapOf("reason" to reason,"mediaEvidence" to mediaEvidence.summary()))
         push(link = LinkState.Stopping)
         val hadLink = sessionHadLink
         releaseSessionResources(keepAlive = diagnosticOwned.get() || shouldAutoReconnect(hadLink))
@@ -1705,7 +1732,12 @@ object HyperCarRepo {
                 if(current==null || current.first!=generation) {
                     current?.second?.close()
                     val worker=io.github.hypercar.diagnostics.HardwareVideoTranscoder(sourceWidth,sourceHeight,targetWidth,targetHeight,SettingsStore.carlifeFps,
-                        output={p->nativeGate.isCurrent(generation) && RustCoreBridge.nativeSubmitTranscodedVideo(generation,targetWidth,targetHeight,p.ptsUs,p.data)},
+                        output={p->
+                            val current=nativeGate.isCurrent(generation)
+                            val accepted=current && RustCoreBridge.nativeSubmitTranscodedVideo(generation,targetWidth,targetHeight,p.ptsUs,p.data)
+                            if(!accepted)activeDiagnosticJournal?.record("transcode.output_rejected",mapOf("generation" to generation,"generationCurrent" to current,"bytes" to p.data.size,"ptsUs" to p.ptsUs,"width" to targetWidth,"height" to targetHeight))
+                            accepted
+                        },
                         failed={reason->scope.launch {nativeGate.ifCurrent(generation){fail("硬件转码：$reason",allowReconnect=false)}}},trace={line->if(nativeGate.isCurrent(generation))log("TRANSCODE[$generation]: $line")})
                     current=generation to worker;codecWorker=current;worker.start()
                 }
@@ -1725,6 +1757,7 @@ object HyperCarRepo {
         private fun onCurrentState(generation: Long, state: String, detail: String) {
             if (!sessionLive.get()) return
             mediaEvidence.state(state)
+            activeDiagnosticJournal?.record("native.$state",mapOf("detail" to detail,"generation" to generation,"mediaEvidence" to mediaEvidence.summary()))
             connectionTrace?.event("native.$state", "generation=$generation $detail") ?: log("CORE: [$state] $detail")
             diagnosticWait?.let {waiter ->
                 when(state) {
@@ -1863,7 +1896,14 @@ object HyperCarRepo {
             if (frames > lastVideoFrames) lastFrameProgressAt = SystemClock.elapsedRealtime()
             lastVideoFrames = frames
             if (frames > 0 && carLifeSession?.isOpen == true && sourceVideoConfirmed.compareAndSet(false, true)) {
+                activeDiagnosticJournal?.record("media.first_source_frames",mapOf("sourceFrames" to frames,"vehicleDisplayVerified" to false))
                 log("CARLIFE: 首批来源编码帧已提交发送（frames=$frames；来源=${carLifeSession?.source?.enginePackage}；原厂提示页也属于编码帧，须核对实际画面和车机显示）")
+            }
+            if(_snapshots.value.audio.playing!=audioPlaying)activeDiagnosticJournal?.record("media.audio_changed",mapOf("audioSending" to audioPlaying,"soundHeard" to "unverified"))
+            activeDiagnosticJournal?.sample("media.snapshot") {
+                mapOf("sourceFrames" to frames,"fps" to fps,"kbps" to kbps,"audioSending" to audioPlaying,"ducking" to ducking,
+                    "frameIdleMs" to lastFrameProgressAt.takeIf{it>0}?.let{SystemClock.elapsedRealtime()-it},"sourceBinding" to carLifeSession?.hasRenderer,
+                    "boundNetwork" to boundNetwork?.toString(),"link" to _snapshots.value.link.toString(),"vehicleDisplayVerified" to false)
             }
             connectionTrace?.sample("stream.stats") {
                 val idle = lastFrameProgressAt.takeIf { it > 0 }?.let { SystemClock.elapsedRealtime() - it }
@@ -2524,6 +2564,7 @@ object HyperCarRepo {
     }
 
     private fun fail(reason: String, allowReconnect: Boolean = true, keepAliveUntilRetry: Boolean = false) {
+        activeDiagnosticJournal?.record("connection.failed",mapOf("reason" to reason,"sourceBinding" to carLifeSession?.hasRenderer,"mediaEvidence" to mediaEvidence.summary()))
         diagnosticWait?.completeExceptionally(IllegalStateException(reason))
         connectionTrace?.event("connect.failed", "reason=$reason sourceBinding=${carLifeSession?.hasRenderer} videoFrames=$lastVideoFrames boundNetwork=$boundNetwork")
         sessionLive.set(false)
@@ -2625,6 +2666,7 @@ object HyperCarRepo {
      */
     fun log(message: String) {
         val line = LogSanitizer.clean(message)
+        activeDiagnosticJournal?.protocol(line)
         val now = SystemClock.elapsedRealtime()
         var folded = 0
         var overBudget = false
@@ -2712,6 +2754,8 @@ object HyperCarRepo {
     private fun installCrashHandler() {
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, error ->
+            activeDiagnosticJournal?.record("process.crash",mapOf("thread" to thread.name),error)
+            activeDiagnosticJournal?.close()
             runCatching {
                 appendDiskLog("!!! CRASH（线程 ${thread.name}）：${error.javaClass.name}: ${error.message}")
                 error.stackTraceToString().lineSequence().take(80).forEach { appendDiskLog("    $it") }
