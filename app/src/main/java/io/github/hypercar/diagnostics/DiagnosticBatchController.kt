@@ -33,6 +33,7 @@ internal interface DiagnosticPorts {
     fun connectionHealthy():Boolean = true
     fun logs():List<String>
     fun save(policy:VideoStrategy)
+    fun resetVideoPolicy()
     suspend fun export(directory:File):String
 }
 
@@ -228,7 +229,7 @@ internal class DiagnosticBatchController(private val root:File,private val versi
     }
     fun acceptance(kind:String,ok:Boolean) {journal?.record("user.acceptance",mapOf("kind" to kind,"ok" to ok,"selectedPolicy" to state.value.selected?.wire));val value=if(ok)"用户确认正常" else "用户确认异常";update {when(kind){"audio"->it.copy(audio=value);"touch"->it.copy(touch=value);"reconnect"->it.copy(reconnect=value);else->it}}}
     fun saveSelected() {val s=state.value;val p=s.selected?:return;if(s.trials.any{it.policy==p && it.display=="正常 Jovi"}){ports.save(p);journal?.record("settings.video_policy_save_requested",mapOf("policy" to p.wire));update{it.copy(message="已保存 ${p.title}，其他设置未修改")}}}
-    fun resetPolicy() {if(!state.value.busy){ports.save(VideoStrategy.A);journal?.record("settings.video_policy_reset");update{it.copy(message="已恢复普通连接的原始视频策略")}}}
+    fun resetPolicy() {if(!state.value.busy){ports.resetVideoPolicy();journal?.record("settings.video_policy_reset",mapOf("explicitOverride" to false));update{it.copy(message="已恢复按车型和来源选择默认视频策略；下次连接生效")}}}
     fun cancel() {journal?.record("user.cancel_requested");operation?.cancel()}
     fun export()=execute("export") {check(state.value.id.isNotEmpty());File(directory,"session.txt").writeText(ports.logs().joinToString("\n").takeLast(4*1024*1024));update{it.copy(stage="正在导出")};journal?.record("export.snapshot",mapOf("sourceConfirmed" to state.value.sourceConfirmed,"localPassed" to state.value.trials.filter{it.localPassed}.map{it.policy.wire},"storageError" to journal?.storageError()));journal?.close();val path=step("export.write"){ports.export(directory)};File(directory,"exported.json").writeText(JSONObject().put("at",System.currentTimeMillis()).toString());update{it.copy(exportPath=path,stage="已导出")}}
     fun history():List<String> = root.listFiles().orEmpty().filter {it.isDirectory && it!=directory && !java.nio.file.Files.isSymbolicLink(it.toPath()) && it.name.matches(Regex("batch-[a-zA-Z0-9-]+")) && File(it,"batch.json").isFile}.sortedByDescending{it.lastModified()}.map{it.name}

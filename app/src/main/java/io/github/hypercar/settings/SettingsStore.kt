@@ -30,6 +30,9 @@ object SettingsStore {
 
     val explicitVideoPolicy:String? get()=p().getString("video_policy",null)
 
+    /** Remove the override so the connection can select its source/vehicle default. */
+    fun resetVideoPolicy() { p().edit().remove("video_policy").apply() }
+
     private const val KEY_TARGET_MAC = "target_car_mac"
     private const val KEY_TARGET_NAME = "target_car_name"
     private const val KEY_AUTO_CONNECT = "auto_connect_on_bt"

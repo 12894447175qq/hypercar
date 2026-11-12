@@ -14,13 +14,13 @@ import org.json.JSONObject
 
 /** Real decoder output; PNGs never come from UI screenshots or standby fixtures. */
 internal object VideoDecoder {
-    suspend fun decode(sample:File, metadata:File, output:File,trace:(String)->Unit={}):JSONObject {
+    suspend fun decode(sample:File, metadata:File, output:File,trace:(String)->Unit={},canContinue:()->Boolean={true}):JSONObject {
         val started=System.nanoTime()
         val report=JSONObject().put("sample",sample.name).put("sampleBytes",sample.length()).put("startedAt",System.currentTimeMillis()).put("phase","read_sample")
         output.mkdirs()
         trace("begin sample=${sample.name} bytes=${sample.length()}")
         try {
-            return decodeFrames(sample,metadata,output,trace,report).also {report.put("status","decoded").put("result",it)}
+            return decodeFrames(sample,metadata,output,trace,report,canContinue).also {report.put("status","decoded").put("result",it)}
         } catch(e:Exception) {
             report.put("status",if(e is kotlinx.coroutines.CancellationException)"cancelled" else "failed")
                 .put("error",DiagnosticJournal.errorDetails(e)).put("codecError",CodecFailure.describe(e))
@@ -32,7 +32,8 @@ internal object VideoDecoder {
                 .onFailure {trace("attempt_report_write_failed ${CodecFailure.describe(it)}")}
         }
     }
-    private suspend fun decodeFrames(sample:File,metadata:File,output:File,trace:(String)->Unit,report:JSONObject):JSONObject {
+    private suspend fun decodeFrames(sample:File,metadata:File,output:File,trace:(String)->Unit,report:JSONObject,canContinue:()->Boolean):JSONObject {
+        check(canContinue()) {"新的连接已开始，停止后台画面检查"}
         val packets=VideoEvidence.read(sample)
         report.put("inputFrames",packets.size).put("phase","read_codec_metadata")
         val summary=JSONObject(metadata.readText())
@@ -48,6 +49,7 @@ internal object VideoDecoder {
             setInteger(MediaFormat.KEY_MAX_INPUT_SIZE,4*1024*1024)
         }
         report.put("phase","create_decoder").put("width",w).put("height",h)
+        check(canContinue()) {"新的连接已开始，停止后台画面检查"}
         val decoder=MediaCodec.createDecoderByType("video/avc")
         report.put("decoder",decoder.name)
         trace("configure decoder=${decoder.name} width=$w height=$h inputFrames=${packets.size}")
@@ -59,6 +61,7 @@ internal object VideoDecoder {
             trace("started decoder=${decoder.name}")
             while(!ended) {
                 currentCoroutineContext().ensureActive()
+                check(canContinue()) {"新的连接已开始，停止后台画面检查"}
                 check(System.nanoTime()<deadline) { "解码超过30秒" }
                 if(fed<=packets.size) {
                     report.put("phase","dequeue_input")

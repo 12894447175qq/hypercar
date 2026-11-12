@@ -11,6 +11,20 @@ import org.junit.Assert.*
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class DiagnosticBatchControllerTest {
+    @Test fun restoreDefaultUsesAudiVivoCompatibilityInsteadOfPersistingRawForwarding()=runTest {
+        val root=Files.createTempDirectory("hc-video-default").toFile()
+        try {
+            val ports=Ports().apply {saved=VideoStrategy.E}
+            val controller=DiagnosticBatchController(root,"test",ports,this)
+            controller.resetPolicy()
+            val resolved=io.github.hypercar.session.VideoPolicySelection.resolve(
+                ports.saved?.wire,"audi_mib3",io.github.hypercar.session.CarLifeSource.VIVO)
+            assertEquals("level40_inline",resolved)
+            assertNull("Reset must remove the explicit override, not save strategy A",ports.saved)
+            assertEquals("original",io.github.hypercar.session.VideoPolicySelection.resolve(
+                ports.saved?.wire,"generic",io.github.hypercar.session.CarLifeSource.VIVO))
+        }finally{root.deleteRecursively()}
+    }
     @Test fun ordinaryConnectionsBeforePreflightAndCarTrialsNeedNoManualDisconnect()=runTest {
         val root=Files.createTempDirectory("hc-auto-takeover").toFile()
         try {
@@ -128,6 +142,7 @@ class DiagnosticBatchControllerTest {
         override fun release(){releases++;takeover?.release{};if(failRelease)error("resource release failed")}
         override fun logs()=if(failProbe)emptyList()else listOf("test log")
         override fun save(policy:VideoStrategy){saved=policy}
+        override fun resetVideoPolicy(){saved=null}
         override suspend fun export(directory:File)="test.zip"
     }
     @Test fun allCasesRequireHumanDisplayAndOnlyConfirmedPolicyCanPersist()=runTest {

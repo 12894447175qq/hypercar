@@ -76,6 +76,7 @@ object HyperCarRepo {
     @Volatile private var diagnosticOptions: org.json.JSONObject? = null
     @Volatile private var codecWorker: Pair<Long, io.github.hypercar.diagnostics.HardwareVideoTranscoder>? = null
     private var batchController: io.github.hypercar.diagnostics.DiagnosticBatchController? = null
+    private val videoContentAuditMutex = kotlinx.coroutines.sync.Mutex()
 
     @Synchronized internal fun comprehensiveDiagnostics(context:Context):io.github.hypercar.diagnostics.DiagnosticBatchController {
         init(context)
@@ -195,6 +196,7 @@ object HyperCarRepo {
                 override fun connectionHealthy() = snapshots.value.link is LinkState.Connected
                 override fun logs()=(diskLog()?.snapshotLines()?:snapshots.value.recentLogs).map(LogSanitizer::clean)
                 override fun save(policy:io.github.hypercar.diagnostics.VideoStrategy){SettingsStore.videoPolicy=policy.wire}
+                override fun resetVideoPolicy(){SettingsStore.resetVideoPolicy()}
                 override suspend fun export(directory:java.io.File):String {
                     val resolver=context.contentResolver
                     val archiveName="hypercar-${directory.name}-${System.currentTimeMillis()}.zip"
@@ -3221,10 +3223,31 @@ object HyperCarRepo {
     fun exportLogs(onFinished: (() -> Unit)? = null) {
         scope.launch {
             try {
+                val contentSummary=mutableListOf<String>()
+                if(videoContentAuditMutex.tryLock()) {
+                    try {
+                        val ctx=appContext()
+                        if(ctx!=null) {
+                            val idle={ !sessionLive.get() && !diagnosticOwned.get() && RustCoreBridge.nativeIsIdle() }
+                            val complete=withTimeoutOrNull(6_000) {
+                                io.github.hypercar.diagnostics.AutomaticVideoEvidence.auditForLog(
+                                    java.io.File(ctx.filesDir,"video-diagnostics"),idle,
+                                    decode={sample,metadata,directory->io.github.hypercar.diagnostics.VideoDecoder.decode(
+                                        sample,metadata,directory,trace={log("DECODE-AUTO: $it")},canContinue=idle)},
+                                    trace={contentSummary.add("VIDEO-CONTENT: $it")},
+                                )
+                                true
+                            }
+                            if(complete!=true)contentSummary.add("VIDEO-CONTENT: status=analysis_timeout budgetMs=6000 sourceDesktopVerified=false vehicleDisplayVerified=false")
+                        }
+                    }catch(e:CancellationException){throw e}
+                    catch(e:Exception){contentSummary.add("VIDEO-CONTENT: status=analysis_failed error=${LogSanitizer.clean(e.message.orEmpty())}")}
+                    finally{videoContentAuditMutex.unlock()}
+                }else contentSummary.add("VIDEO-CONTENT: status=another_export_analyzing")
                 val logs = runCatching { diskLog()?.snapshotLines().orEmpty().map(LogSanitizer::clean) }.getOrElse {
                     log("LOG: 读取保留日志文件失败，改用界面尾部：${it.message}")
                     emptyList()
-                }.ifEmpty { _snapshots.value.recentLogs }
+                }.ifEmpty { _snapshots.value.recentLogs } + contentSummary
                 if (logs.isEmpty()) {
                     log("LOG: 无日志可导出")
                     return@launch
