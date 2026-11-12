@@ -119,7 +119,7 @@ class Iap2Coordinator(
                     dropProfilesBeforeIap2 = dropProfilesBeforeIap2,
                     log = log,
                     onEndpoint = { endpoint -> endpointCallback?.invoke(endpoint) },
-                    onSessionEnded = { reason -> log("IAP2: 会话结束（$reason），继续监听/出站等待重连") },
+                    onSessionEnded = { reason -> log("IAP2: 蓝牙会话结束（$reason）；Wi-Fi 会话由上层独立监测") },
                 )
             bluetooth = bt
             if (!bt.start()) {
@@ -147,6 +147,8 @@ class Iap2Coordinator(
         log("IAP2: 蓝牙 ACL 断开——结束当前 iAP2 会话（监听保留）")
         bluetooth?.dropCurrentSession()
     }
+
+    fun onAirplayActivated() = bluetooth?.onAirplayActivated()
 
     // ---- 内部 ----
 

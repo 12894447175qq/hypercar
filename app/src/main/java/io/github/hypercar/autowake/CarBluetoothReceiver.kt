@@ -76,7 +76,8 @@ class CarBluetoothReceiver : BroadcastReceiver() {
             trace.event("acl.ignored", "reason=handler_missing")
             return
         }
-        // 转交会话层：connected 区分上车/下车。handler 内部决定 startForegroundService/stop，
+        // 转交蓝牙层状态；ACL 断开并不证明独立的 Wi-Fi 投屏已断开。
+        // handler 内部按会话状态决定是否启动前台保活，
         // 并做会话重活。这里只兜底捕获异常（如 ForegroundServiceStartNotAllowedException——
         // Android 12+ 后台 FGS 豁免靠 SYSTEM_ALERT_WINDOW，用户没授悬浮窗时会被拦，只记日志不崩）。
         trace.event("acl.handoff.begin", "connected=$connected serviceRunning=${HyperCarService.isRunning} deviceTail=${address.takeLast(5)}")

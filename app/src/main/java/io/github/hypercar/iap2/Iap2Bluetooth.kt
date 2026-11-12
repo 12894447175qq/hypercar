@@ -92,10 +92,12 @@ class Iap2Bluetooth(
 
     private val generation = AtomicLong(0)
 
+    @Volatile private var bootstrap = BluetoothBootstrapGate()
+
     @Volatile
     private var running = false
 
-    /** 当前会话占用的 socket（stop/notifyBluetoothLost 关它来打断阻塞读写）。 */
+    /** 已被会话接管的 socket；尚在 connect() 的 socket 由 bootstrap 单独持有。 */
     private val currentSocket = AtomicReference<BluetoothSocket?>(null)
 
     /** 当前会话的链路通道（主动结束会话用）。 */
@@ -174,6 +176,7 @@ class Iap2Bluetooth(
         skippedNoService.clear()
         running = true
         val myGeneration = generation.incrementAndGet()
+        val myBootstrap = BluetoothBootstrapGate().also { bootstrap = it }
         val target = targetProvider()
         log(
             "BT: 启动——监听 $SDP_NAME（…cafe，等车机连入）+ 出站尝试车机 iAP2 服务（…caff）" +
@@ -190,12 +193,12 @@ class Iap2Bluetooth(
             running = false
             return false
         }
-        Thread({ acceptLoop(myGeneration) }, "iap2-bt-accept").apply {
+        Thread({ acceptLoop(myGeneration, myBootstrap) }, "iap2-bt-accept").apply {
             isDaemon = true
             serverThread = this
             start()
         }
-        Thread({ connectLoop(myGeneration) }, "iap2-bt-client").apply {
+        Thread({ connectLoop(myGeneration, myBootstrap) }, "iap2-bt-client").apply {
             isDaemon = true
             clientThread = this
             start()
@@ -211,6 +214,7 @@ class Iap2Bluetooth(
         if (!running) return
         running = false
         generation.incrementAndGet()
+        bootstrap.finish()
         serverSocket.getAndSet(null)?.let { socket -> runCatching { socket.close() } }
         dropCurrentSession()
         serverThread?.interrupt()
@@ -220,19 +224,30 @@ class Iap2Bluetooth(
         log("BT: 已停止（监听与出站均已关闭）")
     }
 
+    /** RECORD succeeded over Wi-Fi. Keep the current RFCOMM channel, stop acquiring replacements. */
+    fun onAirplayActivated() {
+        bootstrap.finish()
+        log("BT: AirPlay 已激活，停止新蓝牙拨号和配置文件断开；保留已有 iAP2 链路")
+    }
+
     /**
      * 只结束当前会话、保留监听/出站循环（ACL 断开时调用）。
      * 车机蓝牙断开后，旧 RFCOMM socket 的读会卡在半开连接上不返回——必须主动关。
      */
     fun dropCurrentSession() {
-        activeChannel.getAndSet(null)?.let { channel -> runCatching { channel.close() } }
-        currentSocket.getAndSet(null)?.let { socket -> runCatching { socket.close() } }
+        bootstrap.cancelPending()
+        detachCurrentSession().forEach { runCatching { it.close() } }
     }
+
+    /** Ownership updates only; callers close outside the bootstrap monitor. */
+    private fun detachCurrentSession(): List<Closeable> = listOfNotNull(
+        activeChannel.getAndSet(null), currentSocket.getAndSet(null),
+    )
 
     // ---- 入站：车机连入 ----
 
     @SuppressLint("MissingPermission")
-    private fun acceptLoop(myGeneration: Long) {
+    private fun acceptLoop(myGeneration: Long, gate: BluetoothBootstrapGate) {
         while (running && generation.get() == myGeneration) {
             val socket: BluetoothSocket =
                 try {
@@ -244,6 +259,11 @@ class Iap2Bluetooth(
             if (!running || generation.get() != myGeneration) {
                 runCatching { socket.close() }
                 return
+            }
+            if (!gate.isOpen) {
+                runCatching { socket.close() }
+                log("BT-S: Wi-Fi 会话已接管，不替换现有连接")
+                continue
             }
             val peerAddress = safeAddress(socket.remoteDevice)
             // 指定了目标车机时拒绝其它设备的连入（多台车机场景：非目标的控制器
@@ -264,8 +284,16 @@ class Iap2Bluetooth(
                     runCatching { socket.close() }
                     continue
                 }
+                var retired: List<Closeable> = emptyList()
+                if (!gate.accept {
+                    if (sessionProductive) false
+                    else { retired = detachCurrentSession(); true }
+                }) {
+                    runCatching { socket.close() }
+                    continue
+                }
                 log("BT-S: 车机重新连入（上一轮仍在等凭据）——结束旧会话让位给新一轮 addr=${peerAddress ?: "?"}")
-                dropCurrentSession()
+                retired.forEach { runCatching { it.close() } }
                 sleepQuietly(500)
                 if (sessionActive.get()) {
                     log("BT-S: 旧会话未在 500ms 内退出，忽略本次连入 addr=${peerAddress ?: "?"}")
@@ -275,7 +303,7 @@ class Iap2Bluetooth(
             }
             val peerName = safeName(socket.remoteDevice) ?: peerAddress ?: "unknown"
             log("BT-S: 车机已连入 name=$peerName，开始 iAP2 发送端会话")
-            Thread({ runSession(socket, "BT-S") }, "iap2-bt-session").apply {
+            Thread({ runSession(socket, "BT-S", gate) }, "iap2-bt-session").apply {
                 isDaemon = true
                 start()
             }
@@ -285,10 +313,10 @@ class Iap2Bluetooth(
     // ---- 出站：主动连入车机 ----
 
     @SuppressLint("MissingPermission")
-    private fun connectLoop(myGeneration: Long) {
+    private fun connectLoop(myGeneration: Long, gate: BluetoothBootstrapGate) {
         val adapter = adapterOrNull() ?: return
         var inboundGraceDone = false
-        while (running && generation.get() == myGeneration) {
+        while (running && generation.get() == myGeneration && gate.isOpen) {
             // 会话期间静默：两条 RFCOMM 会互相踩（见 sessionActive 注释）
             if (sessionActive.get()) {
                 sleepQuietly(2_000)
@@ -301,11 +329,11 @@ class Iap2Bluetooth(
                 inboundGraceDone = true
                 val deadline = SystemClock.uptimeMillis() + INBOUND_GRACE_MILLIS
                 while (running && generation.get() == myGeneration &&
-                    !sessionActive.get() && SystemClock.uptimeMillis() < deadline
+                    gate.isOpen && !sessionActive.get() && SystemClock.uptimeMillis() < deadline
                 ) {
                     sleepQuietly(250)
                 }
-                if (sessionActive.get() || !running || generation.get() != myGeneration) continue
+                if (sessionActive.get() || !running || generation.get() != myGeneration || !gate.isOpen) continue
                 log("BT-C: ${INBOUND_GRACE_MILLIS / 1000}s 内车机未主动连入——改走出站（会先断开该车机的 HFP/A2DP）")
             }
             val target = targetProvider()
@@ -322,7 +350,7 @@ class Iap2Bluetooth(
             }
             var connected: BluetoothSocket? = null
             for (device in candidates) {
-                if (!running || generation.get() != myGeneration) return
+                if (!running || generation.get() != myGeneration || !gate.isOpen) return
                 if (sessionActive.get()) break
                 val name = safeName(device) ?: device.address
                 runCatching { adapter.cancelDiscovery() }
@@ -330,19 +358,24 @@ class Iap2Bluetooth(
                 // 文件在线时不开放 iAP2 服务窗口（奥迪 MIB3 实测每 3s 连接失败）。
                 // **宝马档案不做这一步**：它的 HFP/A2DP 在线时照样主动连入 iAP2，而断开
                 // 会连带把 ACL 拽掉（车机反复重连），反而再也不发起 CarPlay。
+                if (!gate.isOpen || sessionActive.get()) break
                 if (dropProfilesBeforeIap2) {
                     // 注意：BtProfiles.disconnect 内部会打「自己断开」归因标记——断开
                     // 配置文件（个别 ROM 退到设备级断开）会让系统广播 ACL 断开，接收器
                     // 靠那个标记认出「这是我们干的」，不按「下车」拆会话。
-                    val dropped = BtProfiles.disconnect(appContext, device)
+                    val dropped = BtProfiles.disconnect(appContext, device) {
+                        running && generation.get() == myGeneration && gate.isOpen && !sessionActive.get()
+                    }
+                    if (!gate.isOpen || !running || generation.get() != myGeneration) return
+                    if (sessionActive.get()) break
                     if (dropped.isNotEmpty()) {
                         val now = SystemClock.uptimeMillis()
                         if (now - lastProfileLogAt > PROFILE_LOG_THROTTLE_MILLIS) {
                             lastProfileLogAt = now
                             val left = BtProfiles.stillConnected(appContext, device.address)
                             log(
-                                "BT-C: $name 蓝牙已连接（${dropped.joinToString("/")}）——已断开" +
-                                    if (left.isEmpty()) "" else "（仍有 ${left.joinToString("/")} 在线）",
+                                "BT-C: $name 已请求断开配置文件（${dropped.joinToString("/")}）；" +
+                                    if (left.isEmpty()) "当前均已断开" else "仍有 ${left.joinToString("/")} 在线",
                             )
                         }
                     }
@@ -350,12 +383,13 @@ class Iap2Bluetooth(
                     profileDropSkippedLogged = true
                     log("BT-C: 车机档案要求保留 HFP/A2DP（不断配置文件，等车机自己连入 iAP2）")
                 }
-                val socket = tryConnect(device)
+                val socket = tryConnect(device, gate)
                 if (socket != null) {
                     log("BT-C: ✓ 已连入 $name 的 iAP2 服务（RFCOMM 建立）")
                     connected = socket
                     break
                 } else {
+                    if (!gate.isOpen || !running || generation.get() != myGeneration) return
                     val now = SystemClock.uptimeMillis()
                     if (now - lastFailureLogAt > FAILURE_LOG_THROTTLE_MILLIS) {
                         lastFailureLogAt = now
@@ -372,7 +406,7 @@ class Iap2Bluetooth(
                 runCatching { connected.close() }
                 return
             }
-            runSession(connected, "BT-C")
+            runSession(connected, "BT-C", gate)
             sleepQuietly(RETRY_DELAY_MILLIS)
         }
     }
@@ -465,23 +499,26 @@ class Iap2Bluetooth(
     }
 
     @SuppressLint("MissingPermission")
-    private fun tryConnect(device: BluetoothDevice): BluetoothSocket? {
+    private fun tryConnect(device: BluetoothDevice, gate: BluetoothBootstrapGate): BluetoothSocket? {
         val socket =
             try {
                 device.createRfcommSocketToServiceRecord(ACCESSORY_IAP2_UUID)
             } catch (_: IOException) {
                 return null
             }
-        // 连接前就登记：connect() 是阻塞调用（SDP 查询 + 建链最长可达数十秒），
-        // stop()/dropCurrentSession() 只有拿到 socket 引用才能 close() 打断它。
-        currentSocket.set(socket)
+        // In-flight dials have separate ownership: retiring them must not close an accepted session.
+        if (!gate.register(socket)) {
+            runCatching { socket.close() }
+            return null
+        }
         return try {
             socket.connect()
-            socket
+            if (gate.isOpen) socket else { runCatching { socket.close() }; null }
         } catch (_: IOException) {
-            currentSocket.compareAndSet(socket, null)
             runCatching { socket.close() }
             null
+        } finally {
+            gate.release(socket)
         }
     }
 
@@ -490,16 +527,19 @@ class Iap2Bluetooth(
     private fun runSession(
         socket: BluetoothSocket,
         tag: String,
+        gate: BluetoothBootstrapGate,
     ) {
-        if (!sessionActive.compareAndSet(false, true)) {
+        if (!gate.accept {
+                if (!sessionActive.compareAndSet(false, true)) false
+                else { currentSocket.set(socket); true }
+            }) {
             // 竞争兜底（accept 与 connect 两侧可能同时启动会话）：后来者直接让位
-            log("$tag 已有 iAP2 会话在跑，本连接不建会话")
+            log("$tag 已有 iAP2 会话或 Wi-Fi 已接管，本连接不建会话")
             runCatching { socket.close() }
             return
         }
         sessionStarts.incrementAndGet()
         sessionProductive = false
-        currentSocket.set(socket)
         val channel = RfcommLinkChannel(socket, log)
         activeChannel.set(channel)
         val session =
@@ -545,7 +585,7 @@ class Iap2Bluetooth(
             runCatching { channel.close() }
             runCatching { socket.close() }
             sessionActive.set(false)
-            log("$tag 会话结束（RFCOMM 已关闭；监听与出站循环仍在运行）")
+            log("$tag 会话结束（RFCOMM 已关闭；允许新蓝牙会话=${gate.isOpen && running}）")
         }
     }
 

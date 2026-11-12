@@ -85,13 +85,17 @@ object BtProfiles {
      * 真断开了东西时会先打一条「自己断开」归因标记（见 [markSelfDrop]）：紧接着的系统
      * `ACTION_ACL_DISCONNECTED` 广播是我们造成的，接收器不能当成下车去拆会话。
      * 什么都没连（返回空列表）则不动标记——别把宽限窗口白白撑大。
+     * [stillNeeded] 在阻塞查询后及每次断开前复查；Wi-Fi 已接管时不继续设备级兜底。
+     * 已经交给系统的断开调用无法撤回。
      *
      * @return 断开前在线的配置文件（空 = 本来就没连接，无需任何动作）
      */
     fun disconnect(
         context: Context,
         device: BluetoothDevice,
+        stillNeeded: () -> Boolean = { true },
     ): List<String> {
+        if (!stillNeeded()) return emptyList()
         val address =
             try {
                 device.address
@@ -99,17 +103,18 @@ object BtProfiles {
                 return emptyList()
             }
         val before = connectedNames(context, address)
-        if (before.isEmpty()) return emptyList()
+        if (before.isEmpty() || !stillNeeded()) return emptyList()
         markSelfDrop(address)
         for (id in profiles) {
+            if (!stillNeeded()) return before
             if (profileName(id) !in before) continue
-            proxy(context, id)?.let { disconnectProfile(it, device) }
+            proxy(context, id)?.let { if (stillNeeded()) disconnectProfile(it, device) }
         }
-        if (!awaitDisconnected(context, address, 1_500L)) {
+        if (!awaitDisconnected(context, address, 1_500L, stillNeeded) && stillNeeded()) {
             // 配置级断开未生效（个别 ROM 限流）：设备级断开兜底（@hide，同样只要求
             // BLUETOOTH_CONNECT）。车机侧看是「设备整体断开」，属预期。
             runCatching { BluetoothDevice::class.java.getMethod("disconnect").invoke(device) }
-            awaitDisconnected(context, address, 500L)
+            awaitDisconnected(context, address, 500L, stillNeeded)
         }
         return before
     }
@@ -150,9 +155,11 @@ object BtProfiles {
         context: Context,
         address: String,
         timeoutMillis: Long,
+        stillNeeded: () -> Boolean,
     ): Boolean {
         val deadline = SystemClock.uptimeMillis() + timeoutMillis
         while (SystemClock.uptimeMillis() < deadline) {
+            if (!stillNeeded()) return false
             if (connectedNames(context, address).isEmpty()) return true
             try {
                 Thread.sleep(120)

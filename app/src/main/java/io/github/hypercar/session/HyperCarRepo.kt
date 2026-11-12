@@ -589,10 +589,11 @@ object HyperCarRepo {
                     }
                     connect(app)
                 } else {
-                    runCatching { device.address }.getOrNull()?.let { address ->
-                        if (address == aclCarMac) { aclCarMac = null; aclCarName = null }
-                    }
-                    disconnect()
+                    // ACL describes only Bluetooth, not the independently monitored Wi-Fi session.
+                    // Preserve car identity and recovery intent; only the user's Stop cancels them.
+                    iap2?.notifyBluetoothLost()
+                    connectionTrace?.event("acl.bluetooth_only_loss",
+                        "live=${sessionLive.get()} engineRunning=$streaming network=$boundNetwork userStop=false wifiAndSourceRetained=true")
                 }
                 }
                 if(!dispatched) {
@@ -1781,6 +1782,10 @@ object HyperCarRepo {
             mediaEvidence.state(state)
             activeDiagnosticJournal?.record("native.$state",mapOf("detail" to detail,"generation" to generation,"mediaEvidence" to mediaEvidence.summary()))
             connectionTrace?.event("native.$state", "generation=$generation $detail") ?: log("CORE: [$state] $detail")
+            // Both ordinary connections and diagnostic cases own the same Bluetooth bootstrap.
+            if (state == "connected" && headUnitProfile.id == io.github.hypercar.headunit.HeadUnitProfiles.AUDI_MIB3.id) {
+                iap2?.onAirplayActivated()
+            }
             diagnosticWait?.let {waiter ->
                 when(state) {
                     "diagnostic_complete"->waiter.complete(Unit)
