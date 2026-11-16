@@ -232,7 +232,7 @@ pub async fn run_engine(
     {
         let target=transform_target.clone();
         let mut raw_capture=if transcode {cfg.diagnostic_dir.as_ref().and_then(|p|crate::video_capture::CaptureWriter::create(std::path::Path::new(p),"source").ok())} else {None};
-        let clock=std::time::Instant::now();let mut dimensions=(cfg.width,cfg.height);
+        let clock=std::time::Instant::now();
         let mut source=SourceVideoBuffer::new(cfg.width,cfg.height);
         let mut codec_pts=0u64;
         let stop_d = stop.clone();
@@ -260,11 +260,8 @@ pub async fn run_engine(
                             } else if to_video {
                                 if transcode {
                                     match ev {
-                                        CarLifeEvent::EncoderResolution{width,height}=>{dimensions=(width,height);source.set_size(width,height);},
+                                        CarLifeEvent::EncoderResolution{width,height}=>source.set_size(width,height),
                                         CarLifeEvent::VideoFrame{data,..}=>{
-                                            if let Some(info)=crate::screen::annexb_nals(&data).into_iter().find(|n|crate::screen::nal_type(n)==7).and_then(|s|crate::video_compat::SpsInfo::parse(s).ok()) {
-                                                dimensions=(info.width,info.height);
-                                            }
                                             let pts=clock.elapsed().as_micros() as u64;
                                             if let Some(c)=raw_capture.as_mut(){c.record(&data,pts);}
                                             source.push(data);
@@ -287,6 +284,7 @@ pub async fn run_engine(
                 if transcode {
                     if let Some((tw,th))=negotiated {
                         while let Some(data)=source.pop() {
+                            let dimensions = source.size;
                             codec_pts=codec_pts.saturating_add(1_000_000/cfg.fps.max(1) as u64);
                             if !crate::emit_transcode(dimensions.0,dimensions.1,tw,th,codec_pts,&data) {
                                 emit_state("ended","硬件转码输入失败；保留原厂组件，停止本轮");stop_d.cancel();return;
@@ -647,6 +645,8 @@ pub(crate) async fn run_video_pump(
     let mut tick = tokio::time::interval(Duration::from_millis(16));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut showing_standby = true;
+    let mut source_epoch = 1u64;
+    let mut epoch_frames = 0u64;
     let mut source_timestamp_logged = false;
     let mut standby_idx = 0usize;
     let mut standby_size_sent = None;
@@ -704,11 +704,13 @@ pub(crate) async fn run_video_pump(
                 Some(CarLifeEvent::ClientLeft { video: true }) => {
                     if let Some(capture)=source_capture.as_mut(){capture.finish();}
                     if let Some(sender)=sender.as_mut(){sender.finish_capture();}
-                    source.require_keyframe();
+                    source.reset_source();
+                    source_epoch += 1;
+                    epoch_frames = 0;
                     showing_standby = true;
                     standby_size_sent = None;
                     standby_canvas = source.size;
-                    emit_log("CARLIFE: 视频来源断开；重连后等待新的来源 IDR，禁止沿用旧参考帧");
+                    emit_log("CARLIFE: 视频来源断开；已清除来源 SPS/PPS 与参考帧，重连必须取得本轮 SPS/PPS/IDR");
                 }
                 Some(_) => {}
                 None => return,
@@ -770,7 +772,7 @@ pub(crate) async fn run_video_pump(
                     s.reset_video_config();
                     showing_standby = false;
                     standby_size_sent = None;
-                    emit_log(&format!("VIDEO: 切换到来源 {}x{}，重发来源解码参数与 IDR", source.size.0, source.size.1));
+                    emit_log(&format!("VIDEO: 切换到来源 {}x{} sourceEpoch={source_epoch}，重发来源解码参数与 IDR；保留同一加密计数器", source.size.0, source.size.1));
                 }
                 while let Some(data) = source.pop() {
                     match s.send_video_annexb(&data).await {
@@ -781,8 +783,9 @@ pub(crate) async fn run_video_pump(
                                 st.bytes += data.len() as u64;
                                 st.frames
                             };
-                            if frames == 1 {
-                                emit_log(&format!("VIDEO: first_source_frame_written bytes={} size={}x{}；非等待页；接收端是否解码显示仍需实车核对", data.len(), source.size.0, source.size.1));
+                            epoch_frames += 1;
+                            if epoch_frames == 1 {
+                                emit_log(&format!("VIDEO: first_source_frame_written sourceEpoch={source_epoch} totalSourceFrames={frames} bytes={} size={}x{}；非等待页；接收端是否解码显示仍需实车核对", data.len(), source.size.0, source.size.1));
                                 media_readiness.source_written();
                             }
                         }

@@ -292,6 +292,28 @@ impl ScreenSender {
             let s = normalized.as_slice();
             let changed = self.last_sps.as_deref() != Some(s) || self.last_pps.as_deref() != Some(p);
             if changed {
+                // Derive the header from the same SPS as avcC, not a separate
+                // asynchronous encoder-size callback or the receiver's UI canvas.
+                match crate::video_compat::SpsInfo::parse(s) {
+                    Ok(info) => {
+                        if self.size() != (info.width, info.height) {
+                            crate::emit_log(&format!(
+                                "VIDEO: config_size_corrected hint={}x{} sps={}x{} action=use_sps",
+                                self.width, self.height, info.width, info.height
+                            ));
+                            self.set_size(info.width, info.height);
+                        }
+                        crate::emit_log(&format!(
+                            "VIDEO: decoder_contract visible={}x{} coded={}x{} profile={} level={} refs={} baseline={} viewport=unspecified displayVerified=false",
+                            info.width, info.height, info.coded_width, info.coded_height,
+                            info.profile, info.level, info.max_refs, info.profile == 66
+                        ));
+                    }
+                    Err(reason) => crate::emit_log(&format!(
+                        "VIDEO: decoder_contract spsParse=failed reason={reason} fallback={}x{} geometryVerified=false",
+                        self.width, self.height
+                    )),
+                }
                 let avcc = build_avcc(s, p);
                 if !avcc.is_empty() {
                     self.last_sps = Some(s.to_vec());
@@ -534,6 +556,42 @@ mod tests {
         let mut body = vec![0; len];
         stream.read_exact(&mut body).await.unwrap();
         (header, body)
+    }
+
+    #[tokio::test]
+    async fn logged_vivo_sps_defines_config_geometry_without_relabelling_profile() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let (_, writer) = client.into_split();
+        let key = [14; 32];
+        let mut sender = ScreenSender::new(writer, ScreenCipher::ChaCha(key), 1408, 656, false);
+        sender.set_policy(VideoPolicy::Level40Inline, 60);
+        // Actual codec parameters from 50009 at 21:23:16.835. The slice is a
+        // synthetic framing fixture, NOT a recovered frame from the user's TXT.
+        let sps = [0x67,0x42,0x80,0x1e,0xda,0x01,0x40,0x16,0xe9,0xa8,0x28,0x30,0x28,0x36,0x85,0x09,0xa8];
+        let pps = [0x68,0xce,0x06,0xf2];
+        let slice = [0x65,0x88];
+        let mut frame = Vec::new();
+        for nal in [&sps[..], &pps[..], &slice[..]] {
+            frame.extend_from_slice(&[0,0,0,1]); frame.extend_from_slice(nal);
+        }
+        assert!(sender.send_video_annexb(&frame).await.unwrap());
+        let (head, config) = read_packet(&mut server).await;
+        assert_eq!(f32::from_le_bytes(head[16..20].try_into().unwrap()), 1280.0);
+        assert_eq!(f32::from_le_bytes(head[20..24].try_into().unwrap()), 720.0);
+        assert_eq!(head[6], SCREEN_FLAG_ENCRYPTED);
+        assert_eq!(&head[32..48], &[0; 16], "do not infer a display viewport from SW3874");
+        assert_eq!(config[1], 66, "preserve the real Baseline profile");
+        assert_eq!(config[3], 40, "preserve the existing bounded Level4 compatibility policy");
+        let (head, encrypted) = read_packet(&mut server).await;
+        let plain = chacha_open(&key, &nonce64(0), &encrypted, &head).unwrap();
+        let mut expected_sps = sps; expected_sps[3] = 40;
+        let mut expected = Vec::new();
+        for nal in [&expected_sps[..], &pps[..], &slice[..]] {
+            expected.extend_from_slice(&(nal.len() as u32).to_be_bytes()); expected.extend_from_slice(nal);
+        }
+        assert_eq!(plain, expected, "avcC and in-band headers must describe the same decoder");
     }
 
     #[tokio::test]

@@ -192,3 +192,90 @@ async fn negotiated_standby_is_not_replaced_by_stale_settings_or_encoder_request
     let output = capture.await.unwrap();
     assert_eq!(output.config_sizes, vec![(1280, 720)], "do not reconfigure the waiting decoder before a real source IDR");
 }
+
+#[tokio::test]
+async fn source_sps_controls_handoff_despite_early_and_late_resolution_callbacks() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    let (_, writer) = client.into_split();
+    let key = [13; 32];
+    let capture = tokio::spawn(receive(server, key));
+    let (ready, ready_rx) = tokio::sync::oneshot::channel();
+    let (events, event_rx) = mpsc::unbounded_channel();
+    let stats = Arc::new(Mutex::new(PumpStat::default()));
+    let stop = SessionStop::new(8014);
+    let pump = tokio::spawn(run_video_pump((1412, 654), ready_rx, event_rx, stats.clone(), stop.clone(), MediaReadiness::new(), VideoPumpOptions::default()));
+    ready.send(ScreenSender::new(writer, ScreenCipher::ChaCha(key), 1412, 654, false)).ok().unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let frames = access_units();
+    // 50009 requests 1408x656, but the video SPS says 1280x720. CMD and VIDEO
+    // are separate sockets: neither a missing nor a late CMD reply may win over SPS.
+    events.send(CarLifeEvent::EncoderResolution { width: 1408, height: 656 }).unwrap();
+    events.send(CarLifeEvent::VideoFrame { source_timestamp: 0, data: frames[0].clone() }).unwrap();
+    wait_frames(&stats, 1).await;
+    events.send(CarLifeEvent::EncoderResolution { width: 1920, height: 1080 }).unwrap();
+    for frame in frames.iter().skip(1) {
+        events.send(CarLifeEvent::VideoFrame { source_timestamp: 0, data: frame.clone() }).unwrap();
+    }
+    let delivered = tokio::time::timeout(Duration::from_millis(500), async {
+        while stats.lock().frames < 9 { tokio::time::sleep(Duration::from_millis(5)).await; }
+    }).await.is_ok();
+    stop.cancel();
+    pump.await.unwrap();
+    let output = capture.await.unwrap();
+    assert!(delivered, "a late CMD size callback discarded valid source reference frames");
+    assert_eq!(output.source_configs, 1, "one source configuration, derived from this GOP's SPS");
+    assert_eq!(output.source_frames, 9);
+    if let Ok(directory) = std::env::var("HYPERCAR_VIDEO_EVIDENCE") {
+        let directory = std::path::Path::new(&directory);
+        std::fs::write(directory.join("async-size-mixed.h264"), output.all).unwrap();
+        std::fs::write(directory.join("async-size-source.h264"), output.source).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn disconnected_source_cannot_borrow_previous_epochs_decoder_parameters() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    let (_, writer) = client.into_split();
+    let key = [13; 32];
+    let capture = tokio::spawn(receive(server, key));
+    let (ready, ready_rx) = tokio::sync::oneshot::channel();
+    let (events, event_rx) = mpsc::unbounded_channel();
+    let stats = Arc::new(Mutex::new(PumpStat::default()));
+    let stop = SessionStop::new(8015);
+    let pump = tokio::spawn(run_video_pump((1280, 720), ready_rx, event_rx, stats.clone(), stop.clone(), MediaReadiness::new(), VideoPumpOptions::default()));
+    ready.send(ScreenSender::new(writer, ScreenCipher::ChaCha(key), 1280, 720, false)).ok().unwrap();
+    let frames = access_units();
+    events.send(CarLifeEvent::VideoFrame { source_timestamp: 0, data: frames[0].clone() }).unwrap();
+    wait_frames(&stats, 1).await;
+    events.send(CarLifeEvent::ClientLeft { video: true }).unwrap();
+    // A fresh encoder can reuse parameter IDs with different contents. No parameters
+    // from the previous TCP source or the waiting card may bootstrap its naked IDR.
+    let nals = annexb_nals(&frames[0]);
+    let packet = |kinds: &[u8]| {
+        let mut out = Vec::new();
+        for nal in &nals {
+            if kinds.contains(&nal_type(nal)) {
+                out.extend_from_slice(&[0, 0, 0, 1]); out.extend_from_slice(nal);
+            }
+        }
+        out
+    };
+    for data in [packet(&[5]), packet(&[7]), packet(&[5])] {
+        events.send(CarLifeEvent::VideoFrame { source_timestamp: 0, data }).unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let before_fresh_parameters = stats.lock().frames;
+    events.send(CarLifeEvent::VideoFrame { source_timestamp: 0, data: packet(&[8]) }).unwrap();
+    events.send(CarLifeEvent::VideoFrame { source_timestamp: 0, data: packet(&[5]) }).unwrap();
+    wait_frames(&stats, before_fresh_parameters + 1).await;
+    stop.cancel();
+    pump.await.unwrap();
+    let output = capture.await.unwrap();
+    assert_eq!(before_fresh_parameters, 1, "old source SPS/PPS leaked across the disconnect");
+    assert_eq!(output.source_frames, 2);
+    assert_eq!(output.source_configs, 2);
+}

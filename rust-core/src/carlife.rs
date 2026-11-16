@@ -1354,6 +1354,9 @@ async fn handle_media_client(
                 if let Err(e) = wr.write_all(&frame).await {
                     emit_log(&format!("CARLIFE: {label} 心跳写失败 kind={:?} os={:?}: {e}", e.kind(), e.raw_os_error()));
                     first_frame.store(false, std::sync::atomic::Ordering::Relaxed);
+                    // This exit must invalidate the source epoch just like EOF/read
+                    // failure; otherwise the next connection inherits old SPS/PPS.
+                    let _ = events.send(CarLifeEvent::ClientLeft { video: true });
                     return;
                 }
                 hb_sent += 1;

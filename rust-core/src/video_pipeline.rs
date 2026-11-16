@@ -1,27 +1,43 @@
 //! 来源视频必须以本来源的 SPS/PPS/IDR 开始，不能沿用等待页的解码状态。
 use std::collections::VecDeque;
 use crate::screen::{annexb_nals, nal_type};
+use crate::video_compat::SpsInfo;
 
 const MAX_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const MAX_BUFFER_FRAMES: usize = 240;
 
 pub struct SourceVideoBuffer {
     pub size: (u32, u32),
+    reported_size: (u32, u32),
+    sps_size: Option<(u32, u32)>,
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
     ready: bool,
     pending: VecDeque<Vec<u8>>,
     bytes: usize,
+    waiting_packets: u64,
 }
 
 impl SourceVideoBuffer {
     pub fn new(width: u32, height: u32) -> Self {
-        Self { size: (width, height), sps: None, pps: None, ready: false, pending: VecDeque::new(), bytes: 0 }
+        Self { size: (width, height), reported_size: (width, height), sps_size: None,
+            sps: None, pps: None, ready: false, pending: VecDeque::new(), bytes: 0, waiting_packets: 0 }
     }
 
     pub fn set_size(&mut self, width: u32, height: u32) {
         let next = (width / 2 * 2, height / 2 * 2);
-        if next.0 >= 2 && next.1 >= 2 && next != self.size {
+        if next.0 < 2 || next.1 < 2 { return; }
+        if next != self.reported_size && self.sps_size.is_some_and(|actual| actual != next) {
+            crate::emit_log(&format!(
+                "VIDEO: source_size_hint={}x{} activeSps={}x{} action=keep_sps；CMD 回调不能覆盖当期码流或丢弃参考帧",
+                next.0, next.1, self.size.0, self.size.1
+            ));
+        }
+        self.reported_size = next;
+        // CMD and VIDEO are independent sockets. A request/ack can precede or
+        // follow the video, and vendors can echo the request despite encoding a
+        // different size. Only the current GOP's SPS determines decoder geometry.
+        if self.sps_size.is_none() && next != self.size {
             self.size = next;
             self.require_keyframe();
             self.sps = None;
@@ -29,10 +45,32 @@ impl SourceVideoBuffer {
         }
     }
 
+    /// A new source TCP connection has no proven relationship to the old encoder.
+    /// Same-epoch overflow only needs an IDR; disconnect must also discard its CSD.
+    pub fn reset_source(&mut self) {
+        self.require_keyframe();
+        self.sps = None;
+        self.pps = None;
+        self.sps_size = None;
+        self.size = self.reported_size;
+    }
+
     pub fn require_keyframe(&mut self) {
         self.ready = false;
         self.pending.clear();
         self.bytes = 0;
+        self.waiting_packets = 0;
+    }
+
+    fn waiting(&mut self, idr: bool) -> bool {
+        self.waiting_packets += 1;
+        if self.waiting_packets <= 3 || self.waiting_packets % 120 == 0 {
+            crate::emit_log(&format!(
+                "VIDEO: source_gate=waiting sps={} pps={} packetIdr={idr} blockedPackets={}；等待本轮完整参数与关键帧，未提交来源视频",
+                self.sps.is_some(), self.pps.is_some(), self.waiting_packets
+            ));
+        }
+        false
     }
 
     /// 返回 false 表示本帧等待关键帧或缓冲超限，不能计为已发送帧。
@@ -44,10 +82,23 @@ impl SourceVideoBuffer {
         let changed = sps.as_ref().is_some_and(|n| self.sps.as_ref() != Some(n))
             || pps.as_ref().is_some_and(|n| self.pps.as_ref() != Some(n));
         if changed { self.require_keyframe(); }
-        if let Some(sps) = sps { self.sps = Some(sps); }
+        if let Some(sps) = sps {
+            let dimensions = SpsInfo::parse(&sps).ok().map(|info| (info.width, info.height));
+            if self.sps_size != dimensions {
+                if let Some((width, height)) = dimensions {
+                    crate::emit_log(&format!(
+                        "VIDEO: source_geometry sps={width}x{height} reported={}x{} action=use_sps",
+                        self.reported_size.0, self.reported_size.1
+                    ));
+                }
+            }
+            self.sps_size = dimensions;
+            self.size = dimensions.unwrap_or(self.reported_size);
+            self.sps = Some(sps);
+        }
         if let Some(pps) = pps { self.pps = Some(pps); }
         let packet = if idr {
-            let (Some(sps), Some(pps)) = (&self.sps, &self.pps) else { return false; };
+            let (Some(sps), Some(pps)) = (&self.sps, &self.pps) else { return self.waiting(true); };
             // 保留最新可独立解码的 GOP，首帧早于车机就绪时也不丢关键参数。
             let mut packet = Vec::with_capacity(data.len() + sps.len() + pps.len() + 8);
             for nal in [sps.as_slice(), pps.as_slice()] {
@@ -58,10 +109,11 @@ impl SourceVideoBuffer {
                     packet.extend_from_slice(&[0, 0, 0, 1]); packet.extend_from_slice(nal);
                 }
             }
-            self.pending.clear(); self.bytes = 0; self.ready = true;
+            self.pending.clear(); self.bytes = 0; self.ready = true; self.waiting_packets = 0;
             packet
         } else {
-            if !self.ready || !nals.iter().any(|n| nal_type(n) == 1) { return false; }
+            if !self.ready { return self.waiting(false); }
+            if !nals.iter().any(|n| nal_type(n) == 1) { return false; }
             data
         };
         if self.bytes + packet.len() > MAX_BUFFER_BYTES || self.pending.len() >= MAX_BUFFER_FRAMES {
@@ -106,6 +158,28 @@ mod tests {
         assert_eq!(types, [7,8,5]);
         assert_eq!(buffer.pop().unwrap(), pframe());
         assert!(!buffer.has_pending());
+    }
+
+    #[test]
+    fn queued_gop_keeps_its_sps_geometry_until_a_new_sps_arrives() {
+        let source = include_bytes!("../testdata/source-1280x720.h264");
+        let mut first = Vec::new();
+        for nal in annexb_nals(source) {
+            if nal_type(nal) == 9 && !first.is_empty() { break; }
+            first.extend_from_slice(&[0,0,0,1]); first.extend_from_slice(nal);
+        }
+        let mut buffer = SourceVideoBuffer::new(1412, 654);
+        buffer.push(first);
+        buffer.set_size(1408, 656);
+        assert_eq!(buffer.size, (1280, 720));
+        assert!(buffer.pop().is_some(), "late callbacks cannot discard an early cached GOP");
+        // No disconnect, no explicit size callback: the next SPS alone changes geometry.
+        let wide = crate::airplay::standby_for_aspect(2560, 744).unwrap();
+        assert!(buffer.push(wide.frames[0].to_vec()));
+        assert_eq!(buffer.size, (wide.width, wide.height));
+        buffer.set_size(1280, 720);
+        assert_eq!(buffer.size, (wide.width, wide.height));
+        assert!(buffer.pop().is_some());
     }
 
     #[test]

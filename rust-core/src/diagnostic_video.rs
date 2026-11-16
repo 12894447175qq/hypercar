@@ -145,15 +145,27 @@ mod tests {
     use crate::video_compat::VideoPolicy;
     #[tokio::test]
     async fn receiver_rejects_header_dimensions_that_do_not_describe_the_sps() {
+        use tokio::io::AsyncWriteExt;
         let dir=std::env::temp_dir().join(format!("hc-wrong-size-{}",uuid::Uuid::new_v4()));
         let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
-        let (peer,_)=listener.accept().await.unwrap();let(_,writer)=client.into_split();
+        let (peer,_)=listener.accept().await.unwrap();let(_,mut writer)=client.into_split();
         let sample=include_bytes!("../testdata/source-1280x720.h264");
         let expected=Arc::new(Mutex::new(idr(sample)));let path=dir.to_string_lossy().to_string();
         let receiver=tokio::spawn(receive(peer,[17;32],path,expected));
-        let mut sender=ScreenSender::new(writer,ScreenCipher::ChaCha([17;32]),1282,720,false);
-        let _=sender.send_video_annexb(sample).await;drop(sender);
+        // The production sender now corrects geometry from SPS. Forge the bad
+        // wire header directly so this still tests rejection, not that old bug.
+        let nals=annexb_nals(sample);
+        let sps=nals.iter().find(|n|nal_type(n)==7).unwrap();
+        let pps=nals.iter().find(|n|nal_type(n)==8).unwrap();
+        let body=crate::screen::build_avcc(sps,pps);
+        let mut header=[0u8;128];
+        header[..4].copy_from_slice(&(body.len() as u32).to_le_bytes());
+        header[4]=1;header[6]=4;
+        header[16..20].copy_from_slice(&1282f32.to_le_bytes());
+        header[20..24].copy_from_slice(&720f32.to_le_bytes());
+        writer.write_all(&header).await.unwrap();
+        writer.write_all(&body).await.unwrap();drop(writer);
         assert!(receiver.await.unwrap().unwrap_err().contains("不一致"));
         std::fs::remove_dir_all(dir).unwrap();
     }

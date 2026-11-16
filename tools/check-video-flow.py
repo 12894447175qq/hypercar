@@ -34,10 +34,10 @@ def decode(path):
 reference = decode(ROOT/'rust-core/testdata/source-1280x720.h264')
 assert len(reference) == 9
 checks = []
-for label in ['same-size', 'changed-size']:
+for label, repeats in [('same-size', 2), ('changed-size', 2), ('async-size', 1)]:
     source = args.output/(label+'-source.h264')
     frames = decode(source)
-    assert frames == reference * 2, f'{label}: source pixels changed across transport/recovery'
+    assert frames == reference * repeats, f'{label}: source pixels changed across transport/recovery'
     mixed = args.output/(label+'-mixed.h264')
     mixed_frames = decode(mixed)
     assert len(mixed_frames) > len(frames), 'standby must also have been decoded'
