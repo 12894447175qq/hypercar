@@ -964,7 +964,7 @@ async fn handle_cmd_client(
                         let (w, h) = safe_carlife_encoder_size(raw_w, raw_h);
                         if (w, h) != (even(raw_w.max(2)), even(raw_h.max(2))) {
                             *encoder_size.lock() = (w, h);
-                            // 画布必须跟着规整后的尺寸走，否则车机端缩放/触摸坐标全偏
+                            // 仅传递请求尺寸提示；来源 SPS 到达后由视频泵决定解码尺寸。
                             let _ = events.send(CarLifeEvent::EncoderResolution {
                                 width: w,
                                 height: h,
@@ -989,9 +989,8 @@ async fn handle_cmd_client(
                     }
                 }
                 CMD_VIDEO_ENCODER_INIT_DONE => {
-                    // 手机在这里回报**实际**采用的分辨率（可能把我们请求的值压缩到
-                    // 其编码器上限）。以它为准，否则 VideoConfig 画布与真实码流不一致，
-                    // 车机端会缩放/错位，触摸坐标也会整体偏移。
+                    // 手机回报协商尺寸。CMD 与 VIDEO 是独立通道，回报可能迟到或
+                    // 只回显请求；保存作提示，VideoConfig 仍以当期 SPS 为准。
                     let (actual_w, actual_h) = parse_encoder_info(&payload);
                     if actual_w >= 2 && actual_h >= 2 {
                         let actual = (even(actual_w), even(actual_h));
@@ -999,12 +998,12 @@ async fn handle_cmd_client(
                         *encoder_size.lock() = actual;
                         if actual != requested {
                             emit_log(&format!(
-                                "CARLIFE: 手机实际编码 {}x{}（请求 {}x{}，已按其实际值同步画布）",
+                                "CARLIFE: 手机回报编码 {}x{}（请求 {}x{}，记录尺寸提示；视频配置以当期 SPS 为准）",
                                 actual.0, actual.1, requested.0, requested.1
                             ));
                         } else {
                             emit_log(&format!(
-                                "CARLIFE: 手机确认编码 {}x{}",
+                                "CARLIFE: 手机确认协商尺寸 {}x{}；实际码流尺寸待 SPS 核验",
                                 actual.0, actual.1
                             ));
                         }
