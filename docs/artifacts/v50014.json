@@ -1,0 +1,146 @@
+{
+  "sourceCommit": "b884626a9b8943c03c70e54ae4c0eb81f8d6c408",
+  "sourceWorktreeCleanAtPackaging": true,
+  "apk": "HyperCar-0.1.1.14-v50014-vivo-MIB3-mac-test.apk",
+  "versionCode": 50014,
+  "versionName": "0.1.1.14",
+  "apkBytes": 4929514,
+  "apkSha256": "8fa31d4ea699e3d1761f6d5977c24450ce6e12d9e9ea184a61ee22a2362aa82e",
+  "certificateSha256": "01020c4ff672bdef9550f9c740285fdaf1f4ae0d70e9296050c0815d1570d5af",
+  "sameSignerAs50013": true,
+  "nativeLibrarySha256": "a903ce3ad51d633254e58528f2914b3d7c8dcfbf3a7a4eefae837624a12b1f3e",
+  "abi": "arm64-v8a",
+  "minSdk": 31,
+  "targetSdk": 34,
+  "checks": {
+    "zipCrc": true,
+    "apkSignatureVerified": true,
+    "zipAlignment16KiB": true,
+    "elfLoadAlignment16KiB": true,
+    "packagedNativeMatchesVerifiedLocalLibrary": true,
+    "embeddedVcsMatchesSource": true,
+    "jniEntrypointsAndDexCallbacksPresent": true,
+    "jniEntrypoints": [
+      "nativeBuildIap2NavPacket",
+      "nativeControlReady",
+      "nativeInitLogger",
+      "nativeIsIdle",
+      "nativeIsRunning",
+      "nativeSendHardKey",
+      "nativeSendIap",
+      "nativeSendMic",
+      "nativeSendTouch",
+      "nativeSetListener",
+      "nativeStart",
+      "nativeStop",
+      "nativeSubmitTranscodedVideo"
+    ],
+    "syntheticTestFixtureNotBundled": true
+  },
+  "deviceAcceptance": "not run; physical vivo decoder, MediaStore, and MIB3 display/audio/touch/reconnect remain pending",
+  "validation": {
+    "android": {
+      "tests": {
+        "tests": 130,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "suites": 28,
+      "lint": {
+        "Warning": 30,
+        "Information": 2
+      }
+    },
+    "rust": {
+      "cargoCheck": "passed",
+      "tests": 66,
+      "failures": 0,
+      "fullSuiteRerun": true,
+      "nativeRebuilt": true,
+      "target": "aarch64-linux-android",
+      "api": 31,
+      "nativeSha256": "a903ce3ad51d633254e58528f2914b3d7c8dcfbf3a7a4eefae837624a12b1f3e",
+      "followupLogOnlyChange": {
+        "tests": 6,
+        "filter": "carlife::",
+        "failures": 0,
+        "fullSuiteBehaviorEvidenceReused": true
+      }
+    },
+    "videoFlow": {
+      "checks": [
+        {
+          "case": "same-size",
+          "sourceFrames": 18,
+          "mixedFrames": 28,
+          "sourcePixelsMatch": true,
+          "mixedSha256": "1e076b0ab97beac7753a8bcbb68767a17233daf898b40b6fc30615fc018029b9"
+        },
+        {
+          "case": "changed-size",
+          "sourceFrames": 18,
+          "mixedFrames": 28,
+          "sourcePixelsMatch": true,
+          "mixedSha256": "91a2f45dc53304c14e4df8aebb669865862eeca093d16985c3453fc7aa7643af"
+        },
+        {
+          "case": "async-size",
+          "sourceFrames": 9,
+          "mixedFrames": 14,
+          "sourcePixelsMatch": true,
+          "mixedSha256": "29362ce07c7e31d34c50c24e9caced941acb2371eea2575da25998fb50a501ee"
+        }
+      ],
+      "decoder": "ffmpeg version 7.1 Copyright (c) 2000-2024 the FFmpeg developers",
+      "realVehicleTest": false,
+      "input": "generated baseline H264 fixture, not current vivo capture"
+    },
+    "videoPolicies": {
+      "checks": [
+        {
+          "policy": "original",
+          "decodedFrames": 9,
+          "sourcePixelsMatch": true
+        },
+        {
+          "policy": "level40",
+          "decodedFrames": 9,
+          "sourcePixelsMatch": true
+        },
+        {
+          "policy": "inline_headers",
+          "decodedFrames": 9,
+          "sourcePixelsMatch": true
+        },
+        {
+          "policy": "level40_inline",
+          "decodedFrames": 9,
+          "sourcePixelsMatch": true
+        }
+      ],
+      "input": "generated fixture; not captured vivo video"
+    },
+    "review": "main agent self-review",
+    "deviceAcceptance": "not run",
+    "blackScreenRootCause": "not established from historical TXT; two additional transition defects reproduced and fixed"
+  },
+  "builtAtUtc": "2026-11-16T08:22:09.509852+00:00",
+  "reviewDate": "2026-11-16",
+  "releasePublished": false,
+  "referenceCommit": "4e42a0d23ee411a1ac4d2ffa44feef9d9fca726d",
+  "files": {
+    "HyperCar-0.1.1.14-v50014-vivo-MIB3-mac-test.apk": {
+      "bytes": 4929514,
+      "sha256": "8fa31d4ea699e3d1761f6d5977c24450ce6e12d9e9ea184a61ee22a2362aa82e"
+    },
+    "INSTALL.md": {
+      "bytes": 2301,
+      "sha256": "c8ca3d6d3e68f958c388784e7353ce97f7b043e3e8d04cc1d7d4bd7fbf71ea3d"
+    },
+    "mapping.txt.gz": {
+      "bytes": 2074568,
+      "sha256": "d01a636577068dde3134cdbb23bfa7605b10e9db76836ddee2daa548cc8a9159"
+    }
+  }
+}
